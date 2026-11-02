@@ -26,33 +26,48 @@ mkdir -p "$RUN_DIR" "$LOG_DIR"
 set -a; . "$ENV_FILE"; set +a
 
 # -u 关掉 Python 的块缓冲：日志重定向到文件时也能实时看到
-PYTHON="$VENV/bin/python -u"
+PYTHON="$VENV/bin/python"
 cd "$PKG_DIR"
 
+# shellcheck source=proc.sh
+. "$SCRIPT_DIR/proc.sh"
+
+MODULE_collect='collect.run'
+MODULE_analyze='analyze.run'
+
 is_running() {
-    local pf="$RUN_DIR/$1.pid"
+    local name="$1"
+    local module_var="MODULE_$name"
+    local pf="$RUN_DIR/$name.pid"
     [ -f "$pf" ] || return 1
     local pid; pid="$(cat "$pf" 2>/dev/null || true)"
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    # 只认命令行匹配的进程。PID 被复用给别的进程时不能当成"已在运行"，
+    # 否则 start.sh 会拒绝启动，而实际上采集根本没跑。
+    pid_is_ours "$pid" "${!module_var}"
 }
 
 start_one() {
     local name="$1"; shift
+    local pf="$RUN_DIR/$name.pid"
     if is_running "$name"; then
-        echo "  $name 已在运行 (pid $(cat "$RUN_DIR/$name.pid"))，跳过"
+        echo "  $name 已在运行 (pid $(cat "$pf"))，跳过"
         return 0
     fi
-    nohup $PYTHON -m "$@" \
+    if [ -f "$pf" ]; then
+        echo "  [!] 清理失效 pidfile（pid $(cat "$pf" 2>/dev/null || echo 空) 不是 $name）"
+        rm -f "$pf"
+    fi
+    nohup "$PYTHON" -u -m "$@" \
         >> "$LOG_DIR/$name.log" 2>&1 &
     local pid=$!
-    echo "$pid" > "$RUN_DIR/$name.pid"
+    echo "$pid" > "$pf"
     sleep 2
     if kill -0 "$pid" 2>/dev/null; then
         echo "  $name 已启动 (pid $pid)  日志 logs/$name.log"
     else
         echo "  [!] $name 启动后立刻退出，看 logs/$name.log：" >&2
         tail -20 "$LOG_DIR/$name.log" >&2
-        rm -f "$RUN_DIR/$name.pid"
+        rm -f "$pf"
         return 1
     fi
 }

@@ -12,6 +12,7 @@
 """
 import json
 import logging
+import signal
 import time
 from datetime import datetime, timezone
 
@@ -270,6 +271,19 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
+def install_signal_handlers() -> None:
+    """把 SIGTERM 转成 KeyboardInterrupt。
+
+    deploy/stop.sh 发的是 SIGTERM，Python 默认不会把它变成
+    KeyboardInterrupt，`except KeyboardInterrupt` 和 `finally` 都不会执行。
+    转换后主循环能正常退出并关连接。
+    """
+    def _to_keyboard_interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _to_keyboard_interrupt)
+
+
 def main() -> int:
     import argparse
     import sys
@@ -287,6 +301,7 @@ def main() -> int:
     args = ap.parse_args()
 
     setup_logging(args.verbose)
+    install_signal_handlers()
     dao = Dao()
     try:
         if args.once:

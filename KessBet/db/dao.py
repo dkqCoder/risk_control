@@ -47,6 +47,20 @@ class Dao:
         self._dsn.setdefault('connect_timeout', 8)
         self._dsn.setdefault('charset', 'utf8mb4')
         self._dsn.setdefault('autocommit', False)
+        # 用 READ COMMITTED 而不是 MySQL 默认的 REPEATABLE READ。
+        #
+        # 原因：REPEATABLE READ 下，一条连接读到第一行时就固定了整场事务的
+        # 一致性快照，之后不 commit 就一直看不到别处的写入。本项目的读取方
+        # 都是长期存活的只读循环（analyze.run 每轮只读、从不 commit；
+        # collect.run 主线程只做查询），所以会永久停在启动那一刻的数据上：
+        # 实测 analyze_once 第二轮起看到的永远是第一轮的赔率，report()
+        # 报 prematch=0 而库里实际有 5 万多行。
+        #
+        # READ COMMITTED 每条语句重新取快照，读循环天然看到最新数据。
+        # 写入侧不受影响：writer/dao 的写操作都是单场事务 + 显式 commit，
+        # 不依赖 REPEATABLE READ 的“事务内可重复读”语义。
+        self._dsn.setdefault('init_command',
+                             'SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED')
         # 密码只从环境变量来。缺了就立刻报错，不要等到 pymysql 抛
         # "Access denied" 才发现是没加载 .env。
         if not self._dsn.get('password'):
