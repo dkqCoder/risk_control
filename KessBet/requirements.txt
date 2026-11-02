@@ -1,0 +1,12 @@
+# KessBet 运行依赖
+#
+# 版本与开发机（Windows / Python 3.13.7）实测一致，避免部署后行为漂移。
+# 升级任一版本前先跑 test/ 全套，尤其是 scipy —— milp 的求解结果
+# 依赖 HiGHS 版本。
+
+curl_cffi==0.15.0
+pycryptodome==4.1.0
+scipy==1.18.1
+numpy==2.4.4
+PyMySQL==1.2.3
+cryptography>=42.0.0

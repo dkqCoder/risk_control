@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{{TITLE}} · 赔率对照</title>
+<style>
+  :root{
+    --bg:#0f1419; --panel:#171c22; --panel2:#1e252d; --line:#2a333d;
+    --fg:#e6edf3; --dim:#8b98a5; --ok:#3fb950; --bad:#f85149; --na:#6e7b8b;
+    --accent:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+  }
+  header{
+    position:sticky; top:0; z-index:10; background:var(--panel);
+    border-bottom:1px solid var(--line); padding:14px 22px;
+    display:flex; flex-wrap:wrap; gap:22px; align-items:center;
+  }
+  header h1{font-size:17px; margin:0; font-weight:600}
+  .meta{color:var(--dim); font-size:12px}
+  .meta b{color:var(--fg); font-weight:500}
+  .stats{display:flex; gap:16px; margin-left:auto; font-size:13px}
+  .stats span{color:var(--dim)}
+  .stats b{font-variant-numeric:tabular-nums}
+  .stats .g{color:var(--ok)}
+  .stats .r{color:var(--bad)}
+  .wrap{padding:18px 22px 60px; max-width:1180px; margin:0 auto; columns:2; column-gap:18px}
+  @media(max-width:900px){ .wrap{columns:1} }
+  .market{
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    margin:0 0 14px; padding:12px 14px; break-inside:avoid;
+  }
+  .market h3{
+    margin:0 0 9px; font-size:13px; font-weight:600; letter-spacing:.02em;
+    color:var(--accent); display:flex; align-items:center; gap:8px;
+  }
+  .miss{color:var(--na); font-size:11px; font-weight:400}
+  table{width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums}
+  th{
+    text-align:left; font-size:11px; font-weight:500; color:var(--dim);
+    padding:3px 6px; border-bottom:1px solid var(--line); text-transform:uppercase;
+  }
+  td{padding:3px 6px; border-bottom:1px solid rgba(42,51,61,.5); font-size:13px}
+  tr:last-child td{border-bottom:none}
+  td:first-child{color:var(--dim); width:14%}
+  td:nth-child(2){width:24%}
+  td:nth-child(3),td:nth-child(4){width:22%; font-family:ui-monospace,Consolas,monospace}
+  .mark{width:8%; text-align:center; font-weight:700}
+  tr.ok .mark{color:var(--ok)}
+  tr.bad{background:rgba(248,81,73,.09)}
+  tr.bad .mark{color:var(--bad)}
+  tr.bad td:nth-child(4){color:var(--bad); font-weight:600}
+  tr.na .mark{color:var(--na)}
+  tr.na td:nth-child(4){color:var(--na)}
+  .note{
+    max-width:1180px; margin:0 auto 16px; padding:10px 14px;
+    background:rgba(88,166,255,.08); border-left:3px solid var(--accent);
+    border-radius:4px; font-size:12.5px; color:var(--dim);
+  }
+  .note b{color:var(--fg)}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>{{TITLE}}</h1>
+    <div class="meta">matchId <b>{{MID}}</b></div>
+  </div>
+  <div class="meta">页面生成 <b>{{NOW}}</b> · 接口快照 <b>{{APITS}}</b></div>
+  <div class="stats">
+    <span>一致 <b class="g">{{MATCHED}}</b></span>
+    <span>不一致 <b class="r">{{MISMATCHED}}</b></span>
+  </div>
+</header>
+
+<div class="note">
+  左侧<b>官网页面</b>是从 kessbet.com 比赛页直接读取的渲染结果；右侧<b>接口抓取</b>
+  是程序通过 <code>action:0015</code> 拿到的原始数据。两者抓取时间不同，赔率会实时变动，
+  个别差异属正常。
+</div>
+
+<div class="wrap">
+{{BODY}}
+</div>
+</body>
+</html>

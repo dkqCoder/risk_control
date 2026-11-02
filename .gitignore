@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 抓取归档数据：运行时不需要，服务器上重新抓即可
+# （测试中 test_kessbet_arb.py 依赖 snapshots/_api_snapshot.json，
+#   只在本地跑测试时需要，线上部署不跑测试）
+KessBet/data/
+
+# 运行产物
+KessBet/logs/*.log
+KessBet/bash.exe.stackdump
+KessBet/run/*.pid
+KessBet/.venv/
+
+# 本地环境
+.env
+*.local
+KessBet/deploy/.env
+
+# 编辑器
+.idea/
+.vscode/
