@@ -307,6 +307,86 @@ class Dao:
             cur.execute(sql, (match_id,))
             return {(r[0], r[1], r[2], r[3]) for r in cur.fetchall()}
 
+    # ---------- 分析结果快照 ----------
+    #
+    # analyze 每轮把每场的判定结果写进来，页面直接读。
+    # 页面**绝不能**在请求里跑 ILP —— 单场 1.2 秒，一屏 50 场就是 60 秒。
+
+    def write_cost(self, platform: str, match_id: str, sport: str,
+                   kickoff_time, cost, cost_scope: str,
+                   n_markets: int, n_selections: int, n_candidates: int,
+                   ilp_chosen: str | None, lp_worst_profit,
+                   lp_chosen: str | None, cross_gap, error: str | None,
+                   odds_updated, computed_time) -> None:
+        sql = """
+        INSERT INTO kessbet_match_cost
+          (platform, match_id, sport, kickoff_time, cost, cost_scope,
+           n_markets, n_selections, n_candidates, ilp_chosen,
+           lp_worst_profit, lp_chosen, cross_gap, error,
+           odds_updated, computed_time)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON DUPLICATE KEY UPDATE
+          sport=VALUES(sport), kickoff_time=VALUES(kickoff_time),
+          cost=VALUES(cost), cost_scope=VALUES(cost_scope),
+          n_markets=VALUES(n_markets), n_selections=VALUES(n_selections),
+          n_candidates=VALUES(n_candidates), ilp_chosen=VALUES(ilp_chosen),
+          lp_worst_profit=VALUES(lp_worst_profit), lp_chosen=VALUES(lp_chosen),
+          cross_gap=VALUES(cross_gap), error=VALUES(error),
+          odds_updated=VALUES(odds_updated), computed_time=VALUES(computed_time)
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (
+                platform, match_id, sport, kickoff_time, cost, cost_scope,
+                n_markets, n_selections, n_candidates, ilp_chosen,
+                lp_worst_profit, lp_chosen, cross_gap, error,
+                odds_updated, computed_time,
+            ))
+
+    def cost_updated_at(self, match_id: str, platform: str = 'kessbet'):
+        """该场赔率最后一次变更时间，用来判断能否跳过重算。
+
+        取 odds_prematch 的 MAX(updated_time)，比读整场选项便宜得多。
+        """
+        sql = """SELECT MAX(updated_time) FROM kessbet_odds_prematch
+                 WHERE platform=%s AND match_id=%s"""
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (platform, match_id))
+            return cur.fetchone()[0]
+
+    def get_costs(self, match_ids: list[str],
+                  platform: str = 'kessbet') -> dict[str, dict]:
+        """批量读成本快照，一次查询搞定列表页。"""
+        if not match_ids:
+            return {}
+        ph = ','.join(['%s'] * len(match_ids))
+        sql = f"""
+        SELECT match_id, cost, cost_scope, n_markets, n_selections,
+               n_candidates, ilp_chosen, lp_worst_profit, lp_chosen,
+               cross_gap, error, computed_time
+        FROM kessbet_match_cost
+        WHERE platform=%s AND match_id IN ({ph})
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, [platform] + list(match_ids))
+            out = {}
+            for r in cur.fetchall():
+                out[r[0]] = {
+                    'cost': float(r[1]) if r[1] is not None else None,
+                    'cost_scope': r[2], 'n_markets': r[3], 'n_selections': r[4],
+                    'n_candidates': r[5], 'ilp_chosen': r[6],
+                    'lp_worst_profit': float(r[7]) if r[7] is not None else None,
+                    'lp_chosen': r[8],
+                    'cross_gap': float(r[9]) if r[9] is not None else None,
+                    'error': r[10], 'computed_time': r[11],
+                }
+        return out
+
+    def cleanup_cost(self, days: int = 7) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM kessbet_match_cost "
+                        "WHERE kickoff_time < NOW() - INTERVAL %s DAY", (days,))
+            return cur.rowcount
+
     def get_selections(self, match_id: str) -> list[tuple]:
         sql = """
         SELECT market, side, line, selection, odds

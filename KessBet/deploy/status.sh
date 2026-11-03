@@ -31,9 +31,10 @@ proc_state() {
 echo "================ KessBet 状态 ================"
 echo "采集进程 $(proc_state collect)"
 echo "分析进程 $(proc_state analyze)"
+echo "Web 服务  $(proc_state api)"
 echo
 echo "---- 日志 ----"
-for f in "$LOG_DIR"/collect.log "$LOG_DIR"/analyze.log; do
+for f in "$LOG_DIR"/collect.log "$LOG_DIR"/analyze.log "$LOG_DIR"/api.log; do
     [ -f "$f" ] || continue
     printf '%-14s %8s  %s\n' "$(basename "$f")" \
         "$(du -h "$f" | cut -f1)" \
@@ -70,7 +71,7 @@ fi
 
 echo
 echo "---- 最近错误 ----"
-grep -hE "ERROR|CRITICAL|Traceback" "$LOG_DIR"/collect.log "$LOG_DIR"/analyze.log 2>/dev/null \
+grep -hE "ERROR|CRITICAL|Traceback" "$LOG_DIR"/collect.log "$LOG_DIR"/analyze.log "$LOG_DIR"/api.log 2>/dev/null \
     | tail -5 | sed 's/^/  /' || true
-[ -n "${1:-}" ] && [ "$1" = "-f" ] && { echo; echo "---- 跟踪日志 (Ctrl-C 退出) ----"; tail -f "$LOG_DIR"/collect.log "$LOG_DIR"/analyze.log; }
+[ -n "${1:-}" ] && [ "$1" = "-f" ] && { echo; echo "---- 跟踪日志 (Ctrl-C 退出) ----"; tail -f "$LOG_DIR"/collect.log "$LOG_DIR"/analyze.log "$LOG_DIR"/api.log; }
 exit 0

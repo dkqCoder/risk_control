@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Odds Monitor</title>
+<style>
+:root{
+  /* 浅色主题（中性灰底，对比更实）。状态色/强调色对比度 >= 4.5:1（WCAG AA）。
+     图表系列色经 dataviz 校验：CVD ΔE 9.0、对比度全部 >= 3:1。 */
+  --bg:#e9ebee; --panel:#ffffff; --panel2:#f4f5f7; --line:#c9cfd6;
+  --fg:#15181c; --dim:#4a525c; --muted:#7a838d;
+  --s1:#1f6fd0; --s2:#c2410c; --s3:#0b7a52;
+  --good:#0a6e0a; --warning:#8a5a00; --serious:#bc4c00; --critical:#b01818;
+  --accent:#1f6fd0;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--fg);
+  font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+}
+header{
+  position:sticky; top:0; z-index:10; background:var(--panel);
+  border-bottom:1px solid var(--line); padding:14px 22px;
+  display:flex; flex-wrap:wrap; gap:22px; align-items:center;
+}
+header h1{font-size:17px; margin:0; font-weight:600}
+.sim{font-size:11px; color:var(--warning); border:1px solid var(--warning);
+  border-radius:4px; padding:1px 6px}
+.stats{display:flex; gap:18px; margin-left:auto; font-size:13px}
+.stats span{color:var(--dim)}
+.stats b{font-variant-numeric:tabular-nums; color:var(--fg); font-weight:500}
+.wrap{padding:18px 22px 60px; max-width:1240px; margin:0 auto}
+
+/* ---- 筛选条 ---- */
+.filters{
+  display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+  margin-bottom:14px; padding:10px 12px;
+  background:var(--panel); border:1px solid var(--line); border-radius:8px;
+}
+.filters label{font-size:12px; color:var(--dim); margin-right:4px}
+.filters select,.filters input{
+  background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+  border-radius:5px; padding:5px 8px; font-size:13px;
+}
+.filters input[type=search]{width:180px}
+.btn{
+  background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+  border-radius:5px; padding:5px 12px; font-size:13px; cursor:pointer;
+}
+.btn:hover{border-color:var(--accent); color:var(--accent)}
+.btn.pri{background:rgba(9,105,218,.08); border-color:var(--accent); color:var(--accent)}
+
+/* ---- 表格 ---- */
+table{width:100%; border-collapse:collapse; background:var(--panel);
+  border:1px solid var(--line); border-radius:8px; overflow:hidden;
+  font-variant-numeric:tabular-nums}
+thead th{
+  text-align:left; font-size:11px; font-weight:500; color:var(--dim);
+  padding:9px 12px; border-bottom:1px solid var(--line);
+  text-transform:uppercase; letter-spacing:.03em; white-space:nowrap;
+  background:var(--panel2);
+}
+thead th.num{text-align:right}
+tbody td{padding:9px 12px; border-bottom:1px solid rgba(216,222,228,.7); font-size:13px}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:rgba(9,105,218,.04); cursor:pointer}
+td.num{text-align:right; font-family:ui-monospace,Consolas,monospace}
+.ko{color:var(--dim); white-space:nowrap}
+.ko b{color:var(--fg); font-weight:500}
+.teams{font-weight:500}
+.teams small{display:block; color:var(--dim); font-weight:400; font-size:11px}
+.cost{font-weight:600}
+.cost.hot{color:var(--warning)}
+.cost.cold{color:var(--s3)}
+.delta{font-size:12px}
+.delta.up{color:var(--critical)}    /* 成本上升 */
+.delta.down{color:var(--good)}      /* 成本下降 */
+
+/* ---- 状态徽章：颜色 + 文字，不靠颜色单独表意 ---- */
+.badge{
+  display:inline-flex; align-items:center; gap:5px;
+  font-size:11px; padding:2px 8px; border-radius:999px;
+  border:1px solid transparent; white-space:nowrap;
+}
+.badge i{width:6px; height:6px; border-radius:50%; display:inline-block}
+.badge.ok{color:var(--good); border-color:rgba(10,125,10,.35); background:rgba(10,125,10,.08)}
+.badge.ok i{background:var(--good)}
+.badge.warn{color:var(--warning); border-color:rgba(154,103,0,.35); background:rgba(154,103,0,.08)}
+.badge.warn i{background:var(--warning)}
+.badge.crit{color:var(--critical); border-color:rgba(192,32,32,.35); background:rgba(192,32,32,.08)}
+.badge.crit i{background:var(--critical)}
+.badge.mute{color:var(--muted); border-color:var(--line); background:var(--panel2)}
+.badge.mute i{background:var(--muted)}
+
+.hint{color:var(--dim); font-size:12px; margin:10px 0 0; line-height:1.8}
+
+/* 平台标签 */
+.plats{white-space:nowrap}
+.pf{
+  display:inline-block; font-size:11px; padding:1px 6px; border-radius:3px;
+  background:var(--panel2); border:1px solid var(--line); color:var(--dim);
+  margin-right:4px;
+}
+.pf:last-child{margin-right:0}
+/* 跨平台标记：用强调色区分，并带文字，不靠颜色单独表意 */
+.pf.cross{
+  background:rgba(31,111,208,.1); border-color:rgba(31,111,208,.35);
+  color:var(--accent); font-weight:500;
+}
+.pager{display:flex; gap:8px; align-items:center; justify-content:flex-end;
+  margin-top:12px; font-size:12px; color:var(--dim)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Odds Monitor</h1>
+  <div class="stats">
+    <span title="未来 N 小时内开赛的足球比赛">在盯 <b id="stTotal">—</b> 场</span>
+    <span title="已有成本快照 / 全部"><b id="stComputed">—</b> 已算</span>
+    <span title="全部比赛中的最低覆盖成本（不是当前页）">
+      最低 <b id="stMin" style="color:var(--warning)">—</b></span>
+    <span title="全部比赛中位数">中位 <b id="stMedian">—</b></span>
+    <span title="成本低于 1.03 的场次：抽水异常低，最接近套利">偏低 <b id="stBelow">—</b></span>
+    <span id="stSync" style="color:var(--muted)"></span>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="filters">
+    <label for="sport">运动</label>
+    <select id="sport">
+      <option value="sr:sport:1" selected>足球</option>
+      <option value="sr:sport:2">篮球</option>
+      <option value="sr:sport:3">棒球</option>
+      <option value="sr:sport:6">手球</option>
+      <option value="sr:sport:16">美式足球</option>
+    </select>
+
+    <label for="range">开赛</label>
+    <select id="range">
+      <option value="6">未来 6 小时</option>
+      <option value="24">未来 24 小时</option>
+      <option value="72" selected>未来 3 天（72h）</option>
+    </select>
+
+    <label for="maxcost">成本 ≤</label>
+    <select id="maxcost">
+      <option value="">不限</option>
+      <option value="1.05">1.05</option>
+      <option value="1.03">1.03</option>
+      <option value="1.00">1.00（只看套利）</option>
+    </select>
+
+    <input type="search" id="q" placeholder="搜索球队 / 联赛">
+
+    <button class="btn pri" id="refresh">刷新</button>
+    <label class="mk-toggle" style="font-size:12px;color:var(--dim);display:flex;align-items:center;gap:5px;cursor:pointer"
+           title="只看数据陈旧 / 无赔率 / 无法覆盖的场次">
+      <input type="checkbox" id="onlyAbnormal"> 仅看异常
+    </label>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>开赛</th>
+        <th>联赛</th>
+        <th>比赛</th>
+        <th>平台</th>
+        <th class="num">盘口</th>
+        <th class="num">选项</th>
+        <th class="num">最小成本</th>
+        <th class="num">1h 变化</th>
+        <th>最近更新</th>
+        <th>状态</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <div class="pager">
+    <span id="pagerInfo">加载中…</span>
+    <button class="btn" id="prev">上一页</button>
+    <button class="btn" id="next">下一页</button>
+  </div>
+
+  <p class="hint">
+    成本 = 覆盖全部 2025 个状态所需的最小 Σ(1/赔率)。&lt;1 才是套利；
+    正常区间 1.02–1.08，就是平台抽水。<br>
+    <b>平台列</b>显示该场比赛有报价的来源。只有一个平台时，成本是该平台内部的
+    最优覆盖成本；有多个平台后，成本标为「跨平台」并按每个选项取各平台最高赔率计算 ——
+    那才是真正可能出现 &lt;1 的地方。<br>
+    「1h 变化」是相对 1 小时前的成本变动 —— <span style="color:var(--good)">绿</span>为成本下降（抽水变少），
+    <span style="color:var(--critical)">红</span>为成本上升。
+  </p>
+</div>
+
+
+<script>
+// ============================================================
+// 数据来自 /api/matches（成本由 analyze 预计算写入 kessbet_match_cost，
+// 页面请求里不跑 ILP）。
+// ============================================================
+// 元素不存在时返回 null 而不是让整个渲染流程抛异常。
+// 页面上有多个可选区块，缺一个不该导致其它数字也不显示。
+const $ = id => document.getElementById(id);
+const setText = (id, v) => { const e = $(id); if (e) e.textContent = v; };
+
+const state = {
+  hours: 72, sport: 'sr:sport:1', q: '',
+  maxCost: null, onlyAbnormal: false,
+  offset: 0, limit: 25, total: 0,
+  loading: false, error: null,
+  rows: [],
+};
+
+const BADGE = {
+  ok:      ['ok',   '正常'],
+  pending: ['mute', '计算中'],
+  nodata:  ['mute', '无赔率'],
+  nocov:   ['crit', '无法覆盖'],
+  error:   ['crit', '计算失败'],
+};
+const PLATFORM_LABEL = { kessbet: 'KessBet' };
+
+function fmtCost(v){ return v == null ? '—' : v.toFixed(4); }
+
+function fmtPlatforms(r){
+  if (!r.platforms.length) return '<span style="color:var(--muted)">—</span>';
+  return r.platforms.map(p => `<span class="pf">${PLATFORM_LABEL[p] || p}</span>`).join('')
+    + (r.platforms.length > 1 ? '<span class="pf cross">跨平台</span>' : '');
+}
+
+function costClass(c, status){
+  if (c == null) return '';
+  if (c < 1.0) return 'cold';        // 套利，用最醒目
+  if (c < 1.03) return 'cold';
+  if (c < 1.05) return 'hot';
+  return '';
+}
+
+function render(){
+  const tb = $('rows');
+  if (state.error) {
+    tb.innerHTML = `<tr><td colspan="10" style="padding:40px; text-align:center; color:var(--critical)">
+      API 请求失败：${state.error}<br>
+      <span style="color:var(--dim); font-size:12px">
+        确认 web/api.py 已启动：<code>uvicorn web.api:app --port 8080</code>
+      </span></td></tr>`;
+    return;
+  }
+  if (state.loading && !state.rows.length) {
+    tb.innerHTML = `<tr><td colspan="10" style="padding:40px; text-align:center; color:var(--dim)">加载中…</td></tr>`;
+    return;
+  }
+  if (!state.rows.length) {
+    tb.innerHTML = `<tr><td colspan="10" style="padding:40px; text-align:center; color:var(--dim)">没有符合条件的比赛</td></tr>`;
+    return;
+  }
+
+  tb.innerHTML = state.rows.map(r => {
+    const [cls, label] = BADGE[r.status] || BADGE.mute || ['mute', r.status];
+    const ko = (r.kickoff_time || '').slice(5, 16);   // MM-DD HH:MM
+    const upd = r.last_update ? r.last_update.slice(11, 16) : '—';
+    return `<tr data-id="${r.match_id}">
+      <td class="ko">${ko}</td>
+      <td style="color:var(--dim)">${r.league || '—'}</td>
+      <td class="teams">${r.home_team} <small>vs ${r.away_team}</small></td>
+      <td class="plats">${fmtPlatforms(r)}</td>
+      <td class="num">${r.n_markets || '—'}</td>
+      <td class="num">${r.n_selections || '—'}</td>
+      <td class="num cost ${costClass(r.cost, r.status)}">${fmtCost(r.cost)}</td>
+      <td class="num" style="color:var(--muted)">—</td>
+      <td style="color:var(--dim); white-space:nowrap">${upd}</td>
+      <td><span class="badge ${cls}"><i></i>${label}</span></td>
+    </tr>`;
+  }).join('');
+
+  // 点行进详情
+  tb.querySelectorAll('tr[data-id]').forEach(tr => {
+    tr.addEventListener('click', () => {
+      location.href = `detail.html?id=${encodeURIComponent(tr.dataset.id)}`;
+    });
+  });
+}
+
+function renderPager(){
+  const from = state.total ? state.offset + 1 : 0;
+  const to = Math.min(state.offset + state.limit, state.total);
+  $('pagerInfo').textContent =
+    `共 ${state.total} 场，显示 ${from}–${to}` +
+    (state.loading ? '（刷新中…）' : '');
+  $('prev').disabled = state.offset <= 0 || state.loading;
+  $('next').disabled = state.offset + state.limit >= state.total || state.loading;
+}
+
+async function load(){
+  state.loading = true; state.error = null;
+  render(); renderPager();
+
+  const p = new URLSearchParams({
+    hours: state.hours, sport: state.sport,
+    limit: state.limit, offset: state.offset,
+  });
+  if (state.q) p.set('q', state.q);
+  if (state.maxCost != null) p.set('max_cost', state.maxCost);
+  if (state.onlyAbnormal) p.set('only_abnormal', 'true');
+
+  try {
+    const r = await fetch('/api/matches?' + p);
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
+    const d = await r.json();
+    state.rows = d.matches;
+    state.total = d.total;
+  } catch (e) {
+    state.error = e.message;
+    state.rows = []; state.total = 0;
+  } finally {
+    state.loading = false;
+    render(); renderPager();
+  }
+
+  // 顶部统计单独请求：必须基于**全部符合条件**的比赛，
+  // 不能对当前页 25 条取 min（那样翻页数字会变）。
+  loadSummary();
+}
+
+async function loadSummary(){
+  const p = new URLSearchParams({ hours: state.hours, sport: state.sport });
+  if (state.q) p.set('q', state.q);
+  try {
+    const r = await fetch('/api/summary?' + p);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const s = await r.json();
+    setText('stTotal', s.matches);
+    // 「已算」显示 已算/总数
+    setText('stComputed', s.computed + '/' + s.matches);
+    setText('stMin', s.min_cost == null ? '—' : s.min_cost.toFixed(4));
+    setText('stMedian', s.median_cost == null ? '—' : s.median_cost.toFixed(4));
+    setText('stBelow', s.below_1_03);
+    const sb = $('stBelow');
+    if (sb) sb.style.color = s.below_1_03 > 0 ? 'var(--warning)' : '';
+    setText('stSync', (s.pending ? s.pending + ' 待算 · ' : '') +
+      '更新于 ' + new Date().toLocaleTimeString());
+  } catch (e) {
+    $('stSync').textContent = '统计加载失败';
+  }
+}
+
+// ---- 交互 ----
+$('range').addEventListener('change', e => {
+  state.hours = Number(e.target.value) || 24;
+  state.offset = 0; load();
+});
+$('sport').addEventListener('change', e => {
+  state.sport = e.target.value;
+  state.offset = 0; load();
+});
+$('maxcost').addEventListener('change', e => {
+  state.maxCost = e.target.value === '' ? null : Number(e.target.value);
+  state.offset = 0; load();
+});
+$('onlyAbnormal').addEventListener('change', e => {
+  state.onlyAbnormal = e.target.checked;
+  state.offset = 0; load();
+});
+$('refresh').addEventListener('click', () => { state.offset = state.offset; load(); });
+
+let qTimer;
+$('q').addEventListener('input', e => {
+  clearTimeout(qTimer);
+  qTimer = setTimeout(() => {
+    state.q = e.target.value.trim(); state.offset = 0; load();
+  }, 300);
+});
+$('prev').addEventListener('click', () => {
+  state.offset = Math.max(0, state.offset - state.limit); load();
+});
+$('next').addEventListener('click', () => {
+  state.offset += state.limit; load();
+});
+
+// 每 30 秒自动刷新（成本由后台 analyze 每 60 秒更新一轮）
+setInterval(() => { if (!document.hidden) load(); }, 30000);
+
+load();
+</script>
+</body>
+</html>

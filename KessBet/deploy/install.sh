@@ -179,7 +179,7 @@ VENV="$PKG_DIR/.venv"
 "$VENV/bin/pip" install -q -r "$PKG_DIR/requirements.txt"
 echo "    已安装："
 "$VENV/bin/pip" list --format=freeze 2>/dev/null | grep -Ei \
-    'curl|pycrypto|scipy|numpy|pymysql|cryptography' | sed 's/^/      /'
+    'curl|pycrypto|scipy|numpy|pymysql|cryptography|fastapi|uvicorn' | sed 's/^/      /'
 
 # ---------- 8. 写 .env ----------
 log "写入配置"

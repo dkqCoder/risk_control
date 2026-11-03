@@ -328,7 +328,80 @@ CREATE TABLE IF NOT EXISTS kessbet_odds_hit (
 
 
 -- =============================================================================
--- ⑥ kessbet_collect_log — 采集与运行日志
+-- ⑥ kessbet_match_cost — 分析结果快照（供页面只读）
+-- -----------------------------------------------------------------------------
+-- analyze 每算完一场就 upsert 一行。页面读这张表，**不在请求里跑 ILP**。
+--
+-- 为什么必须有这张表：
+--   单场 ILP 约 1.2 秒。列表页一屏 50 场就是 60 秒，用户不可能等。
+--   分析进程本来就每 60 秒跑一轮，顺手把结果落库，页面读一次只要几毫秒。
+--
+-- 为什么按 match_id 而不是 canonical_id 存：
+--   成本是**单平台内部**的概念（单家抽水）。跨平台成本要另外算，
+--   将来会加 cost_cross 列并用 canonical_id 聚合。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS kessbet_match_cost (
+    platform        VARCHAR(16)  NOT NULL
+        COMMENT '平台标识',
+
+    match_id        VARCHAR(32)  NOT NULL
+        COMMENT '平台内比赛 ID',
+
+    sport           VARCHAR(16)  NOT NULL
+        COMMENT 'Sportradar 运动编号',
+
+    kickoff_time    DATETIME     NOT NULL
+        COMMENT '开赛时间（北京时间），冗余存储便于按时间筛选和清理',
+
+    cost            DOUBLE       DEFAULT NULL
+        COMMENT '最小覆盖成本 Σ(1/赔率)。NULL 表示没有可用候选或无法覆盖',
+
+    cost_scope      VARCHAR(8)   NOT NULL DEFAULT 'single'
+        COMMENT 'single=单平台内部最优。将来跨平台会写 cross',
+
+    n_markets       INT          NOT NULL DEFAULT 0
+        COMMENT '盘口数',
+
+    n_selections    INT          NOT NULL DEFAULT 0
+        COMMENT '选项数',
+
+    n_candidates    INT          NOT NULL DEFAULT 0
+        COMMENT '可建模的候选数（能映射到状态空间的）',
+
+    ilp_chosen      TEXT
+        COMMENT 'ILP 选中的选项描述，JSON 数组',
+
+    lp_worst_profit DOUBLE       DEFAULT NULL
+        COMMENT 'LP 最差状态净收益。t = 1/cost - 1，用于和 ILP 交叉校验',
+
+    lp_chosen       TEXT
+        COMMENT 'LP 建议的资金配置，JSON 数组 [{desc, weight}]',
+
+    cross_gap       DOUBLE       DEFAULT NULL
+        COMMENT 'ILP 与 LP 的偏差，正常应 < 1e-4',
+
+    error           VARCHAR(32)  DEFAULT NULL
+        COMMENT 'no_data / no_candidates / no_cover / ilp_error / lp_error；NULL 表示正常',
+
+    odds_updated    DATETIME     DEFAULT NULL
+        COMMENT '该场赔率最后一次变更时间。赔率没变就不必重算，analyze 用它跳过',
+
+    computed_time   DATETIME     NOT NULL
+        COMMENT '本次计算的时刻（北京时间）',
+
+    PRIMARY KEY (platform, match_id),
+    KEY idx_kickoff (kickoff_time)
+        COMMENT '页面按开赛时间筛选',
+    KEY idx_cost (cost)
+        COMMENT '页面按成本排序/筛阈值',
+    KEY idx_computed (computed_time)
+        COMMENT '排查哪些比赛很久没算'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='分析结果快照：analyze 写入，页面只读，避免请求时跑 ILP';
+
+
+-- =============================================================================
+-- ⑦ kessbet_collect_log — 采集与运行日志
 -- -----------------------------------------------------------------------------
 -- 排查用。记录每次赛程刷新、清理、WS 连接等操作的结果。
 -- 保留 30 天。

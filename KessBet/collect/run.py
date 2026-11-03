@@ -7,7 +7,7 @@
 流程：
     启动
      ├─ 拉 7 个运动赛程 → kessbet_match
-     ├─ bootstrap：拉 24 小时内全部比赛赔率
+     ├─ bootstrap：拉 HORIZON_HOURS（默认 72）小时内全部比赛赔率
      └─ WebSocket 连接，订阅全部未开赛比赛
 
     运行中
@@ -83,8 +83,8 @@ class Collector:
         self.stats['schedule_refresh'] += 1
         return by_sport
 
-    def upcoming_ids(self, hours: int = 24) -> list[str]:
-        return [r[0] for r in self.dao.upcoming(hours)]
+    def upcoming_ids(self, hours: int | None = None) -> list[str]:
+        return [r[0] for r in self.dao.upcoming(hours or config.HORIZON_HOURS)]
 
     # ---------- 订阅 ----------
 
@@ -97,7 +97,7 @@ class Collector:
         """
         if not self.ws:
             return
-        ids = self.upcoming_ids(24)
+        ids = self.upcoming_ids()
         self.ws.subscribe(ids)
         # 本地剔除已结束的
         removed = self.ws.prune(set(ids))
@@ -112,7 +112,7 @@ class Collector:
 
         每小时赛程刷新后调用，保证新进入窗口的比赛有初始数据。
         """
-        hours = 24
+        hours = config.HORIZON_HOURS
         with self.dao.conn.cursor() as c:
             c.execute("""
                 SELECT m.match_id
@@ -150,7 +150,7 @@ class Collector:
 
         log.info('=== phase 2: bootstrap ===')
         t0 = time.time()
-        total = self.refresher.bootstrap(hours=24)
+        total = self.refresher.bootstrap(hours=config.HORIZON_HOURS)
         log.info('bootstrap: %d rows in %.1fs', total, time.time() - t0)
 
         log.info('=== phase 3: websocket ===')
@@ -172,7 +172,7 @@ class Collector:
     def _start_ws(self) -> None:
         try:
             self.adapter.on_push(self.refresher.mark_dirty)
-            self.ws = self.adapter.start_ws(initial_ids=self.upcoming_ids(24))
+            self.ws = self.adapter.start_ws(initial_ids=self.upcoming_ids())
             log.info('ws subscribed to %d matches', self.ws.subscribed_count)
         except Exception as e:
             log.error('ws start failed: %s (will retry in loop)', e)
@@ -196,7 +196,7 @@ class Collector:
                     log.warning('ws not alive, reconnecting...')
                     self._start_ws()
                     if self.ws:
-                        self.refresher.bootstrap(hours=24)
+                        self.refresher.bootstrap(hours=config.HORIZON_HOURS)
 
                 # 每小时刷新赛程
                 if time.monotonic() - self._last_schedule > 3600:

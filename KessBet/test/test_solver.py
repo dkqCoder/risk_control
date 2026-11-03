@@ -93,14 +93,36 @@ def test_empty_candidates():
 
 
 def test_zero_mask_ignored():
-    """mask 为 0 的候选应被忽略（不覆盖任何状态）。"""
+    """mask 为 0 的候选应被忽略（不覆盖任何状态）。
+
+    赔率要用正常值（> MIN_ODDS），否则会被赔率下限先过滤掉，
+    测不到「mask 为 0」这条逻辑。
+    """
     n = 2
     cands = [
-        (0b00, 1.01, 'useless'),
+        (0b00, 2.5, 'useless'),
         (0b11, 2.0, 'covers_all'),
     ]
     r = solve(cands, n)
     assert r.chosen == ['covers_all']
+
+
+def test_low_odds_excluded():
+    """赔率 <= MIN_ODDS(1.02) 的选项不参与求解。
+
+    这类「极端盘线」（客队上半场进<2.5球之类）赔率接近 1.00，
+    1/赔率 ≈ 0.99，看起来能极便宜地覆盖大片状态，会把成本算得虚低。
+    实测 245159490624721227 因此从 1.0817 变成 1.0568。
+    """
+    n = 3
+    cands = [
+        (0b001, 2.0, 'a'),
+        (0b010, 3.0, 'b'),
+        (0b100, 1.01, 'extreme_line'),   # 低于 MIN_ODDS，应被排除
+    ]
+    r = solve(cands, n)
+    assert r.status == NO_COVER
+    assert r.gap_state == 2
 
 
 # ---------- 覆盖校验 ----------

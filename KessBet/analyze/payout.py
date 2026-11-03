@@ -15,8 +15,9 @@ from scipy.optimize import linprog
 
 log = logging.getLogger(__name__)
 
-# 赔率下限：<= 该值视为停售（平台标记位为 0），不能下注
-MIN_ODDS = 1.0
+# 赔率下限：<= 该值不参与求解。必须和 solver.MIN_ODDS 一致，
+# 否则两个模型的候选池不同，交叉验证会误报。原因见 solver.py 的注释。
+MIN_ODDS = 1.02
 
 # 判定阈值：最差状态净收益必须严格大于该值才算套利
 # 不能用 0，因为求解器有数值误差；也不能太大，否则漏掉真实机会

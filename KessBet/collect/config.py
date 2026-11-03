@@ -37,5 +37,27 @@ WS_SUBSCRIBE_BATCH = 30
 WS_URL = ('wss://socketio.kessbet.com/cpop/network/'
           '?brand=KYA&platform=pc&EIO=3&transport=websocket')
 
-ANALYZE_INTERVAL = 60
-ANALYZE_HORIZON_HOURS = 6
+# ---- 分析进程调度 ----
+# 事件驱动：每 ANALYZE_POLL_SEC 秒查一次「赔率比快照新」的比赛，只算这些。
+# 赔率由采集侧写入 odds_prematch，updated_time 一变就会被这里捕获。
+ANALYZE_POLL_SEC = 2
+
+# 兜底：每 N 秒忽略「没变」判断，全量算一遍。
+# 防快照表被误删、时钟漂移、跳过条件写错导致某些场次永远不更新。
+ANALYZE_FULL_SWEEP_SEC = 300
+
+# 并发线程数。ILP 是 CPU 密集的，设成 CPU 核数的一半左右比较稳，
+# 太高会和采集进程抢 CPU。
+ANALYZE_CONCURRENCY = 4
+
+# 采集与分析的时间窗口（小时）。三处必须一致：
+#   - 采集 bootstrap：拉这些比赛的赔率
+#   - WS 订阅：订阅这些比赛接收变动推送
+#   - 分析：只算这些比赛的覆盖成本
+# 窗口外的比赛只有赛程、没有赔率，列表页会显示「无赔率」。
+HORIZON_HOURS = 72
+
+ANALYZE_HORIZON_HOURS = HORIZON_HOURS
+
+# 兼容旧配置名（run_loop 的默认 interval 走 ANALYZE_POLL_SEC）
+ANALYZE_INTERVAL = ANALYZE_POLL_SEC

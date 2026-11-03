@@ -19,6 +19,7 @@ RUN_DIR="$PKG_DIR/run"
 
 MODULE_collect='collect.run'
 MODULE_analyze='analyze.run'
+MODULE_api='uvicorn'
 
 stop_one() {
     local name="$1"
@@ -73,6 +74,7 @@ fi
 case "$TARGET" in
     collect) stop_one collect ;;
     analyze) stop_one analyze ;;
-    all)     stop_one analyze || true; stop_one collect ;;
-    *) echo "用法: $0 [collect|analyze|all]" >&2; exit 1 ;;
+    api)     stop_one api ;;
+    all)     stop_one api || true; stop_one analyze || true; stop_one collect ;;
+    *) echo "用法: $0 [collect|analyze|api|all]" >&2; exit 1 ;;
 esac

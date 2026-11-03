@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Odds Monitor · 单场赔率变化</title>
+<style>
+:root{
+  /* 浅色主题（中性灰底，对比更实）。状态色/强调色对比度 >= 4.5:1（WCAG AA）。
+     图表系列色经 dataviz 校验：CVD ΔE 9.0、对比度全部 >= 3:1。 */
+  --bg:#e9ebee; --panel:#ffffff; --panel2:#f4f5f7; --line:#c9cfd6;
+  --fg:#15181c; --dim:#4a525c; --muted:#7a838d;
+  --s1:#1f6fd0; --s2:#c2410c; --s3:#0b7a52;
+  --good:#0a6e0a; --warning:#8a5a00; --critical:#b01818;
+  --accent:#1f6fd0;
+}
+*{box-sizing:border-box}
+body{margin:0; background:var(--bg); color:var(--fg);
+  font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;}
+a{color:var(--accent); text-decoration:none}
+header{
+  position:sticky; top:0; z-index:10; background:var(--panel);
+  border-bottom:1px solid var(--line);
+}
+header .inner{max-width:1240px; margin:0 auto; padding:12px 22px 18px}
+header .top{display:flex; gap:14px; align-items:center; flex-wrap:wrap}
+header .back{font-size:13px; color:var(--dim); display:flex; align-items:center; gap:4px}
+header .back:hover{color:var(--accent)}
+header h1{font-size:18px; margin:0; font-weight:600; letter-spacing:-.01em}
+.sim{font-size:11px; color:var(--warning); border:1px solid var(--warning);
+  border-radius:4px; padding:1px 6px; opacity:.85}
+
+/* 头部指标条：主指标独占左侧，其余三列用细分隔线排开 */
+.hero{display:flex; align-items:stretch; gap:0; margin-top:16px}
+.hero .primary{padding-right:28px; margin-right:28px; border-right:1px solid var(--line)}
+.hero .primary .lbl{
+  font-size:11px; color:var(--dim); letter-spacing:.04em; margin-bottom:6px;
+  display:flex; align-items:center; gap:6px;
+}
+.hero .primary .big{
+  font-size:34px; font-weight:650; line-height:1; letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums; color:var(--s3);
+}
+.hero .primary .sub{font-size:12px; color:var(--dim); margin-top:7px}
+.hero .primary .sub .tag{
+  display:inline-block; padding:1px 7px; border-radius:3px; margin-right:6px;
+  background:rgba(11,122,82,.1); color:var(--s3); font-weight:500;
+}
+
+.hero .facts{display:flex; gap:0; align-items:flex-start}
+.hero .fact{padding:0 24px; border-right:1px solid var(--line)}
+.hero .fact:last-child{border-right:none; padding-right:0}
+.hero .fact .lbl{font-size:11px; color:var(--dim); margin-bottom:5px; white-space:nowrap}
+.hero .fact .v{
+  font-size:17px; font-weight:600; font-variant-numeric:tabular-nums;
+  line-height:1.25; white-space:nowrap;
+}
+.hero .fact .note{font-size:11px; color:var(--muted); margin-top:3px; white-space:nowrap}
+.hero .fact .note.up{color:var(--critical)}
+.hero .fact .note.down{color:var(--good)}
+.wrap{padding:18px 22px 60px; max-width:1240px; margin:0 auto}
+.card{background:var(--panel); border:1px solid var(--line); border-radius:8px;
+  padding:14px 16px; margin-bottom:16px}
+.card h2{font-size:13px; margin:0 0 12px; font-weight:600; color:var(--accent);
+  letter-spacing:.02em}
+
+/* ---- 组合 ---- */
+.combo{display:flex; gap:10px; flex-wrap:wrap}
+.pick{background:var(--panel2); border:1px solid var(--line); border-radius:6px;
+  padding:8px 12px; font-size:12px; display:flex; gap:10px; align-items:center}
+.pick .k{color:var(--dim)}
+.pick .v{font-family:ui-monospace,Consolas,monospace; font-weight:600}
+
+/* ---- 下注表 ---- */
+.stake-head{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px}
+.stake-head label{font-size:12px; color:var(--dim)}
+.stake-head input{background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+  border-radius:5px; padding:5px 10px; font-size:14px; width:110px;
+  font-variant-numeric:tabular-nums; font-weight:600}
+.stake-head .sep{width:1px; height:16px; background:var(--line)}
+table.stake{width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums}
+table.stake th{font-size:11px; color:var(--dim); font-weight:500; text-transform:uppercase;
+  letter-spacing:.03em; text-align:left; padding:7px 12px; border-bottom:1px solid var(--line)}
+table.stake th.num{text-align:right}
+table.stake td{padding:8px 12px; font-size:13px; border-bottom:1px solid rgba(216,222,228,.7)}
+table.stake td.num{text-align:right; font-family:ui-monospace,Consolas,monospace}
+table.stake tbody tr:last-child td{border-bottom:1px solid var(--line)}
+table.stake tfoot td{padding:9px 12px; font-size:13px; font-weight:600;
+  border-bottom:none; background:var(--panel2)}
+/* 平台标签（与列表页一致） */
+.pf{
+  display:inline-block; font-size:11px; padding:1px 6px; border-radius:3px;
+  background:var(--panel2); border:1px solid var(--line); color:var(--dim);
+  white-space:nowrap;
+}
+.money{color:var(--fg)}
+.money.back{color:var(--s1)}
+
+/* 结算结论 */
+.settle{margin:14px 0 0; padding:12px 14px; border-radius:6px;
+  background:var(--panel2); border-left:3px solid var(--critical); font-size:13px}
+.settle .line{display:flex; gap:22px; flex-wrap:wrap; align-items:baseline}
+.settle .v{font-size:20px; font-weight:600; font-variant-numeric:tabular-nums}
+.settle .v.bad{color:var(--critical)}
+.settle .v.ok{color:var(--good)}
+.settle .note{color:var(--dim); font-size:12px; margin-top:6px}
+
+/* 投注占比条：2px 表面间隙分隔 */
+.bar-wrap{margin-top:16px}
+.bar-lbl{font-size:11px; color:var(--dim); margin-bottom:6px;
+  text-transform:uppercase; letter-spacing:.03em}
+.bar{display:flex; height:14px; border-radius:4px; overflow:hidden; gap:2px}
+.bar div{display:flex; align-items:center; justify-content:center;
+  font-size:10px; color:#fff; font-variant-numeric:tabular-nums; overflow:hidden;
+  white-space:nowrap; min-width:0}
+.fineprint{font-size:12px; color:var(--dim); margin:12px 0 0; line-height:1.7}
+
+/* ---- 图表 ---- */
+.chart-head{display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-bottom:10px}
+.chart-head select{background:var(--panel2); color:var(--fg);
+  border:1px solid var(--line); border-radius:5px; padding:5px 8px; font-size:13px}
+.legend{display:flex; gap:14px; font-size:12px; color:var(--dim)}
+.legend span{display:flex; align-items:center; gap:6px}
+.legend i{width:12px; height:2px; display:inline-block}
+svg{display:block; width:100%; height:auto}
+.grid-line{stroke:var(--line); stroke-width:1}
+.axis-txt{fill:var(--dim); font-size:11px; font-variant-numeric:tabular-nums}
+.hover-line{stroke:var(--muted); stroke-width:1; stroke-dasharray:3 3; opacity:0}
+
+/* ---- 盘口表 ---- */
+.mk-head{display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:12px}
+.mk-count{font-size:12px; color:var(--dim); font-variant-numeric:tabular-nums}
+.mk-head input[type=search]{
+  background:var(--panel); color:var(--fg); border:1px solid var(--line);
+  border-radius:5px; padding:5px 9px; font-size:13px; width:180px; margin-left:auto;
+}
+.mk-toggle{font-size:12px; color:var(--dim); display:flex; align-items:center; gap:5px; cursor:pointer}
+.mk-more{width:100%; margin-top:4px}
+.market{background:var(--panel); border:1px solid var(--line);
+  border-radius:8px; margin-bottom:12px; overflow:hidden}
+.market h3{margin:0; padding:9px 14px; font-size:12px; font-weight:600;
+  color:var(--accent); background:var(--panel2); border-bottom:1px solid var(--line);
+  display:flex; align-items:center; gap:8px}
+.market h3 .n{color:var(--dim); font-weight:400; font-size:11px; margin-left:auto}
+.market table{width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums}
+.market td, .market th{padding:6px 14px; font-size:13px; text-align:left;
+  border-bottom:1px solid rgba(216,222,228,.7)}
+.market th{font-size:11px; color:var(--dim); font-weight:500;
+  text-transform:uppercase; letter-spacing:.03em}
+.market tr:last-child td{border-bottom:none}
+.market td:nth-child(2){color:var(--dim); font-family:ui-monospace,Consolas,monospace}
+.market td:nth-child(3){font-family:ui-monospace,Consolas,monospace; width:110px}
+.arrow{font-size:11px; margin-left:6px}
+.arrow.up{color:var(--critical)}
+.arrow.down{color:var(--good)}
+.market tr.changed{background:rgba(154,103,0,.06)}
+
+/* ---- 时间线 ---- */
+.tl{list-style:none; margin:0; padding:0}
+.tl li{border-left:2px solid var(--line); padding:0 0 14px 16px; position:relative}
+.tl li::before{content:''; position:absolute; left:-5px; top:4px; width:8px; height:8px;
+  border-radius:50%; background:var(--s1); border:2px solid var(--panel)}
+.tl li.big::before{background:var(--warning)}
+.tl .t{font-family:ui-monospace,Consolas,monospace; font-size:12px; color:var(--dim)}
+.tl .n{font-size:13px; margin-left:10px}
+.tl details{margin-top:6px}
+.tl summary{cursor:pointer; font-size:12px; color:var(--accent)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="inner">
+    <div class="top">
+      <a class="back" href="/">← 返回列表</a>
+      <h1 id="hTitle">加载中…</h1>
+      <span class="sim" id="hPlats"></span>
+    </div>
+
+    <div class="hero">
+      <div class="primary">
+        <div class="lbl">最小覆盖成本</div>
+        <div class="big" id="hCost">—</div>
+        <div class="sub" id="hSub"><span style="color:var(--dim)">加载中…</span></div>
+      </div>
+      <div class="facts">
+        <div class="fact">
+          <div class="lbl">LP 最差收益</div>
+          <div class="v" id="hWorst" style="color:var(--dim)">—</div>
+          <div class="note" id="hWorstNote"></div>
+        </div>
+        <div class="fact">
+          <div class="lbl">盘口 / 选项</div>
+          <div class="v" id="hCount" style="color:var(--dim)">—</div>
+          <div class="note" id="hCand"></div>
+        </div>
+        <div class="fact">
+          <div class="lbl">开赛</div>
+          <div class="v" id="hKick" style="color:var(--dim)">—</div>
+          <div class="note" id="hLeague"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="card">
+    <h2>怎么下注（资金配置）</h2>
+
+    <div class="stake-head">
+      <label for="total">总预算</label>
+      <input type="number" id="total" value="1000" min="10" step="100">
+      <span style="color:var(--dim); font-size:12px">元</span>
+      <span class="sep"></span>
+      <span style="color:var(--dim); font-size:12px">
+        不管比赛打成什么结果，收回的钱都一样多
+      </span>
+    </div>
+
+    <table class="stake">
+      <thead>
+        <tr>
+          <th>投注项</th>
+          <th class="num">赔率</th>
+          <th>在哪买</th>
+          <th class="num">下注金额</th>
+          <th class="num">占比</th>
+          <th class="num">中了能收回</th>
+        </tr>
+      </thead>
+      <tbody id="stakeRows"></tbody>
+      <tfoot>
+        <tr class="sum">
+          <td>合计</td><td class="num">—</td><td>—</td>
+          <td class="num" id="sumStake">—</td>
+          <td class="num">100%</td>
+          <td class="num" id="sumBack" title="无论中哪一注，收回金额都相同">—</td>
+        </tr>
+      </tfoot>
+    </table>
+
+    <div class="settle" id="settle"></div>
+
+    <div class="bar-wrap">
+      <div class="bar-lbl">资金分配</div>
+      <div class="bar" id="bar"></div>
+    </div>
+
+    <p class="fineprint">
+      下注金额 = 总预算 ÷ (赔率 × Σ(1/赔率))。这个比例让每个结果收回的钱完全相同，
+      所以「中了能收回」这一列每行都一样。<br>
+      收回 − 总预算 = 亏损额。亏损比例恒等于 成本 − 1，也就是平台抽水。
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>赔率走势</h2>
+    <div class="chart-head">
+      <select id="pick">
+        <option value="1">1x2 · 1（主胜）</option>
+        <option value="X">1x2 · X（平局）</option>
+        <option value="2">1x2 · 2（客胜）</option>
+      </select>
+      <div class="legend">
+        <span><i style="background:var(--s1)"></i>已采集赔率</span>
+        <span><i style="background:var(--line)"></i>开赛前预估缺失区</span>
+      </div>
+    </div>
+    <svg id="chart" viewBox="0 0 900 270" role="img"
+         aria-label="1x2 主胜赔率随时间的走势"></svg>
+    <p style="font-size:12px; color:var(--dim); margin:8px 0 0">
+      只展示采集到的快照点。没有推送的时间段是平线，不代表赔率没变。
+    </p>
+  </div>
+
+  <div class="card" style="background:transparent; border:none; padding:0">
+    <div class="mk-head">
+      <h2 style="margin:0">当前盘口</h2>
+      <span class="mk-count" id="mkCount"></span>
+      <input type="search" id="mkSearch" placeholder="搜索盘口 / 选项">
+    </div>
+    <div id="markets"></div>
+    <button class="btn mk-more" id="mkMore">显示全部</button>
+  </div>
+
+  <div class="card">
+    <h2>变动流水</h2>
+    <ul class="tl" id="tlList"></ul>
+    <p style="font-size:12px; color:var(--dim); margin:0">
+      一次推送刷新会批量写入上百项变动，所以按时间折叠。
+    </p>
+  </div>
+
+</div>
+
+<script>
+// ============================================================
+// 数据来自 /api/matches/{id}。
+// 下注方案直接用服务端 LP 的权重（analyze/payout.py 的 lp_solve），
+// 前端不重算 —— 保证页面数字和后台判定完全一致。
+// ============================================================
+const $ = id => document.getElementById(id);
+const PLATFORM_LABEL = { kessbet: 'KessBet' };
+
+const MID = new URLSearchParams(location.search).get('id');
+let DATA = null;
+
+function fmt(n, d) { d = d === undefined ? 2 : d; return n == null ? '—' : n.toFixed(d); }
+
+// ---------------- 头部 ----------------
+function renderHeader() {
+  const d = DATA;
+  $('hTitle').textContent = d.home_team + ' vs ' + d.away_team;
+  $('hPlats').innerHTML = d.platforms
+    .map(p => '<span class="pf">' + (PLATFORM_LABEL[p] || p) + '</span>').join('');
+
+  const cost = d.cost;
+  const el = $('hCost');
+  if (cost == null) {
+    el.textContent = '—';
+    el.style.color = 'var(--muted)';
+    $('hSub').innerHTML = '<span style="color:var(--dim)">' + (d.error || '无法计算') + '</span>';
+  } else {
+    el.textContent = cost.toFixed(4);
+    el.style.color = cost < 1 ? 'var(--good)' : 'var(--s3)';
+    // 抽水 = 实际亏损比例 = 1 - 1/cost。cost=1.0662 对应 6.20%，不是 6.62%。
+    const vig = (1 - 1 / cost) * 100;
+    const tag = d.is_arbitrage
+      ? '<span class="tag" style="background:rgba(10,110,10,.12);color:var(--good)">套利</span>'
+      : '<span class="tag">无套利</span>';
+    $('hSub').innerHTML = tag + '平台抽水 ' + vig.toFixed(2) + '%';
+  }
+
+  const lp = d.lp;
+  if (lp && lp.worst_profit != null) {
+    $('hWorst').textContent = (lp.worst_profit * 100).toFixed(2) + '%';
+    $('hWorstNote').textContent = '投 1000 元亏 ' +
+      Math.abs(lp.worst_profit * 1000).toFixed(2) + ' 元';
+  }
+  $('hCount').textContent = d.n_markets + ' / ' + d.n_selections;
+  $('hCand').textContent = '可建模 ' + d.n_candidates + ' 个' +
+    (d.cost_source === 'live' ? ' · 实时计算' : ' · 快照');
+  $('hKick').textContent = (d.kickoff_time || '').slice(5, 16);
+  $('hLeague').textContent = d.league || '';
+}
+
+// ---------------- 下注方案 ----------------
+// 服务端 LP 给出 [{desc, weight}]，weight 是占总预算的比例。
+// desc 形如 "Total||2.5|over" -> market|side|line|label
+function parseDesc(desc) {
+  const p = String(desc).split('|');
+  return { market: p[0] || '', side: p[1] || '',
+           line: p[2] || '', label: p[3] || '' };
+}
+
+// API 返回的 markets 已按 (market, side) 分组，组里带 base/side。
+// 用 base+side 精确匹配，不能用显示名（显示名带了队名）。
+function oddsOf(x) {
+  if (!DATA) return null;
+  const mk = DATA.markets.find(m => m.base === x.market && m.side === x.side);
+  if (!mk) return null;
+  const s = mk.selections.find(s =>
+    s.line === x.line && s.label === x.label);
+  return s ? s.odds : null;
+}
+
+// 把 (market, side, line) 还原成用户看到的写法：
+//   ('Total','', '2.5')      -> 'Total 2.5'
+//   ('Total','H','2.5')      -> 'Arsenal Total 2.5'
+//   ('1st Half - Total','A','0.5') -> 'Everton 上半场 Total 0.5'
+function marketLabel(x) {
+  const mk = DATA && DATA.markets.find(m =>
+    m.base === x.market && m.side === x.side);
+  const name = mk ? mk.name : x.market;
+  return x.line ? name + ' ' + x.line : name;
+}
+
+function renderStake() {
+  const total = Math.max(1, Number($('total').value) || 1000);
+  const lp = DATA && DATA.lp;
+  const bets = (lp && lp.chosen) ? lp.chosen : [];
+
+  if (!bets.length) {
+    $('stakeRows').innerHTML =
+      '<tr><td colspan="6" style="color:var(--dim); padding:20px 12px">' +
+      '无法给出下注方案（' + ((DATA && DATA.error) || '没有可用组合') + '）</td></tr>';
+    $('sumStake').textContent = '—';
+    $('sumBack').textContent = '—';
+    $('settle').innerHTML = '';
+    $('bar').innerHTML = '';
+    return;
+  }
+
+  const rows = bets.map((b, i) => {
+    const x = parseDesc(b.desc);
+    // 返回 null 表示这个选项在当前盘口里找不到（可能已撤盘）。
+    // 绝不能 fallback 成 0 —— 那会让「收回 = 赔率 × 金额」算出 0，
+    // 或者更糟，让页面显示一个看起来正常的错误数字。
+    const odds = oddsOf(x);
+    const missing = odds == null;
+    return {
+      market: x.market, side: x.side, line: x.line, label: x.label,
+      odds: odds,
+      missing: missing,
+      stake: b.weight * total,
+      pct: b.weight * 100,
+      back: missing ? null : odds * b.weight * total,
+      color: ['var(--s1)', 'var(--s2)', 'var(--s3)'][i % 3],
+    };
+  });
+
+  $('stakeRows').innerHTML = rows.map(r =>
+    '<tr' + (r.missing ? ' style="background:rgba(192,32,32,.06)"' : '') + '>' +
+      '<td>' + marketLabel(r) + ' · ' + r.label + '</td>' +
+      '<td class="num">' + (r.missing
+          ? '<span style="color:var(--critical)">已撤盘</span>'
+          : fmt(r.odds)) + '</td>' +
+      '<td><span class="pf">' + (PLATFORM_LABEL[DATA.platform] || DATA.platform) + '</span></td>' +
+      '<td class="num money">' + fmt(r.stake) + '</td>' +
+      '<td class="num" style="color:var(--dim)">' + r.pct.toFixed(1) + '%</td>' +
+      '<td class="num money back">' + (r.missing ? '—' : fmt(r.back)) + '</td>' +
+    '</tr>').join('');
+
+  // 收回额取单注，不能把各行相加。
+  // 这些选项是**互斥**的：一场比赛只会中其中一注，其余全输。
+  // LP 的最优解保证每注的中奖收回额相等，所以取任意一行都对。
+  // （早期版本这里做了求和，导致 1875.91 这种「投 1000 赚 875」的假象。）
+  const anyMissing = rows.some(r => r.missing);
+  const present = rows.filter(r => !r.missing);
+  const sumBack = present.length ? present[0].back : 0;
+  const backSpread = present.length
+    ? Math.max(...present.map(r => Math.abs(r.back - sumBack))) : 0;
+  $('sumStake').textContent = fmt(total);
+  $('sumBack').textContent = anyMissing ? '—' : fmt(sumBack);
+
+  const profit = sumBack - total;
+  const isArb = DATA.is_arbitrage;
+  $('settle').innerHTML =
+    '<div class="line">' +
+      '<span>总投入</span><span class="v">' + fmt(total) + '</span>' +
+      '<span>不管什么结果都收回</span><span class="v">' + fmt(sumBack) + '</span>' +
+      '<span>净收益</span>' +
+      '<span class="v ' + (isArb ? 'ok' : 'bad') + '">' +
+        (profit >= 0 ? '+' : '') + fmt(profit) + '</span>' +
+      '<span class="v ' + (isArb ? 'ok' : 'bad') + '" style="font-size:14px">' +
+        (profit / total * 100).toFixed(2) + '%</span>' +
+    '</div>' +
+    '<div class="note">' +
+      '覆盖成本 ' + fmt(DATA.cost, 4) +
+      (isArb ? ' &lt; 1 —— 存在套利' : ' ≥ 1 —— 无套利，这个比例就是平台抽水') +
+      '。下注比例由服务端 LP 求解，无论比赛结果如何收回金额一致。' +
+      (DATA.cross_ok ? '' :
+        '<br><b style="color:var(--critical)">⚠ ILP 与 LP 交叉验证未通过，结果可能不可靠</b>') +
+      (anyMissing
+        ? '<br><b style="color:var(--critical)">⚠ 有选项在平台已撤盘，该方案无法执行</b>'
+        : '') +
+      (backSpread > 0.01
+        ? '<br><b style="color:var(--critical)">⚠ 各注收回金额不一致（最大偏差 ' +
+          backSpread.toFixed(2) + ' 元）—— 赔率匹配有误，不要据此下注</b>'
+        : '') +
+      // 覆盖成本 C 与盈亏的正确关系：收回 = 1/C，亏损 = 1 - 1/C。
+      // 注意不是 C - 1 —— C=1.0662 的亏损是 6.20%，不是 6.62%。
+      ((DATA.cost != null && DATA.cost > 0)
+        && Math.abs(-profit / total - (1 - 1 / DATA.cost)) > 0.005
+        ? '<br><b style="color:var(--critical)">⚠ 盈亏与覆盖成本不符：成本 ' +
+          fmt(DATA.cost, 4) + ' 应亏 ' + ((1 - 1 / DATA.cost) * 100).toFixed(2) +
+          '%，实际 ' + (-profit / total * 100).toFixed(2) + '%</b>'
+        : '') +
+    '</div>';
+
+  $('bar').innerHTML = rows.map(r =>
+    '<div style="flex:' + r.pct + '; background:' + r.color + '" title="' +
+      r.market + ' ' + r.label + ' ' + fmt(r.stake) + ' 元 (' + r.pct.toFixed(1) + '%)">' +
+      (r.pct >= 16 ? r.pct.toFixed(0) + '%' : '') + '</div>').join('');
+}
+
+// ---------------- 盘口列表 ----------------
+const MK_PAGE = 8;
+let mkShown = MK_PAGE;
+
+function renderMarkets() {
+  const q = $('mkSearch').value.trim().toLowerCase();
+  let list = DATA ? DATA.markets.slice() : [];
+  if (q) {
+    list = list.map(m => {
+      if (m.name.toLowerCase().indexOf(q) >= 0) return m;
+      const sels = m.selections.filter(s =>
+        s.label.toLowerCase().indexOf(q) >= 0 || (s.line || '').indexOf(q) >= 0);
+      return sels.length ? { name: m.name, selections: sels } : null;
+    }).filter(Boolean);
+  }
+
+  const shown = list.slice(0, mkShown);
+  const nSel = list.reduce((n, m) => n + m.selections.length, 0);
+  $('mkCount').textContent = list.length + ' 个盘口 / ' + nSel + ' 个选项' +
+    (list.length > mkShown ? '，显示前 ' + mkShown + ' 个' : '');
+
+  $('markets').innerHTML = shown.map(m =>
+    '<div class="market"><h3>' + m.name +
+      '<span class="n">' + m.selections.length + ' 项</span></h3><table>' +
+      '<tr><th>选项</th><th>盘线</th><th>赔率</th></tr>' +
+      m.selections.map(s =>
+        '<tr><td>' + s.label + '</td>' +
+        '<td style="color:var(--muted)">' + (s.line || '—') + '</td>' +
+        '<td>' + s.odds.toFixed(2) + '</td></tr>').join('') +
+      '</table></div>').join('') ||
+    '<p style="color:var(--dim); font-size:13px">没有匹配的盘口</p>';
+
+  const more = $('mkMore');
+  more.style.display = list.length > mkShown ? '' : 'none';
+  more.textContent = '显示全部（还有 ' + (list.length - mkShown) + ' 个）';
+}
+
+// ---------------- 变动流水 ----------------
+function renderTimeline() {
+  const tl = (DATA && DATA.timeline) ? DATA.timeline : [];
+  if (!tl.length) {
+    $('tlList').innerHTML = '<li style="color:var(--dim); border:none">暂无变动记录</li>';
+    return;
+  }
+  $('tlList').innerHTML = tl.slice(0, 30).map(t =>
+    '<li class="' + (t.changes >= 50 ? 'big' : '') + '">' +
+      '<span class="t">' + t.time.slice(11, 19) + '</span>' +
+      '<span class="n">' + t.changes + ' 项变动</span></li>').join('');
+}
+
+// ---------------- 走势图 ----------------
+function drawChart(points) {
+  const svg = $('chart');
+  if (!points || !points.length) {
+    svg.innerHTML = '<text x="450" y="130" text-anchor="middle" class="axis-txt">' +
+      '该选项没有变动记录</text>';
+    return;
+  }
+  // 底部留 44px：X 轴标签现在是 "MM-DD HH:MM"，比原来的 "HH:MM" 长也更高，
+  // 32px 时最后一个标签会贴到视口边缘。
+  const W = 900, H = 270, P = { l: 52, r: 20, t: 20, b: 44 };
+  const vals = points.map(p => p.odds);
+  let lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+  if (hi === lo) { hi += 0.05; lo -= 0.05; }
+  const pad = (hi - lo) * 0.25; lo -= pad; hi += pad;
+
+  const x = i => P.l + (points.length === 1 ? 0.5 :
+              (i / (points.length - 1))) * (W - P.l - P.r);
+  const y = v => P.t + (1 - (v - lo) / (hi - lo)) * (H - P.t - P.b);
+
+  let out = '';
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4, yy = y(v);
+    out += '<line class="grid-line" x1="' + P.l + '" y1="' + yy + '" x2="' +
+      (W - P.r) + '" y2="' + yy + '"/>';
+    out += '<text class="axis-txt" x="' + (P.l - 8) + '" y="' + (yy + 4) +
+      '" text-anchor="end">' + v.toFixed(2) + '</text>';
+  }
+  // X 轴刻度。时间格式按数据跨度自适应：
+  //   同一天   -> "11-03 14:20"（仍带日期，方便截图/事后回看时确认是哪天）
+  //   只有时分  -> "14:20"（不可能出现，至少保留日期）
+  // 刻度太密会重叠，所以限制最多 7 个。
+  const dates = new Set(points.map(p => p.time.slice(0, 10)));
+  const multiDay = dates.size > 1;
+  const maxTicks = 7;
+  const step = Math.max(1, Math.ceil(points.length / maxTicks));
+  points.forEach((p, i) => {
+    if (i % step !== 0 && i !== points.length - 1) return;
+    // 最后一个刻度和前一个挨太近就跳过，避免文字重叠
+    const label = p.time.slice(5, 16);          // MM-DD HH:MM
+    out += '<text class="axis-txt" x="' + x(i) + '" y="' + (H - P.b + 18) +
+      '" text-anchor="middle">' + label + '</text>';
+  });
+  // 跨天时在最左侧补一条日期说明，避免读者误以为都是同一天
+  if (multiDay) {
+    out += '<text class="axis-txt" x="' + (W - P.r) + '" y="' + (P.t - 4) +
+      '" text-anchor="end" style="fill:var(--muted)">' +
+      [...dates].sort()[0] + ' ~ ' + [...dates].sort().slice(-1)[0] + '</text>';
+  }
+
+  const d = points.map((p, i) => (i ? 'L' : 'M') + x(i) + ',' + y(p.odds)).join(' ');
+  out += '<path d="' + d + '" fill="none" stroke="var(--s1)" stroke-width="2" ' +
+    'stroke-linejoin="round" stroke-linecap="round"/>';
+  points.forEach((p, i) => {
+    out += '<circle cx="' + x(i) + '" cy="' + y(p.odds) + '" r="3.5" ' +
+      'fill="var(--s1)" stroke="var(--panel)" stroke-width="2"/>';
+  });
+  const last = points[points.length - 1];
+  out += '<text class="axis-txt" x="' + (x(points.length - 1) - 8) + '" y="' +
+    (y(last.odds) - 10) + '" text-anchor="end" fill="var(--fg)" ' +
+    'style="font-size:13px;font-weight:600">' + last.odds.toFixed(2) + '</text>';
+
+  out += '<line id="hv" class="hover-line" x1="0" y1="' + P.t + '" x2="0" y2="' +
+    (H - P.b) + '"/>';
+  out += '<g id="hvdot" style="opacity:0"><circle r="6" fill="var(--s1)" ' +
+    'stroke="var(--panel)" stroke-width="2"/></g>';
+  out += '<g id="hvtip" style="opacity:0"><rect rx="4" fill="var(--panel2)" ' +
+    'stroke="var(--line)" height="34"/><text class="axis-txt" style="fill:var(--fg)"></text></g>';
+  out += '<rect id="hit" x="' + P.l + '" y="' + P.t + '" width="' + (W - P.l - P.r) +
+    '" height="' + (H - P.t - P.b) + '" fill="transparent"/>';
+  svg.innerHTML = out;
+
+  const hit = svg.querySelector('#hit');
+  const hv = svg.querySelector('#hv'), dot = svg.querySelector('#hvdot');
+  const tip = svg.querySelector('#hvtip'), tipText = tip.querySelector('text');
+  const tipRect = tip.querySelector('rect');
+
+  hit.addEventListener('mousemove', ev => {
+    const box = svg.getBoundingClientRect();
+    const px = (ev.clientX - box.left) / box.width * W;
+    let best = 0, bd = Infinity;
+    points.forEach((p, i) => {
+      const dd = Math.abs(x(i) - px); if (dd < bd) { bd = dd; best = i; }
+    });
+    const i = best, cx = x(i), cy = y(points[i].odds);
+    hv.setAttribute('x1', cx); hv.setAttribute('x2', cx); hv.style.opacity = 1;
+    dot.setAttribute('transform', 'translate(' + cx + ',' + cy + ')');
+    dot.style.opacity = 1;
+    // 悬停提示给完整日期时间，看完就不用再去猜是哪天
+    const label = points[i].time.slice(5, 16) + '   ' + points[i].odds.toFixed(2);
+    tipText.textContent = label;
+    const tw = label.length * 6.8 + 20, th = 34;
+    tipRect.setAttribute('width', tw);
+    let tx = cx + 12; if (tx + tw > W - P.r) tx = cx - tw - 12;
+    tx = Math.max(P.l, Math.min(tx, W - P.r - tw));
+    let ty = cy - th - 12; if (ty < P.t) ty = cy + 14;
+    ty = Math.max(P.t, Math.min(ty, H - P.b - th));
+    tip.setAttribute('transform', 'translate(' + tx + ',' + ty + ')');
+    tipText.setAttribute('x', tw / 2); tipText.setAttribute('y', th / 2 + 4);
+    tipText.setAttribute('text-anchor', 'middle');
+    tip.style.opacity = 1;
+  });
+  hit.addEventListener('mouseleave', () => {
+    hv.style.opacity = 0; dot.style.opacity = 0; tip.style.opacity = 0;
+  });
+}
+
+const historyCache = {};
+async function loadSeries(key) {
+  const parts = key.split('\u0001');
+  if (historyCache[key]) { drawChart(historyCache[key]); return; }
+  drawChart([]);
+  try {
+    const p = new URLSearchParams({
+      market: parts[0], side: parts[1], line: parts[2], label: parts[3],
+      platform: DATA.platform,
+    });
+    const r = await fetch('/api/matches/' + encodeURIComponent(MID) + '/history?' + p);
+    const d = await r.json();
+    historyCache[key] = d.points;
+    drawChart(d.points);
+  } catch (e) {
+    drawChart([]);
+  }
+}
+
+// ---------------- 初始化 ----------------
+async function init() {
+  if (!MID) {
+    document.body.innerHTML =
+      '<p style="padding:40px;color:var(--critical)">缺少 id 参数，请从列表页进入。</p>';
+    return;
+  }
+  try {
+    const r = await fetch('/api/matches/' + encodeURIComponent(MID));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    DATA = await r.json();
+  } catch (e) {
+    document.body.innerHTML =
+      '<p style="padding:40px;color:var(--critical)">加载失败：' + e.message + '</p>';
+    return;
+  }
+
+  renderHeader();
+  renderStake();
+  renderMarkets();
+  renderTimeline();
+
+  // 走势图默认取 1x2（全场），没有就取第一个分组
+  const mk12 = DATA.markets.find(m => m.base === '1x2' && !m.side)
+            || DATA.markets[0];
+  if (!mk12) { drawChart([]); return; }
+  const pick = $('pick');
+  pick.innerHTML = mk12.selections.slice(0, 8).map(s => {
+    const key = [mk12.base, mk12.side, s.line, s.label].join('\u0001');
+    return '<option value="' + key + '">' + mk12.name + ' · ' + s.label +
+      (s.line ? ' ' + s.line : '') + '</option>';
+  }).join('');
+  pick.addEventListener('change', e => loadSeries(e.target.value));
+  loadSeries(pick.value);
+}
+
+$('total').addEventListener('input', () => { if (DATA) renderStake(); });
+$('mkSearch').addEventListener('input', () => { mkShown = MK_PAGE; renderMarkets(); });
+$('mkMore').addEventListener('click', () => { mkShown = Infinity; renderMarkets(); });
+
+init();
+</script>
+</body>
+</html>

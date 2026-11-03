@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 启动采集 + 分析进程（nohup）
+# 启动采集 + 分析 + Web API（nohup）
 # =============================================================================
 # 用法：bash deploy/start.sh
 #       bash deploy/start.sh collect    # 只起采集
 #       bash deploy/start.sh analyze    # 只起分析
+#       bash deploy/start.sh api        # 只起 Web API
 #
 # 已经在跑的进程不会重复启动。
 # =============================================================================
@@ -34,6 +35,12 @@ cd "$PKG_DIR"
 
 MODULE_collect='collect.run'
 MODULE_analyze='analyze.run'
+MODULE_api='uvicorn'
+
+# Web API 监听地址。默认只绑本机，前面套 nginx 反代；
+# 要直接对外就把 API_HOST 设为 0.0.0.0（至少要有防火墙或 vpn）。
+API_HOST="${API_HOST:-127.0.0.1}"
+API_PORT="${API_PORT:-8080}"
 
 is_running() {
     local name="$1"
@@ -72,15 +79,44 @@ start_one() {
     fi
 }
 
+# Web API 不是 `-m <module>` 的形式（uvicorn 需要 app 路径和端口参数），
+# 单独写一个启动函数。
+start_api() {
+    local name='api'
+    local pf="$RUN_DIR/$name.pid"
+    if is_running "$name"; then
+        echo "  $name 已在运行 (pid $(cat "$pf"))，跳过"
+        return 0
+    fi
+    [ -f "$pf" ] && rm -f "$pf"
+
+    nohup "$PYTHON" -u -m uvicorn web.api:app \
+        --host "$API_HOST" --port "$API_PORT" \
+        >> "$LOG_DIR/$name.log" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$pf"
+    sleep 3
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "  $name 已启动 (pid $pid)  http://$API_HOST:$API_PORT/  日志 logs/$name.log"
+    else
+        echo "  [!] $name 启动后立刻退出，看 logs/$name.log：" >&2
+        tail -20 "$LOG_DIR/$name.log" >&2
+        rm -f "$pf"
+        return 1
+    fi
+}
+
 TARGET="${1:-all}"
 echo "启动目录 $PKG_DIR"
 case "$TARGET" in
     collect) start_one collect collect.run ;;
     analyze) start_one analyze analyze.run ;;
+    api)     start_api ;;
     all)
         start_one collect collect.run
         start_one analyze analyze.run
+        start_api
         ;;
-    *) echo "用法: $0 [collect|analyze|all]" >&2; exit 1 ;;
+    *) echo "用法: $0 [collect|analyze|api|all]" >&2; exit 1 ;;
 esac
 echo "完成"
