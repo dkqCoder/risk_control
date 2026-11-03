@@ -119,7 +119,9 @@ if [ -z "${KESSBET_DB_PASSWORD:-}" ] && [ -f "$APP_DIR/deploy/.env" ]; then
 fi
 if [ -z "${KESSBET_DB_PASSWORD:-}" ]; then
     # 生成 24 位随机密码（只含字母数字，避免 shell / SQL 转义问题）
-    KESSBET_DB_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
+    # 注意：不能用 `tr </dev/urandom | head -c 24`——head 取够就关管道，
+    # tr 收到 SIGPIPE 退出码 141，在 set -o pipefail 下会让脚本静默中止。
+    KESSBET_DB_PASSWORD="$(openssl rand -hex 12)"
 fi
 
 "${MYSQL_ROOT[@]}" <<SQL

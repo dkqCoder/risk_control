@@ -264,6 +264,20 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
+def install_signal_handlers() -> None:
+    """把 SIGTERM 转成 KeyboardInterrupt。
+
+    deploy/stop.sh 发的是 SIGTERM，而 Python 只把 SIGINT 转成
+    KeyboardInterrupt。不处理的话 SIGTERM 会直接终止进程，`except
+    KeyboardInterrupt` 和 `finally` 都不执行——Refresher 的线程池不会
+    shutdown，正在途中的整场替换事务被硬断。
+    """
+    def _to_keyboard_interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _to_keyboard_interrupt)
+
+
 def main():
     ap = argparse.ArgumentParser(description='KessBet 采集进程')
     ap.add_argument('--once', action='store_true', help='跑一轮就退出')
@@ -272,11 +286,15 @@ def main():
     args = ap.parse_args()
 
     setup_logging(args.verbose)
+    install_signal_handlers()
 
     c = Collector(use_ws=not args.no_ws)
     code = 0
     try:
         code = c.start(once=args.once)
+    except KeyboardInterrupt:
+        log.info('interrupted (SIGTERM/SIGINT)')
+        c.stop()
     finally:
         try:
             c.report()
