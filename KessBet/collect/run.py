@@ -60,6 +60,12 @@ class Collector:
             try:
                 matches = self.adapter.list_matches(sport)
                 n = self.dao.upsert_matches(matches)
+                # 同步跨平台映射。失败不影响采集——这张表只服务页面和跨平台比价，
+                # 单平台分析走 (platform, match_id)，不依赖它。
+                try:
+                    self.dao.sync_canonical(matches)
+                except Exception as e:
+                    log.warning('sync_canonical %s failed: %s', sport, e)
                 upcoming = sum(1 for m in matches if m.kickoff_time > now)
                 by_sport[sport] = (n, upcoming)
                 total += n

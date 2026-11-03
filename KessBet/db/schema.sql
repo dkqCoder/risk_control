@@ -98,7 +98,58 @@ CREATE TABLE IF NOT EXISTS kessbet_match (
 
 
 -- =============================================================================
--- ② kessbet_odds_prematch — 赛前赔率当前状态
+-- ② kessbet_match_canonical — 跨平台比赛映射
+-- -----------------------------------------------------------------------------
+-- 一场真实世界的比赛在多个平台各有自己的 match_id。这张表把它们对齐到
+-- 一个统一键，供跨平台比价和页面聚合使用。
+--
+-- 对齐依据：sportradar_id（sr:match:NNNNN）。
+--   实测 kessbet 的 4440 场 100% 带该字段，且无重复 —— 可以直接做关联键。
+--   某平台若没有 sportradar_id，退回 (开赛时间 ± 容差, 主队名归一化, 客队名归一化)
+--   做模糊匹配，匹配结果写入 match_key 但不写主键约束。
+--
+-- ⚠️ 这张表**不参与**单平台套利判定。单平台分析仍按 (platform, match_id) 走。
+--    只有跨平台比价和前端聚合才需要它。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS kessbet_match_canonical (
+    canonical_id   VARCHAR(64)  NOT NULL
+        COMMENT '统一比赛键。优先用 sportradar_id；没有则用 fallback:<hash>',
+
+    platform       VARCHAR(16)  NOT NULL
+        COMMENT '平台标识，如 kessbet',
+
+    match_id       VARCHAR(32)  NOT NULL
+        COMMENT '该平台内部的比赛 ID',
+
+    sport          VARCHAR(16)  NOT NULL
+        COMMENT 'Sportradar 运动编号，取值 sr:sport:N',
+
+    match_source   VARCHAR(16)  NOT NULL DEFAULT 'sportradar'
+        COMMENT 'canonical_id 的来源：sportradar=按 ID 对齐 / fallback=按队名+时间模糊匹配',
+
+    home_team      VARCHAR(128) NOT NULL DEFAULT ''
+        COMMENT '主队名，平台原文。多平台写法可能不同，聚合时取第一个平台的作为展示名',
+
+    away_team      VARCHAR(128) NOT NULL DEFAULT ''
+        COMMENT '客队名，平台原文',
+
+    kickoff_time   DATETIME     NOT NULL
+        COMMENT '开赛时间（北京时间）。多平台可能有分钟级差异',
+
+    updated_time   DATETIME     NOT NULL
+        COMMENT '最后一次写入时间（北京时间）',
+
+    PRIMARY KEY (platform, match_id),
+    KEY idx_canonical (canonical_id)
+        COMMENT '按统一键聚合该场比赛的所有平台报价（页面主查询）',
+    KEY idx_kickoff (kickoff_time)
+        COMMENT '按开赛时间清理'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='跨平台比赛映射：一个真实比赛多行，每平台一行';
+
+
+-- =============================================================================
+-- ③ kessbet_odds_prematch — 赛前赔率当前状态
 -- -----------------------------------------------------------------------------
 -- 分析侧唯一的读取源。一个选项一行，同一选项永远只有最新值。
 --
@@ -175,7 +226,7 @@ CREATE TABLE IF NOT EXISTS kessbet_odds_prematch (
 
 
 -- =============================================================================
--- ③ kessbet_odds_history — 赔率变动历史
+-- ④ kessbet_odds_history — 赔率变动历史
 -- -----------------------------------------------------------------------------
 -- 只增不改。每次刷新时，和当前状态表比对，只记录真正变化的选项。
 -- 保留 7 天，按 kickoff_time 清理。
@@ -235,7 +286,7 @@ CREATE TABLE IF NOT EXISTS kessbet_odds_history (
 
 
 -- =============================================================================
--- ④ kessbet_odds_hit — 套利命中记录
+-- ⑤ kessbet_odds_hit — 套利命中记录
 -- -----------------------------------------------------------------------------
 -- 只在 cost < 1.0 时写。正常情况下这张表**应该是空的**——
 -- 单家博彩公司内部出现无损套利只可能是调价错误。
@@ -277,7 +328,7 @@ CREATE TABLE IF NOT EXISTS kessbet_odds_hit (
 
 
 -- =============================================================================
--- ⑤ kessbet_collect_log — 采集与运行日志
+-- ⑥ kessbet_collect_log — 采集与运行日志
 -- -----------------------------------------------------------------------------
 -- 排查用。记录每次赛程刷新、清理、WS 连接等操作的结果。
 -- 保留 30 天。

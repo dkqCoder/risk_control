@@ -169,6 +169,115 @@ class Dao:
             cur.execute(sql, (hours,))
             return list(cur.fetchall())
 
+    # ---------- 跨平台映射 ----------
+    #
+    # 页面和跨平台比价都走 canonical_id；单平台采集/分析仍用 (platform, match_id)，
+    # 不受这张表影响。
+
+    @staticmethod
+    def canonical_key(platform: str, match_id: str, sportradar_id: str) -> str:
+        """算出一场比赛的统一键。
+
+        优先用 sportradar_id —— 它是行业标准，跨平台一致。
+        没有时退回平台内唯一键，保证仍然可聚合（只是无法和其他平台对齐）。
+        """
+        if sportradar_id:
+            return sportradar_id
+        return f'local:{platform}:{match_id}'
+
+    def sync_canonical(self, matches) -> int:
+        """把赛程同步进跨平台映射表。每次 upsert_matches 之后调一次。"""
+        if not matches:
+            return 0
+        now = beijing_now()
+        rows = []
+        for m in matches:
+            kickoff = (m.kickoff_time.astimezone(BEIJING).replace(tzinfo=None)
+                       if m.kickoff_time.tzinfo else m.kickoff_time)
+            rows.append((
+                self.canonical_key(m.platform, m.match_id, m.sportradar_id),
+                m.platform, m.match_id, m.sport,
+                'sportradar' if m.sportradar_id else 'fallback',
+                m.home_team, m.away_team, kickoff, now,
+            ))
+        sql = """
+        INSERT INTO kessbet_match_canonical
+          (canonical_id, platform, match_id, sport, match_source,
+           home_team, away_team, kickoff_time, updated_time)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON DUPLICATE KEY UPDATE
+          canonical_id=VALUES(canonical_id), sport=VALUES(sport),
+          match_source=VALUES(match_source),
+          home_team=VALUES(home_team), away_team=VALUES(away_team),
+          kickoff_time=VALUES(kickoff_time), updated_time=VALUES(updated_time)
+        """
+        with self.conn.cursor() as cur:
+            cur.executemany(sql, rows)
+        self.conn.commit()
+        return len(rows)
+
+    def platforms_for(self, canonical_id: str) -> list[str]:
+        """该场比赛在哪些平台有报价。"""
+        sql = ("SELECT DISTINCT platform FROM kessbet_match_canonical "
+               "WHERE canonical_id=%s ORDER BY platform")
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (canonical_id,))
+            return [r[0] for r in cur.fetchall()]
+
+    def get_canonical_match(self, canonical_id: str):
+        """跨平台聚合后的比赛信息。
+
+        多个平台对同一场比赛的队名/联赛写法可能不同，这里取开赛最晚的一条
+        作为展示用（通常是数据更完整的那个），并统计平台数。
+        返回 (canonical_id, home, away, kickoff, sport, platforms, n_platforms) 或 None。
+        """
+        sql = """
+        SELECT canonical_id, home_team, away_team, kickoff_time, sport,
+               GROUP_CONCAT(DISTINCT platform ORDER BY platform) AS plats,
+               COUNT(DISTINCT platform) AS n
+        FROM kessbet_match_canonical
+        WHERE canonical_id=%s
+        GROUP BY canonical_id, home_team, away_team, kickoff_time, sport
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (canonical_id,))
+            return cur.fetchone()
+
+    def get_selections_by_platform(self, canonical_id: str, platform: str) -> list[tuple]:
+        """读某平台在某场比赛上的全部选项，返回和 get_selections 一样的结构。"""
+        sql = """
+        SELECT o.market, o.side, o.line, o.selection, o.odds
+        FROM kessbet_odds_prematch o
+        JOIN kessbet_match_canonical c
+          ON c.platform = o.platform AND c.match_id = o.match_id
+        WHERE c.canonical_id=%s AND o.platform=%s
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (canonical_id, platform))
+            return [(r[0], r[1], r[2], r[3], float(r[4])) for r in cur.fetchall()]
+
+    def merged_selections(self, canonical_id: str) -> list[tuple]:
+        """跨平台合并：同一选项取所有平台里的最高赔率。
+
+        返回 (market, side, line, selection, odds, platform)，只保留最优报价。
+        这是跨平台套利的正确输入 —— 每个选项在哪家买最划算。
+        """
+        sql = """
+        SELECT o.market, o.side, o.line, o.selection,
+               MAX(o.odds) AS best_odds,
+               SUBSTRING_INDEX(GROUP_CONCAT(o.platform ORDER BY o.odds DESC), ',', 1)
+                   AS best_platform
+        FROM kessbet_odds_prematch o
+        JOIN kessbet_match_canonical c
+          ON c.platform = o.platform AND c.match_id = o.match_id
+        WHERE c.canonical_id=%s
+        GROUP BY o.market, o.side, o.line, o.selection
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (canonical_id,))
+            return [(r[0], r[1], r[2], r[3], float(r[4]), r[5])
+                    for r in cur.fetchall()]
+
     # ---------- odds ----------
 
     def count_odds(self, match_id: str) -> int:
