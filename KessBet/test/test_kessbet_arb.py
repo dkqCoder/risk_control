@@ -71,12 +71,18 @@ def test_collect_includes_team_specific_markets(snap_file):
     assert '1st Half - Arsenal Total|0.5|over' in labels
 
 
-def test_collect_includes_half_correct_score_other(snap_file):
-    """半场比分盘应像全场比分盘一样贡献 other 补集；具名比分不进候选池。"""
+def test_collect_includes_half_correct_score(snap_file):
+    """半场比分盘既贡献 other 补集，也贡献具名比分本身。
+
+    具名比分曾被认为「1/赔率 太大，不会进最优解」而整类丢弃，
+    实测该理由不成立 —— 详见
+    docs/superpowers/specs/2026-11-04-correct-score-named-review.md
+    """
     cands = P.collect(snap_file, HOME, AWAY)
     labels = {d for _, _, d in cands}
     assert '1st Half - Correct Score|other' in labels
-    assert not any(d.startswith('1st Half - Correct Score||') for d in labels)
+    named = {d for d in labels if d.startswith('1st Half - Correct Score||')}
+    assert named, '具名半场比分应进入候选池'
 
 
 def test_collect_half_correct_score_other_is_complement(snap_file):

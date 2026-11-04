@@ -565,7 +565,15 @@ def collect(path, home, away):
                 if ':' in lab:
                     hh, aa = map(int, lab.split(':'))
                     if hh < G and aa < G:
-                        named |= build(lambda h1, a1, h2, a2, x=hh, y=aa: h2 == x and a2 == y)
+                        m = build(lambda h1, a1, h2, a2, x=hh, y=aa: h2 == x and a2 == y)
+                        named |= m
+                        # 具名比分同时进候选池。原先只累入 named、不进池，
+                        # 理由是「1/赔率 太大不会进最优解」—— 实测不成立：
+                        # 高赔率具名可以补上低价大覆盖选项漏掉的窄缝，
+                        # 以更小的增量补齐覆盖（真实场次 245064451588395947
+                        # 由 1.085252 降到 1.066374）。候选池只增不减，
+                        # 最优成本只会下降或持平，不会引入假套利。
+                        cands.append((m, odds, f'{nm}|{line}|{lab}'))
                 elif lab == 'other':
                     other = (odds, nm)
                 continue
@@ -573,14 +581,19 @@ def collect(path, home, away):
                 if ':' in lab:
                     hh, aa = map(int, lab.split(':'))
                     if hh < H and aa < H:
-                        named |= build(lambda h1, a1, h2, a2, x=hh, y=aa: h1 == x and a1 == y)
+                        m = build(lambda h1, a1, h2, a2, x=hh, y=aa: h1 == x and a1 == y)
+                        named |= m
+                        cands.append((m, odds, f'{nm}|{line}|{lab}'))
                 elif lab == 'other':
                     other = (odds, nm)
                 continue
             m = covers(base, side, line, lab)
             if m is not None:
                 cands.append((m, odds, f'{nm}|{line}|{lab}'))
-        if base in ('Correct Score', '1st Half - Correct Score') and other and named:
+        # named 为 0（盘口没列具名比分）时 other 就是全部状态，
+        # FULL & ~0 = FULL 依然正确。原来的 `other and named` 会把
+        # 这种情况整个丢掉，候选数归零、整场误判 NO_COVER。
+        if base in ('Correct Score', '1st Half - Correct Score') and other is not None:
             cands.append((FULL & ~named, other[0], f'{other[1]}|other'))
     return cands
 
@@ -601,7 +614,10 @@ def collect_from_rows(rows):
         named = 0
         other = None
 
-        # 比分盘：具名比分不进候选池，只用 other 补集
+        # 比分盘：具名比分与 other 补集都进候选池。
+        # 具名曾被认为「1/赔率 太大，不会进最优解」而整类丢弃，实测不成立：
+        # 高赔率具名可以补齐低价大覆盖选项漏掉的窄缝，用更小的增量完成覆盖。
+        # 详见 docs/superpowers/specs/2026-11-04-correct-score-named-review.md
         if market in ('Correct Score', '1st Half - Correct Score'):
             is_half_cs = market.startswith('1st Half')
             limit = H if is_half_cs else G
@@ -613,14 +629,18 @@ def collect_from_rows(rows):
                         continue
                     if hh < limit and aa < limit:
                         if is_half_cs:
-                            named |= build(lambda h1, a1, h2, a2, x=hh, y=aa:
-                                           h1 == x and a1 == y)
+                            m = build(lambda h1, a1, h2, a2, x=hh, y=aa:
+                                      h1 == x and a1 == y)
                         else:
-                            named |= build(lambda h1, a1, h2, a2, x=hh, y=aa:
-                                           h2 == x and a2 == y)
+                            m = build(lambda h1, a1, h2, a2, x=hh, y=aa:
+                                      h2 == x and a2 == y)
+                        named |= m
+                        cands.append((m, odds,
+                                      f'{market}|{side}|{line}|{label}'))
                 elif label == 'other':
                     other = odds
-            if other and named:
+            # named 为 0 时 FULL & ~0 = FULL，other 即全部状态，依然正确。
+            if other is not None:
                 cands.append((FULL & ~named, other, f'{market}|other'))
             continue
 
