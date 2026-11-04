@@ -404,6 +404,54 @@ CREATE TABLE IF NOT EXISTS kessbet_match_cost (
 
 
 -- =============================================================================
+-- ⑥b kessbet_match_cost_history — 成本变动流水
+-- -----------------------------------------------------------------------------
+-- 列表页「1h 变化」的数据源。
+--
+-- 为什么需要单独一张表：
+--   kessbet_match_cost 是 upsert，一场只有**当前**一行，没有历史。
+--   要看「一小时前是多少」就只能反推赔率流水重算 ILP —— 实测 25 场要
+--   61.7 秒（每场 2 遍 ILP + 0.98s 的子查询），页面不可能等。
+--   所以由 analyze 在算完之后顺手记一笔，页面只读。
+--
+-- 为什么只在成本变化时写：
+--   analyze 每 2 秒轮询一次。无条件写的话一场比赛一天就是几万行，
+--   而其中绝大多数成本根本没变。用「与上一行比较，变了才写」把量压到
+--   真正发生变化的次数。
+--
+-- 与 kessbet_match_cost 的区别：
+--   那张表回答「现在多少」，这张表回答「过去怎么变的」。
+--   前者一场一行，后者一场多行、只增不改。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS kessbet_match_cost_history (
+    id             BIGINT      NOT NULL AUTO_INCREMENT,
+
+    platform       VARCHAR(16) NOT NULL,
+    match_id       VARCHAR(32) NOT NULL,
+
+    cost           DOUBLE      NOT NULL
+        COMMENT '本次算出的成本。用 DOUBLE 不用 DECIMAL：DECIMAL(8,4)
+                 会把 1.00004 存成 1.0000，和「成本 < 1 才是套利」冲突',
+
+    prev_cost      DOUBLE      DEFAULT NULL
+        COMMENT '上一行的成本，便于直接看变化量而不必自连接',
+
+    odds_updated   DATETIME    DEFAULT NULL
+        COMMENT '这份成本对应的赔率版本',
+
+    changed_time   DATETIME    NOT NULL
+        COMMENT '写入时刻（北京时间）',
+
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_version (platform, match_id, odds_updated)
+        COMMENT '同一份赔率只记一条，防止重复写',
+    KEY idx_match_time (platform, match_id, changed_time)
+        COMMENT '取某场最近 N 分钟的成本：列表页 1h 变化'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='成本变动流水：analyze 在成本变化时追加，页面读来算 1h 变化';
+
+
+-- =============================================================================
 -- ⑦ kessbet_arbitrage_snapshot — 套利命中快照
 -- -----------------------------------------------------------------------------
 -- 只在 cost < 1.0 时写。存的是**命中那一刻的完整盘口**，不是当前值。

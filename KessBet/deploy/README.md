@@ -126,6 +126,20 @@ PID：`run/*.pid`
 
 赔率没变的比赛会被跳过——实测第二轮 130 场只需 1.2 秒。
 
+算完之后，如果成本和上一轮不同，会往 `kessbet_match_cost_history`
+追加一条流水。列表页的「1h 变化」读这张表。
+
+> **首次部署要回填一次**，否则「1h 变化」列会全是「—」，
+> 要等成本自然变化积累出历史：
+>
+> ```bash
+> set -a; . deploy/.env; set +a
+> "$VENV/bin/python" tools/backfill_cost_history.py --hours 72
+> ```
+>
+> 约 3 秒/场，500 场十几分钟。一次性操作，之后由 analyze 增量维护。
+> 重复执行安全（唯一键去重），也可以加 `--dry-run` 先看量。
+
 ### uvicorn — Web
 
 只读 API + 静态页面。不写任何表，不碰采集链路。

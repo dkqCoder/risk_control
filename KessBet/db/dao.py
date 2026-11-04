@@ -353,6 +353,71 @@ class Dao:
             cur.execute(sql, (platform, match_id))
             return cur.fetchone()[0]
 
+    # ---------- 成本变动流水 ----------
+
+    def append_cost_history(self, platform: str, match_id: str, cost: float,
+                            prev_cost, odds_updated, changed_time) -> bool:
+        """成本变化时追加一行。返回 True 表示确实写了新行。
+
+        只在成本真的变了才写 —— analyze 每 2 秒跑一轮，无条件写会让
+        一场比赛一天产出几万行，而其中绝大多数成本一分没动。
+        唯一键 (platform, match_id, odds_updated) 兜底：同一份赔率重算
+        两次（比如进程重启后补算）不会产生重复行。
+        """
+        if cost is None:
+            return False
+        sql = """
+        INSERT INTO kessbet_match_cost_history
+          (platform, match_id, cost, prev_cost, odds_updated, changed_time)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        ON DUPLICATE KEY UPDATE id = id
+        """
+        with self.conn.cursor() as cur:
+            n = cur.execute(sql, (platform, match_id, cost, prev_cost,
+                                  odds_updated, changed_time))
+        # 不在这里 commit：由调用方和 write_cost 一起提交，
+        # 避免两条记录落在不同事务里导致「成本表更新了但流水没跟上」
+        return n == 1
+
+    def cost_at(self, match_ids: list[str], minutes: int = 60,
+                platform: str = 'kessbet') -> dict[str, dict]:
+        """批量取每场「N 分钟前」的成本，供列表页算 1h 变化。
+
+        取的是 changed_time <= 截止时刻的**最后一行**。注意这是
+        「截止时刻时的成本」，不是「N 分钟内的最小/最大」—— 后者需要
+        扫描窗口内所有行，量级完全不同。
+
+        没有历史行的比赛不出现在结果里，前端据此显示「—」，
+        而不是拿当前值充数（那会让每场都显示 0）。
+        """
+        if not match_ids:
+            return {}
+        ph = ','.join(['%s'] * len(match_ids))
+        sql = f"""
+        SELECT h.match_id, h.cost
+        FROM kessbet_match_cost_history h
+        JOIN (
+            SELECT match_id, MAX(changed_time) AS mt
+            FROM kessbet_match_cost_history
+            WHERE platform=%s AND match_id IN ({ph})
+              AND changed_time <= NOW() - INTERVAL %s MINUTE
+            GROUP BY match_id
+        ) x ON x.match_id = h.match_id AND x.mt = h.changed_time
+        WHERE h.platform=%s
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, [platform] + list(match_ids) + [minutes, platform])
+            return {r[0]: {'cost': float(r[1])} for r in cur.fetchall()}
+
+    def cleanup_cost_history(self, days: int = 7) -> int:
+        """按时间清理。这张表只增不改，不清理会一直涨。"""
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM kessbet_match_cost_history "
+                        "WHERE changed_time < NOW() - INTERVAL %s DAY", (days,))
+            n = cur.rowcount
+        self.conn.commit()
+        return n
+
     def get_costs(self, match_ids: list[str],
                   platform: str = 'kessbet') -> dict[str, dict]:
         """批量读成本快照，一次查询搞定列表页。"""
@@ -380,6 +445,28 @@ class Dao:
                     'error': r[10], 'computed_time': r[11],
                 }
         return out
+
+    def get_cost(self, match_id: str, platform: str = 'kessbet'):
+        """读单场的成本快照。analyze 用来比较「和上一轮比变没变」。"""
+        sql = """SELECT cost, cost_scope, n_markets, n_selections,
+                        n_candidates, ilp_chosen, lp_worst_profit, lp_chosen,
+                        cross_gap, error, computed_time, odds_updated
+                 FROM kessbet_match_cost
+                 WHERE platform=%s AND match_id=%s"""
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (platform, match_id))
+            r = cur.fetchone()
+        if not r:
+            return None
+        return {
+            'cost': float(r[0]) if r[0] is not None else None,
+            'cost_scope': r[1], 'n_markets': r[2], 'n_selections': r[3],
+            'n_candidates': r[4], 'ilp_chosen': r[5],
+            'lp_worst_profit': float(r[6]) if r[6] is not None else None,
+            'lp_chosen': r[7],
+            'cross_gap': float(r[8]) if r[8] is not None else None,
+            'error': r[9], 'computed_time': r[10], 'odds_updated': r[11],
+        }
 
     def cleanup_cost(self, days: int = 7) -> int:
         with self.conn.cursor() as cur:
@@ -549,6 +636,15 @@ class Dao:
                 "WHERE kickoff_time < NOW() - INTERVAL %s DAY",
                 (match_days,))
             result['match'] = cur.rowcount
+
+            # 成本流水没有 kickoff_time（它记的是「什么时候变的」），
+            # 只能按 changed_time 清。放在 match 之后执行，避免出现
+            # 「比赛还在但流水没了」的中间态被别的查询看到。
+            cur.execute(
+                "DELETE FROM kessbet_match_cost_history "
+                "WHERE changed_time < NOW() - INTERVAL %s DAY",
+                (history_days,))
+            result['cost_history'] = cur.rowcount
 
             cur.execute(
                 "DELETE FROM kessbet_collect_log "

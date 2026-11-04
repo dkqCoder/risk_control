@@ -145,6 +145,10 @@ def list_matches(
         ids = [r[0] for r in rows]
         costs = dao.get_costs(ids)                       # 一次查询，O(1)
         plats = _platforms_of(dao, ids)
+        # 1 小时前的成本。一次批量查询，不在请求里跑 ILP ——
+        # 实测按赔率流水反推 25 场要 61.7 秒，页面不可能等。
+        # 没有历史行的场次不会出现在结果里，前端据此显示「—」。
+        prev_costs = dao.cost_at(ids, minutes=60)
         out = []
         for (mid, home, away, league, country, ko, srid,
              n_mk, n_sel, last_upd) in rows:
@@ -167,6 +171,13 @@ def list_matches(
                 or (last_upd is not None
                     and cr['computed_time'] < last_upd))
 
+            # 1h 变化 = 当前 − 1 小时前。任一缺失就返回 None，
+            # 绝不用 0 充数 —— 「没变化」和「不知道」是两件事。
+            prev = prev_costs.get(mid)
+            prev_cost = prev['cost'] if prev else None
+            delta = (round(cost - prev_cost, 6)
+                     if cost is not None and prev_cost is not None else None)
+
             item = {
                 'match_id': mid,
                 'canonical_id': srid or f'local:kessbet:{mid}',
@@ -182,6 +193,8 @@ def list_matches(
                 'platforms': plats.get(mid) or [],
                 'n_platforms': len(plats.get(mid) or []),
                 'cost': cost,
+                'cost_1h_ago': prev_cost,
+                'cost_delta_1h': delta,
                 'cost_scope': cr['cost_scope'] if cr else None,
                 'computed_time': _iso(cr['computed_time']) if cr else None,
                 'cost_stale': stale,

@@ -207,7 +207,7 @@ td.num{text-align:right; font-family:ui-monospace,Consolas,monospace}
         <th class="num">盘口</th>
         <th class="num">选项</th>
         <th class="num">最小成本</th>
-        <th class="num">1h 变化</th>
+        <th class="num" title="相对 1 小时前的成本变化。红色=成本上升，绿色=下降">1h 变化</th>
         <th>最近更新</th>
         <th>状态</th>
       </tr>
@@ -229,8 +229,11 @@ td.num{text-align:right; font-family:ui-monospace,Consolas,monospace}
     <b>平台列</b>显示该场比赛有报价的来源。只有一个平台时，成本是该平台内部的
     最优覆盖成本；有多个平台后，成本标为「跨平台」并按每个选项取各平台最高赔率计算 ——
     那才是真正可能出现 &lt;1 的地方。<br>
-    「1h 变化」是相对 1 小时前的成本变动 —— <span style="color:var(--good)">绿</span>为成本下降（抽水变少），
+    「1h 变化」是当前成本相对 1 小时前的变动 ——
+    <span style="color:var(--good)">绿</span>为成本下降（抽水变少，离套利更近），
     <span style="color:var(--critical)">红</span>为成本上升。
+    显示「—」表示这场在 1 小时内还没有成本记录（新赛事或刚开始采集），
+    不是「变化为 0」。
   </p>
 </div>
 
@@ -263,6 +266,18 @@ const BADGE = {
 const PLATFORM_LABEL = { kessbet: 'KessBet' };
 
 function fmtCost(v){ return v == null ? '—' : v.toFixed(4); }
+
+// 1h 变化：成本下降是好事（抽水变少），上升是坏事。
+// 用箭头 + 颜色双重表达，不单靠颜色 —— 色觉障碍用户也得分得清方向。
+function fmtDelta(v){
+  if (v == null) return '—';
+  if (Math.abs(v) < 5e-5) return '0';          // 小于展示精度，算没变
+  return (v > 0 ? '+' : '−') + Math.abs(v).toFixed(4);
+}
+function deltaClass(v){
+  if (v == null || Math.abs(v) < 5e-5) return '';
+  return v > 0 ? 'up' : 'down';
+}
 
 function fmtPlatforms(r){
   if (!r.platforms.length) return '<span style="color:var(--muted)">—</span>';
@@ -311,7 +326,7 @@ function render(){
       <td class="num cost ${costClass(r.cost, r.status)}">${fmtCost(r.cost)}${r.cost_stale && r.cost != null
           ? '<span title="赔率已更新，这个成本还在重算队列里。点进详情看到的是实时值" ' +
             'style="color:var(--warning);margin-left:3px">*</span>' : ''}</td>
-      <td class="num" style="color:var(--muted)">—</td>
+      <td class="num delta ${deltaClass(r.cost_delta_1h)}">${fmtDelta(r.cost_delta_1h)}</td>
       <td style="color:var(--dim); white-space:nowrap">${upd}</td>
       <td><span class="badge ${cls}"><i></i>${label}</span></td>
     </tr>`;

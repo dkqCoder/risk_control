@@ -45,6 +45,11 @@ log = logging.getLogger(__name__)
 #   - 真正的一致性检查：把 LP 的权重独立复算一遍，验证最差收益与报告值相符
 CROSS_CHECK_EPS = 1e-6      # 数值误差容限（LP 不该比 ILP 差超过这个）
 
+# 成本变化判定阈值。低于它视为「没变」，不记流水 ——
+# 求解器的浮点噪声在 1e-9 量级，赔率微调导致的成本变化通常 >= 1e-4。
+# 取 1e-6 是为了避开噪声又不漏掉真实的小幅变动。
+COST_EPS = 1e-6
+
 # 兼容旧名字：某些调用方/测试仍引用 CROSS_CHECK_TOL
 CROSS_CHECK_TOL = CROSS_CHECK_EPS
 
@@ -473,14 +478,23 @@ def _run_parallel(dao, todo, n, write_hits, verbose, write_costs, now) -> list[d
 
 def _persist_cost(dao, match_id: str, sport: str, kickoff, a: MatchAnalysis,
                   now, odds_updated) -> None:
-    """把一次判定结果写入快照表。写失败不影响分析主流程。"""
+    """把一次判定结果写入快照表，并在成本变化时追加一条流水。
+
+    写失败不影响分析主流程。
+    """
+    cost = a.ilp.cost if a.ilp and a.ilp.cost else None
     try:
+        # 先读上一行的成本，用于判断是否变化、并填 prev_cost。
+        # 必须在 write_cost 之前读 —— 它一提交就把上一行的值覆盖掉了。
+        prev = dao.get_cost(match_id)
+        prev_cost = prev['cost'] if prev else None
+
         dao.write_cost(
             platform='kessbet',
             match_id=match_id,
             sport=sport,
             kickoff_time=kickoff,
-            cost=a.ilp.cost if a.ilp and a.ilp.cost else None,
+            cost=cost,
             cost_scope='single',
             n_markets=0,                       # 由页面按需从 prematch 统计
             n_selections=a.n_options,
@@ -497,6 +511,21 @@ def _persist_cost(dao, match_id: str, sport: str, kickoff, a: MatchAnalysis,
             odds_updated=odds_updated,
             computed_time=now,
         )
+
+        # 只在成本真的变化时记流水。没有变化时写一行也没有意义 ——
+        # 列表页要的是「一小时前是多少」，不是「每 2 秒是多少」。
+        # 首次计算（prev_cost is None）也记一笔，否则新赛事要等到第二次
+        # 变化才有历史，1h 变化会一直空着。
+        if cost is not None and (prev_cost is None
+                                 or abs(prev_cost - cost) > COST_EPS):
+            dao.append_cost_history(
+                platform='kessbet',
+                match_id=match_id,
+                cost=cost,
+                prev_cost=prev_cost,
+                odds_updated=odds_updated,
+                changed_time=now,
+            )
         dao.conn.commit()
     except Exception as e:
         log.warning('write_cost %s failed: %s', match_id, e)

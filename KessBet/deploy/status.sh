@@ -54,9 +54,9 @@ try:
     with d.conn.cursor() as c:
         for t in ('kessbet_match', 'kessbet_odds_prematch',
                   'kessbet_odds_history', 'kessbet_match_cost',
-                  'kessbet_arbitrage_snapshot'):
+                  'kessbet_match_cost_history', 'kessbet_arbitrage_snapshot'):
             c.execute(f'SELECT COUNT(*) FROM {t}')
-            print(f'  {t:24} {c.fetchone()[0]:>10,}')
+            print(f'  {t:28} {c.fetchone()[0]:>10,}')
         c.execute('''SELECT COUNT(DISTINCT match_id)
                      FROM kessbet_odds_prematch
                      WHERE updated_time > NOW() - INTERVAL 30 MINUTE''')
