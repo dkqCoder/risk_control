@@ -33,6 +33,7 @@ if BASE not in sys.path:
 from analyze import payout, solver            # noqa: E402
 from analyze.covers import soccer             # noqa: E402
 from collect import config                    # noqa: E402
+from common.markets import describe_pick, group_markets  # noqa: E402
 from db.dao import Dao                        # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -144,7 +145,6 @@ def list_matches(
         ids = [r[0] for r in rows]
         costs = dao.get_costs(ids)                       # 一次查询，O(1)
         plats = _platforms_of(dao, ids)
-
         out = []
         for (mid, home, away, league, country, ko, srid,
              n_mk, n_sel, last_upd) in rows:
@@ -158,6 +158,15 @@ def list_matches(
                 status = 'nocov' if cr['error'] == 'no_cover' else 'error'
             else:
                 status = 'ok'
+            # 快照是否已经落后于赔率。落后意味着这个 cost 可能是旧值，
+            # 详情页在这种情况下会实时重算，两个页面就会显示不同数字。
+            # 前端据此打「可能过期」标记，避免用户困惑。
+            stale = bool(
+                cr is None
+                or cr.get('computed_time') is None
+                or (last_upd is not None
+                    and cr['computed_time'] < last_upd))
+
             item = {
                 'match_id': mid,
                 'canonical_id': srid or f'local:kessbet:{mid}',
@@ -175,6 +184,7 @@ def list_matches(
                 'cost': cost,
                 'cost_scope': cr['cost_scope'] if cr else None,
                 'computed_time': _iso(cr['computed_time']) if cr else None,
+                'cost_stale': stale,
                 'is_arbitrage': bool(cost is not None and cost < 1.0),
                 'status': status,
             }
@@ -362,29 +372,10 @@ def match_detail(match_id: str,
                           and lp_data and lp_data['worst_profit'] > 1e-6)
             n_cand = snap['n_candidates']
 
-        # 按 (盘口, 归属) 分组。
-        #
-        # 必须带 side：队名盘口在入库时被拆成 market='Total' + side='H'/'A'，
-        # 如果只按 market 分组，'Kataller Toyama Total'、'Vegalta Sendai Total'
-        # 和全场的 'Total' 会混进同一个块。接口返回 66 个盘口，页面只剩 49 个，
-        # 用户会以为漏抓。选项总数（283）是对的，只是分组错了。
-        markets: dict[tuple[str, str], list] = {}
-        for market, side, line, label, odds in rows:
-            markets.setdefault((market, side), []).append({
-                'line': line, 'label': label, 'odds': odds,
-            })
-
-        def _market_name(key: tuple[str, str]) -> str:
-            """还原成用户看到的盘口名。"""
-            base, side = key
-            if not side:
-                return base
-            team = home if side == 'H' else away
-            # 半场前缀要放在队名之前：'1st Half - Kataller Toyama Total'
-            for p in ('1st Half - ', '2nd Half - '):
-                if base.startswith(p):
-                    return f'{p}{team} {base[len(p):]}'
-            return f'{team} {base}'
+        # 按 (盘口, 归属) 分组。实现放在 common/markets.py，
+        # 因为 analyze 写套利快照时要用同一份逻辑 —— 页面显示和留存证据
+        # 必须一致，各写一份早晚会分叉。
+        markets = group_markets(rows, home, away)
 
         # 变动流水（按时间折叠）
         with dao.conn.cursor() as c:
@@ -418,10 +409,7 @@ def match_detail(match_id: str,
             'cross_ok': cross_ok,
             'cross_gap': cross_gap,
             'is_arbitrage': is_arb,
-            'markets': [{'name': _market_name(k),
-                         'base': k[0], 'side': k[1],
-                         'selections': v}
-                        for k, v in sorted(markets.items())],
+            'markets': markets,
             'n_market_groups': len(markets),
             'timeline': timeline,
         }
@@ -453,6 +441,108 @@ def selection_history(match_id: str,
         dao.close()
 
 
+# ---------------------------------------------------------------- 套利命中
+
+def _arb_row(r: dict) -> dict:
+    """把命中快照的一行转成 API 结构。
+
+    传入的是 DictCursor 的行，按列名取值 —— 位置解包太脆弱，
+    两个 DAO 方法的 SELECT 顺序稍有不同就会把字段错配上，
+    而且错误只在运行时暴露（开发时踩过一次）。
+    """
+    worst = r.get('lp_worst_profit')
+    gap = r.get('cross_gap')
+    home, away = r['home_team'], r['away_team']
+    return {
+        'id': r['id'],
+        'alert_time': _iso(r['alert_time']),
+        'match_id': r['match_id'],
+        'canonical_id': r.get('canonical_id') or '',
+        'sport': r['sport'],
+        'home_team': home,
+        'away_team': away,
+        'league': r.get('league') or '',
+        'kickoff_time': _iso(r['kickoff_time']),
+        'cost': float(r['cost']),
+        'cost_scope': r.get('cost_scope'),
+        'lp_worst_profit': float(worst) if worst is not None else None,
+        'profit_pct': round(float(worst) * 100, 4) if worst is not None else None,
+        'cross_gap': float(gap) if gap is not None else None,
+        'n_markets': int(r.get('n_markets') or 0),
+        'n_selections': int(r.get('n_selections') or 0),
+        'n_candidates': int(r.get('n_candidates') or 0),
+        'ilp_chosen': [{'desc': d, 'text': describe_pick(d, home, away)}
+                       for d in json.loads(r.get('ilp_chosen') or '[]')],
+        'lp_chosen': [{'desc': x['desc'],
+                       'text': describe_pick(x['desc'], home, away),
+                       'weight': x['weight']}
+                      for x in json.loads(r.get('lp_chosen') or '[]')],
+        'odds_updated': _iso(r.get('odds_updated')),
+    }
+
+
+@app.get('/api/arbitrage')
+def list_arbitrage(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    match_id: str | None = Query(None),
+) -> dict:
+    """套利命中列表，按告警时间倒序。
+
+    正常情况下这是空列表 —— 单家博彩公司内部出现 cost<1 只可能是定价错误。
+    """
+    dao = _dao()
+    try:
+        rows = dao.list_arbitrage(limit=limit, offset=offset,
+                                  match_id=match_id)
+        total = dao.count_arbitrage(match_id)
+        return {'total': int(total), 'offset': offset, 'limit': limit,
+                'hits': [_arb_row(r) for r in rows]}
+    finally:
+        dao.close()
+
+
+@app.get('/api/arbitrage/stats')
+def arbitrage_stats() -> dict:
+    """命中汇总。页面顶部用。
+
+    必须定义在 /api/arbitrage/{snap_id} **之前** —— FastAPI 按注册顺序匹配，
+    否则 'stats' 会被当成 snap_id 去转 int，直接 422。
+    """
+    dao = _dao()
+    try:
+        with dao.conn.cursor() as c:
+            c.execute("""SELECT COUNT(*), COUNT(DISTINCT match_id),
+                                MIN(cost), MIN(alert_time), MAX(alert_time)
+                         FROM kessbet_arbitrage_snapshot
+                         WHERE platform='kessbet'""")
+            n, n_match, min_cost, first, last = c.fetchone()
+        return {
+            'hits': int(n or 0),
+            'matches': int(n_match or 0),
+            'min_cost': float(min_cost) if min_cost is not None else None,
+            'first_alert': _iso(first),
+            'last_alert': _iso(last),
+        }
+    finally:
+        dao.close()
+
+
+@app.get('/api/arbitrage/{snap_id}')
+def arbitrage_detail(snap_id: int) -> dict:
+    """单条命中快照的完整数据，含当时的全部盘口。"""
+    dao = _dao()
+    try:
+        r = dao.get_arbitrage(snap_id)
+        if not r:
+            raise HTTPException(404, 'snapshot not found')
+        out = _arb_row(r)
+        out['market_detail'] = json.loads(r.get('market_detail') or '[]')
+        return out
+    finally:
+        dao.close()
+
+
 # ---------------------------------------------------------------- 静态页
 
 WEB_DIR = os.path.join(BASE, 'web')
@@ -460,11 +550,24 @@ if os.path.isdir(WEB_DIR):
     app.mount('/static', StaticFiles(directory=WEB_DIR), name='static')
 
 
+def _page(path):
+    """返回 HTML 页并禁止缓存。
+
+    FileResponse 默认带 ETag/Last-Modified，浏览器会用启发式缓存 ——
+    改完页面 f5 看到的还是旧 JS，而服务端 curl 明明是新的。页面本身只有
+    几十 KB，每次取一次比让人怀疑"改了没生效"划算。
+    """
+    return FileResponse(path, headers={
+        'Cache-Control': 'no-store, must-revalidate',
+        'Pragma': 'no-cache',
+    })
+
+
 @app.get('/')
 def index():
     p = os.path.join(WEB_DIR, 'index.html')
     if os.path.isfile(p):
-        return FileResponse(p)
+        return _page(p)
     raise HTTPException(404, 'web/index.html not found')
 
 
@@ -472,5 +575,14 @@ def index():
 def detail_page():
     p = os.path.join(WEB_DIR, 'detail.html')
     if os.path.isfile(p):
-        return FileResponse(p)
+        return _page(p)
     raise HTTPException(404, 'web/detail.html not found')
+
+
+@app.get('/arbitrage')
+@app.get('/arbitrage.html')
+def arbitrage_page():
+    p = os.path.join(WEB_DIR, 'arbitrage.html')
+    if os.path.isfile(p):
+        return _page(p)
+    raise HTTPException(404, 'web/arbitrage.html not found')

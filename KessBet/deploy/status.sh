@@ -53,7 +53,8 @@ try:
     d = Dao()
     with d.conn.cursor() as c:
         for t in ('kessbet_match', 'kessbet_odds_prematch',
-                  'kessbet_odds_history', 'kessbet_odds_hit'):
+                  'kessbet_odds_history', 'kessbet_match_cost',
+                  'kessbet_arbitrage_snapshot'):
             c.execute(f'SELECT COUNT(*) FROM {t}')
             print(f'  {t:24} {c.fetchone()[0]:>10,}')
         c.execute('''SELECT COUNT(DISTINCT match_id)

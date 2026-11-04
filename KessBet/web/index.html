@@ -116,6 +116,12 @@ td.num{text-align:right; font-family:ui-monospace,Consolas,monospace}
 
 <header>
   <h1>Odds Monitor</h1>
+  <a href="/arbitrage" id="navArb"
+     style="font-size:13px;color:var(--dim);border:1px solid var(--line);
+            border-radius:5px;padding:5px 11px;background:var(--panel2)"
+     title="查看套利命中记录（含当时的完整盘口快照）">
+    套利命中 <b id="arbCount" style="color:var(--good)">0</b>
+  </a>
   <div class="stats">
     <span title="未来 N 小时内开赛的足球比赛">在盯 <b id="stTotal">—</b> 场</span>
     <span title="已有成本快照 / 全部"><b id="stComputed">—</b> 已算</span>
@@ -190,6 +196,8 @@ td.num{text-align:right; font-family:ui-monospace,Consolas,monospace}
   <p class="hint">
     成本 = 覆盖全部 2025 个状态所需的最小 Σ(1/赔率)。&lt;1 才是套利；
     正常区间 1.02–1.08，就是平台抽水。<br>
+    带 <span style="color:var(--warning)">*</span> 表示该场赔率刚更新、成本还在重算队列里；
+    详情页对这类场次会实时重算，所以两处数字可能略有不同。<br>
     <b>平台列</b>显示该场比赛有报价的来源。只有一个平台时，成本是该平台内部的
     最优覆盖成本；有多个平台后，成本标为「跨平台」并按每个选项取各平台最高赔率计算 ——
     那才是真正可能出现 &lt;1 的地方。<br>
@@ -272,7 +280,9 @@ function render(){
       <td class="plats">${fmtPlatforms(r)}</td>
       <td class="num">${r.n_markets || '—'}</td>
       <td class="num">${r.n_selections || '—'}</td>
-      <td class="num cost ${costClass(r.cost, r.status)}">${fmtCost(r.cost)}</td>
+      <td class="num cost ${costClass(r.cost, r.status)}">${fmtCost(r.cost)}${r.cost_stale && r.cost != null
+          ? '<span title="赔率已更新，这个成本还在重算队列里。点进详情看到的是实时值" ' +
+            'style="color:var(--warning);margin-left:3px">*</span>' : ''}</td>
       <td class="num" style="color:var(--muted)">—</td>
       <td style="color:var(--dim); white-space:nowrap">${upd}</td>
       <td><span class="badge ${cls}"><i></i>${label}</span></td>
@@ -326,6 +336,23 @@ async function load(){
   // 顶部统计单独请求：必须基于**全部符合条件**的比赛，
   // 不能对当前页 25 条取 min（那样翻页数字会变）。
   loadSummary();
+}
+
+async function loadArbCount(){
+  try{
+    const s = await (await fetch('/api/arbitrage/stats')).json();
+    const n = s.hits || 0;
+    setText('arbCount', n);
+    const el = $('arbCount');
+    if (el) el.style.color = n > 0 ? 'var(--good)' : 'var(--muted)';
+    const nav = $('navArb');
+    // 有命中时让入口更醒目 —— 这是需要立刻处理的事
+    if (nav && n > 0){
+      nav.style.borderColor = 'var(--good)';
+      nav.style.background = 'rgba(10,110,10,.08)';
+      nav.style.color = 'var(--good)';
+    }
+  }catch(e){ /* 入口不显示数字也不影响主列表 */ }
 }
 
 async function loadSummary(){
@@ -383,10 +410,15 @@ $('next').addEventListener('click', () => {
   state.offset += state.limit; load();
 });
 
-// 每 30 秒自动刷新（成本由后台 analyze 每 60 秒更新一轮）
-setInterval(() => { if (!document.hidden) load(); }, 30000);
+// 每 30 秒自动刷新（成本由后台 analyze 更新）
+setInterval(() => {
+  if (document.hidden) return;
+  load();
+  loadArbCount();
+}, 30000);
 
 load();
+loadArbCount();
 </script>
 </body>
 </html>

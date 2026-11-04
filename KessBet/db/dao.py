@@ -410,16 +410,92 @@ class Dao:
             cur.executemany(sql, rows)
             return cur.rowcount
 
-    def write_hit(self, match_id: str, sport: str, cost: float,
-                  markets_json: str, kickoff_time) -> None:
+    # ---------- 套利命中快照 ----------
+
+    def write_arbitrage_snapshot(self, *, match_id: str, sport: str,
+                                 home: str, away: str, league: str,
+                                 canonical_id: str, kickoff_time,
+                                 cost: float, cost_scope: str,
+                                 lp_worst_profit, cross_gap,
+                                 ilp_chosen: str, lp_chosen: str,
+                                 n_markets: int, n_selections: int,
+                                 n_candidates: int, market_detail: str,
+                                 odds_updated, alert_time) -> bool:
+        """写一条命中快照。返回 True 表示新写入，False 表示这份赔率已记过。
+
+        唯一键 (platform, match_id, odds_updated) 负责去重：
+        分析每 2 秒轮询，同一份赔率持续命中时不能反复写 60KB 的快照。
+        """
         sql = """
-        INSERT INTO kessbet_odds_hit
-          (alert_time, platform, match_id, sport, cost, markets, kickoff_time)
-        VALUES (NOW(), 'kessbet', %s, %s, %s, %s, %s)
+        INSERT INTO kessbet_arbitrage_snapshot
+          (alert_time, platform, match_id, canonical_id, sport,
+           home_team, away_team, league, kickoff_time,
+           cost, cost_scope, lp_worst_profit, cross_gap,
+           ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
+           market_detail, odds_updated)
+        VALUES (%s,'kessbet',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON DUPLICATE KEY UPDATE id = id
         """
         with self.conn.cursor() as cur:
-            cur.execute(sql, (match_id, sport, cost, markets_json, kickoff_time))
+            n = cur.execute(sql, (
+                alert_time, match_id, canonical_id, sport,
+                home, away, league, kickoff_time,
+                cost, cost_scope, lp_worst_profit, cross_gap,
+                ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
+                market_detail, odds_updated,
+            ))
         self.conn.commit()
+        # MySQL: INSERT 返回 1，命中重复键返回 0
+        return n == 1
+
+    def list_arbitrage(self, limit: int = 100, offset: int = 0,
+                       match_id: str | None = None) -> list[tuple]:
+        """命中列表，按告警时间倒序。不返回 market_detail（太大）。"""
+        where = ["platform='kessbet'"]
+        args: list = []
+        if match_id:
+            where.append('match_id=%s')
+            args.append(match_id)
+        sql = f"""
+        SELECT id, alert_time, match_id, canonical_id, sport,
+               home_team, away_team, league, kickoff_time,
+               cost, cost_scope, lp_worst_profit, cross_gap,
+               ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
+               odds_updated
+        FROM kessbet_arbitrage_snapshot
+        WHERE {' AND '.join(where)}
+        ORDER BY alert_time DESC, id DESC
+        LIMIT %s OFFSET %s
+        """
+        with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(sql, args + [limit, offset])
+            return list(cur.fetchall())
+
+    def count_arbitrage(self, match_id: str | None = None) -> int:
+        where = ["platform='kessbet'"]
+        args: list = []
+        if match_id:
+            where.append('match_id=%s')
+            args.append(match_id)
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM kessbet_arbitrage_snapshot "
+                        f"WHERE {' AND '.join(where)}", args)
+            return cur.fetchone()[0]
+
+    def get_arbitrage(self, snap_id: int) -> tuple | None:
+        """单条命中快照的完整数据（含 market_detail）。"""
+        sql = """
+        SELECT id, alert_time, match_id, canonical_id, sport,
+               home_team, away_team, league, kickoff_time,
+               cost, cost_scope, lp_worst_profit, cross_gap,
+               ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
+               market_detail, odds_updated
+        FROM kessbet_arbitrage_snapshot
+        WHERE platform='kessbet' AND id=%s
+        """
+        with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(sql, (snap_id,))
+            return cur.fetchone()
 
     # ---------- log ----------
 

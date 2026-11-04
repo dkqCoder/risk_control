@@ -324,16 +324,69 @@ def _analyze_one(dao, row, write_hits: bool, verbose: bool,
                     match_id, home, away, cost, a.lp.worst_profit)
         log.warning('\n%s', format_payout_table(a))
         if write_hits:
-            detail = {
-                'ilp_chosen': a.ilp.chosen,
-                'lp_chosen': [{'desc': d, 'weight': w} for d, w in a.lp.chosen],
-                'worst_profit': a.lp.worst_profit,
-                'cross_gap': a.cross_gap,
-            }
-            dao.write_hit(match_id, sport, cost,
-                          json.dumps(detail, ensure_ascii=False),
-                          kickoff)
+            # 只写 kessbet_arbitrage_snapshot。原来还有一张 kessbet_odds_hit
+            # 只存成本 + desc 列表，没有任何读取方；快照表是它的超集
+            # （完整盘口 + ILP/LP + 交叉验证），留着只会让人以为有两处证据。
+            try:
+                _persist_arbitrage(dao, match_id, sport, home, away, kickoff, a)
+            except Exception as e:
+                log.exception('写套利快照失败 %s: %s', match_id, e)
     return out
+
+
+def _persist_arbitrage(dao, match_id: str, sport: str, home: str,
+                       away: str, kickoff, a: MatchAnalysis) -> None:
+    """把命中的完整盘口写进 kessbet_arbitrage_snapshot。
+
+    用 odds_updated 做去重键：分析每 2 秒轮询，同一份赔率持续命中时
+    不能反复写 30~60KB 的快照。
+    """
+    from common.markets import group_markets
+
+    rows = dao.get_selections(match_id)
+    odds_updated = dao.cost_updated_at(match_id)
+    league = ''
+    try:
+        with dao.conn.cursor() as c:
+            c.execute("SELECT league, sportradar_id FROM kessbet_match "
+                      "WHERE platform='kessbet' AND match_id=%s", (match_id,))
+            r = c.fetchone()
+        if r:
+            league = r[0] or ''
+            srid = r[1] or ''
+        else:
+            srid = ''
+    except Exception:
+        srid = ''
+
+    detail = group_markets(
+        [(m, s, l, lab, o) for m, s, l, lab, o in rows], home, away)
+
+    written = dao.write_arbitrage_snapshot(
+        match_id=match_id, sport=sport,
+        home=home, away=away, league=league,
+        canonical_id=srid or f'local:kessbet:{match_id}',
+        kickoff_time=kickoff,
+        cost=a.ilp.cost,
+        cost_scope='single',
+        lp_worst_profit=a.lp.worst_profit if a.lp else None,
+        cross_gap=a.cross_gap,
+        ilp_chosen=json.dumps(a.ilp.chosen, ensure_ascii=False),
+        lp_chosen=json.dumps(
+            [{'desc': d, 'weight': round(w, 8)} for d, w in a.lp.chosen],
+            ensure_ascii=False),
+        n_markets=len(detail),
+        n_selections=len(rows),
+        n_candidates=a.n_candidates,
+        market_detail=json.dumps(detail, ensure_ascii=False),
+        odds_updated=odds_updated,
+        alert_time=now_beijing(),
+    )
+    if written:
+        log.warning('套利快照已保存 %s (%d 个盘口 / %d 个选项)',
+                    match_id, len(detail), len(rows))
+    else:
+        log.info('套利快照已存在（同一份赔率）%s，跳过', match_id)
 
 
 def analyze_once(dao, horizon_hours: int | None = None,

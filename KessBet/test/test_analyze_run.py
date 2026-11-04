@@ -15,10 +15,14 @@ BEIJING = timezone(timedelta(hours=8))
 
 def _soccer_matches(dao, limit=3):
     with dao.conn.cursor() as c:
+        # JOIN 必须带 platform —— kessbet_odds_prematch 的主键是
+        # (platform, match_id, market, side, line, selection)，只给 match_id
+        # 用不上索引前缀，会退化成全表笛卡尔积（实测挂几分钟不出结果）。
         c.execute("""SELECT m.match_id, MAX(m.home_team), MAX(m.away_team),
                             MAX(m.kickoff_time)
                      FROM kessbet_match m
-                     JOIN kessbet_odds_prematch o ON o.match_id = m.match_id
+                     JOIN kessbet_odds_prematch o
+                       ON o.platform = m.platform AND o.match_id = m.match_id
                      WHERE m.sport='sr:sport:1' AND m.kickoff_time > NOW()
                      GROUP BY m.match_id
                      ORDER BY MIN(m.kickoff_time) LIMIT %s""", (limit,))

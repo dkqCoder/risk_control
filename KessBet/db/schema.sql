@@ -13,12 +13,15 @@
 --    写入统一走 common/timeutil.py 的 to_db()，不要直接塞 UTC。
 --    SQL 里比较时间用 NOW()（服务器时区 +08:00），不要用 UTC_TIMESTAMP()。
 --
--- 五张表的分工：
---   kessbet_match          赛程维表，一场一行
---   kessbet_odds_prematch  当前赔率状态，分析侧唯一读取源，一个选项一行
---   kessbet_odds_history   赔率变动流水，只增不改，保留 7 天
---   kessbet_odds_hit       套利命中记录（cost < 1 时写）
---   kessbet_collect_log    采集/分析运行日志
+-- 各表的分工：
+--   kessbet_match              赛程维表，一场一行
+--   kessbet_odds_prematch      当前赔率状态，分析侧唯一读取源，一个选项一行
+--   kessbet_odds_history       赔率变动流水，只增不改，保留 7 天
+--   kessbet_match_cost         成本快照，analyze 写、页面读
+--   kessbet_match_canonical    跨平台比赛映射（sportradar_id -> 各平台 match_id）
+--   kessbet_arbitrage_snapshot 套利命中快照（完整盘口，去重存证）
+--   kessbet_collect_log        采集/分析运行日志
+--   kessbet_odds_hit           【已废弃】被 kessbet_arbitrage_snapshot 取代
 -- =============================================================================
 
 -- =============================================================================
@@ -286,10 +289,10 @@ CREATE TABLE IF NOT EXISTS kessbet_odds_history (
 
 
 -- =============================================================================
--- ⑤ kessbet_odds_hit — 套利命中记录
+-- ⑤ kessbet_odds_hit — 【已废弃】套利命中记录
 -- -----------------------------------------------------------------------------
--- 只在 cost < 1.0 时写。正常情况下这张表**应该是空的**——
--- 单家博彩公司内部出现无损套利只可能是调价错误。
+-- 由 ⑦ kessbet_arbitrage_snapshot 取代：这张表只存成本 + 命中组合的 desc，
+-- 没有赔率快照，事后无法复核。保留建表语句只是为了兼容已有库，不再写入。
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS kessbet_odds_hit (
     id           BIGINT       NOT NULL AUTO_INCREMENT
@@ -401,7 +404,86 @@ CREATE TABLE IF NOT EXISTS kessbet_match_cost (
 
 
 -- =============================================================================
--- ⑦ kessbet_collect_log — 采集与运行日志
+-- ⑦ kessbet_arbitrage_snapshot — 套利命中快照
+-- -----------------------------------------------------------------------------
+-- 只在 cost < 1.0 时写。存的是**命中那一刻的完整盘口**，不是当前值。
+--
+-- 为什么不能复用 kessbet_odds_hit：
+--   那张表只存了成本 + 命中组合的 desc 列表，没有赔率快照。
+--   赔率几秒后就变了，事后无法复核「当时为什么判定为套利」。
+--   而套利命中极罕见（实测几百场 0 次），一旦出现必须留住证据。
+--
+-- 为什么带 odds_updated 并做唯一键：
+--   分析每 2 秒轮询一次。同一份赔率如果持续命中，不做去重会每 2 秒
+--   写一条 60KB 的快照，一天就爆表。用 (platform, match_id, odds_updated)
+--   做唯一键 —— 同一份赔率只记一次；赔率真变了再次命中才记新的一条。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS kessbet_arbitrage_snapshot (
+    id             BIGINT       NOT NULL AUTO_INCREMENT
+        COMMENT '自增主键',
+
+    alert_time     DATETIME     NOT NULL
+        COMMENT '检测到套利的时刻（北京时间）',
+
+    platform       VARCHAR(16)  NOT NULL,
+    match_id       VARCHAR(32)  NOT NULL,
+
+    canonical_id   VARCHAR(64)  NOT NULL DEFAULT ''
+        COMMENT '跨平台统一键，便于按比赛聚合查看多次命中',
+
+    sport          VARCHAR(16)  NOT NULL,
+    home_team      VARCHAR(128) NOT NULL DEFAULT '',
+    away_team      VARCHAR(128) NOT NULL DEFAULT '',
+    league         VARCHAR(128) NOT NULL DEFAULT '',
+    kickoff_time   DATETIME     NOT NULL
+        COMMENT '开赛时间（北京时间）',
+
+    cost           DOUBLE       NOT NULL
+        COMMENT '命中时的最小覆盖成本，< 1.0。用 DOUBLE 不用 DECIMAL，
+                 否则 0.99996 会被存成 1.0000，与「严格 <1」冲突',
+
+    cost_scope     VARCHAR(8)   NOT NULL DEFAULT 'single',
+
+    lp_worst_profit DOUBLE      DEFAULT NULL
+        COMMENT 'LP 最差状态净收益，> 0 才算套利',
+
+    cross_gap      DOUBLE       DEFAULT NULL
+        COMMENT 'ILP 与 LP 的偏差，用于事后判断求解是否可靠',
+
+    ilp_chosen     TEXT
+        COMMENT 'ILP 选中的选项描述，JSON 数组',
+
+    lp_chosen      TEXT
+        COMMENT 'LP 资金配置，JSON 数组 [{desc, weight}]',
+
+    n_markets      INT          NOT NULL DEFAULT 0,
+    n_selections   INT          NOT NULL DEFAULT 0,
+    n_candidates   INT          NOT NULL DEFAULT 0
+        COMMENT '可建模的候选数',
+
+    market_detail  MEDIUMTEXT
+        COMMENT '命中那一刻的完整盘口快照，JSON：
+                 [{"name","base","side","selections":[{"line","label","odds"}]}]
+                 事后可据此完全重建判定过程。约 30~60 KB/条',
+
+    odds_updated   DATETIME     DEFAULT NULL
+        COMMENT '这份快照对应的赔率版本（odds_prematch 的 MAX(updated_time)）。
+                 与 match_id 一起做唯一键，保证同一份赔率只记一次',
+
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_odds (platform, match_id, odds_updated)
+        COMMENT '去重：同一份赔率只记一条',
+    KEY idx_alert (alert_time)
+        COMMENT '按告警时间倒序查看',
+    KEY idx_match (platform, match_id),
+    KEY idx_canonical (canonical_id)
+        COMMENT '同一场比赛的多次命中'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='套利命中快照：存命中那一刻的完整盘口，正常应为空表';
+
+
+-- =============================================================================
+-- ⑧ kessbet_collect_log — 采集与运行日志
 -- -----------------------------------------------------------------------------
 -- 排查用。记录每次赛程刷新、清理、WS 连接等操作的结果。
 -- 保留 30 天。
