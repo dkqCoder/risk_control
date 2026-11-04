@@ -24,9 +24,29 @@ header{
 }
 header .inner{max-width:1240px; margin:0 auto; padding:12px 22px 18px}
 header .top{display:flex; gap:14px; align-items:center; flex-wrap:wrap}
-header .back{font-size:13px; color:var(--dim); display:flex; align-items:center; gap:4px}
-header .back:hover{color:var(--accent)}
 header h1{font-size:18px; margin:0; font-weight:600; letter-spacing:-.01em}
+
+/* 顶部导航：与列表页、套利页共用同一套，切页面时位置不跳 */
+.tabs{display:flex; gap:2px; align-items:center; margin-right:6px}
+.tab{
+  position:relative; font-size:13px; color:var(--dim); text-decoration:none;
+  padding:6px 12px; border-radius:6px; white-space:nowrap;
+}
+.tab:hover{color:var(--accent); background:rgba(31,111,208,.06)}
+.tab.on{color:var(--fg); font-weight:600; background:var(--panel2)}
+.tab .dot{
+  display:inline-block; min-width:16px; height:16px; margin-left:6px;
+  padding:0 4px; border-radius:8px; background:var(--critical); color:#fff;
+  font-size:11px; font-weight:600; line-height:16px; text-align:center;
+  font-variant-numeric:tabular-nums;
+}
+/* 上面的 display 会盖掉浏览器默认的 [hidden]{display:none} */
+.tab .dot[hidden]{display:none}
+/* 导航与比赛标题之间加一道细线，避免两段文字连成一句 */
+header .tabs::after{
+  content:''; width:1px; height:18px; background:var(--line); margin-left:8px;
+}
+
 .sim{font-size:11px; color:var(--warning); border:1px solid var(--warning);
   border-radius:4px; padding:1px 6px; opacity:.85}
 
@@ -172,7 +192,13 @@ svg{display:block; width:100%; height:auto}
 <header>
   <div class="inner">
     <div class="top">
-      <a class="back" href="/">← 返回列表</a>
+      <nav class="tabs">
+        <a href="/" class="tab">列表</a>
+        <a href="/arbitrage" class="tab" id="navArb"
+           title="查看套利命中记录（含当时的完整盘口快照）">
+          套利命中<span class="dot" id="arbBadge" hidden></span>
+        </a>
+      </nav>
       <h1 id="hTitle">加载中…</h1>
       <span class="sim" id="hPlats"></span>
     </div>
@@ -689,11 +715,26 @@ async function init() {
   loadSeries(pick.value);
 }
 
+// 套利命中角标：与列表页一致，0 命中时完全隐藏
+async function loadArbBadge(){
+  try{
+    const s = await (await fetch('/api/arbitrage/stats')).json();
+    const n = s.hits || 0;
+    const b = $('arbBadge');
+    if (b){ b.hidden = n === 0; b.textContent = n > 99 ? '99+' : n; }
+    const nav = $('navArb');
+    if (nav) nav.title = n
+      ? `${n} 次套利命中，点击查看当时的完整盘口快照`
+      : '查看套利命中记录（含当时的完整盘口快照）';
+  }catch(e){ /* 角标失败不影响详情页主体 */ }
+}
+
 $('total').addEventListener('input', () => { if (DATA) renderStake(); });
 $('mkSearch').addEventListener('input', () => { mkShown = MK_PAGE; renderMarkets(); });
 $('mkMore').addEventListener('click', () => { mkShown = Infinity; renderMarkets(); });
 
 init();
+loadArbBadge();
 </script>
 </body>
 </html>

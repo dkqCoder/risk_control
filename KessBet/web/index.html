@@ -21,12 +21,37 @@ body{
 }
 header{
   position:sticky; top:0; z-index:10; background:var(--panel);
-  border-bottom:1px solid var(--line); padding:14px 22px;
+  border-bottom:1px solid var(--line);
+}
+/* 头部内容与下方 .wrap 同宽居中，否则宽屏下导航会比表格左移 20px */
+header .inner{
+  max-width:1240px; margin:0 auto; padding:14px 22px;
   display:flex; flex-wrap:wrap; gap:22px; align-items:center;
 }
 header h1{font-size:17px; margin:0; font-weight:600}
 .sim{font-size:11px; color:var(--warning); border:1px solid var(--warning);
   border-radius:4px; padding:1px 6px}
+
+/* ---- 顶部导航：三个页面共用同一套。加新页面时往后接一个 .tab 即可 ---- */
+.tabs{display:flex; gap:2px; align-items:center}
+.tab{
+  position:relative; font-size:13px; color:var(--dim); text-decoration:none;
+  padding:6px 12px; border-radius:6px; white-space:nowrap;
+}
+.tab:hover{color:var(--accent); background:rgba(31,111,208,.06)}
+.tab.on{color:var(--fg); font-weight:600; background:var(--panel2)}
+/* 有命中时的角标。数字不做成主角 —— 正常情况下这里应该一直是空的，
+   一旦出现就意味着有需要立刻处理的事，所以用强调色而不是普通计数色。 */
+.tab .dot{
+  display:inline-block; min-width:16px; height:16px; margin-left:6px;
+  padding:0 4px; border-radius:8px; background:var(--critical); color:#fff;
+  font-size:11px; font-weight:600; line-height:16px; text-align:center;
+  font-variant-numeric:tabular-nums;
+}
+/* 上面的 display 会盖掉浏览器默认的 [hidden]{display:none}，
+   必须显式声明，否则 hidden 属性形同虚设、0 也会显示出来 */
+.tab .dot[hidden]{display:none}
+
 .stats{display:flex; gap:18px; margin-left:auto; font-size:13px}
 .stats span{color:var(--dim)}
 .stats b{font-variant-numeric:tabular-nums; color:var(--fg); font-weight:500}
@@ -115,21 +140,24 @@ td.num{text-align:right; font-family:ui-monospace,Consolas,monospace}
 <body>
 
 <header>
-  <h1>Odds Monitor</h1>
-  <a href="/arbitrage" id="navArb"
-     style="font-size:13px;color:var(--dim);border:1px solid var(--line);
-            border-radius:5px;padding:5px 11px;background:var(--panel2)"
-     title="查看套利命中记录（含当时的完整盘口快照）">
-    套利命中 <b id="arbCount" style="color:var(--good)">0</b>
-  </a>
-  <div class="stats">
-    <span title="未来 N 小时内开赛的足球比赛">在盯 <b id="stTotal">—</b> 场</span>
-    <span title="已有成本快照 / 全部"><b id="stComputed">—</b> 已算</span>
-    <span title="全部比赛中的最低覆盖成本（不是当前页）">
-      最低 <b id="stMin" style="color:var(--warning)">—</b></span>
-    <span title="全部比赛中位数">中位 <b id="stMedian">—</b></span>
-    <span title="成本低于 1.03 的场次：抽水异常低，最接近套利">偏低 <b id="stBelow">—</b></span>
-    <span id="stSync" style="color:var(--muted)"></span>
+  <div class="inner">
+    <h1>Odds Monitor</h1>
+    <nav class="tabs">
+      <a href="/" class="tab on" aria-current="page">列表</a>
+      <a href="/arbitrage" class="tab" id="navArb"
+         title="查看套利命中记录（含当时的完整盘口快照）">
+        套利命中<span class="dot" id="arbBadge" hidden></span>
+      </a>
+    </nav>
+    <div class="stats">
+      <span title="未来 N 小时内开赛的足球比赛">在盯 <b id="stTotal">—</b> 场</span>
+      <span title="已有成本快照 / 全部"><b id="stComputed">—</b> 已算</span>
+      <span title="全部比赛中的最低覆盖成本（不是当前页）">
+        最低 <b id="stMin" style="color:var(--warning)">—</b></span>
+      <span title="全部比赛中位数">中位 <b id="stMedian">—</b></span>
+      <span title="成本低于 1.03 的场次：抽水异常低，最接近套利">偏低 <b id="stBelow">—</b></span>
+      <span id="stSync" style="color:var(--muted)"></span>
+    </div>
   </div>
 </header>
 
@@ -342,17 +370,17 @@ async function loadArbCount(){
   try{
     const s = await (await fetch('/api/arbitrage/stats')).json();
     const n = s.hits || 0;
-    setText('arbCount', n);
-    const el = $('arbCount');
-    if (el) el.style.color = n > 0 ? 'var(--good)' : 'var(--muted)';
-    const nav = $('navArb');
-    // 有命中时让入口更醒目 —— 这是需要立刻处理的事
-    if (nav && n > 0){
-      nav.style.borderColor = 'var(--good)';
-      nav.style.background = 'rgba(10,110,10,.08)';
-      nav.style.color = 'var(--good)';
+    const b = $('arbBadge');
+    // 0 命中时角标完全隐藏 —— 常态下不该有东西吸引注意力
+    if (b){
+      b.hidden = n === 0;
+      b.textContent = n > 99 ? '99+' : n;
     }
-  }catch(e){ /* 入口不显示数字也不影响主列表 */ }
+    const nav = $('navArb');
+    if (nav) nav.title = n
+      ? `${n} 次套利命中，点击查看当时的完整盘口快照`
+      : '查看套利命中记录（含当时的完整盘口快照）';
+  }catch(e){ /* 入口不显示角标也不影响主列表 */ }
 }
 
 async function loadSummary(){
