@@ -7,6 +7,7 @@
 | `kessbet_show_calc.py` | 在单场数据上逐步打印套利计算过程（状态映射 → 候选池 → ILP → 覆盖验证） | 怀疑计算结果有问题，想逐步骤核对时 |
 | `kessbet_compare.py` | 生成官网页盘口 vs 接口数据的对照 HTML | 怀疑抓取漏盘口时 |
 | `kessbet_parse.py` | `data/odds/raw_odds/` → 扁平 CSV | 需要把原始数据导出成表格时 |
+| `bet365_probe.py` | bet365 接口探活 + 打印首页样本赔率 | 换代理节点后确认出口能不能用 |
 
 ## 使用
 
@@ -16,6 +17,7 @@ py tools/kessbet_show_calc.py                    # 默认演示 Ipswich vs Notti
 py tools/kessbet_compare.py                      # 输出 tools/odds_compare.html
 py tools/kessbet_parse.py                        # 生成 data/kessbet_all_odds.csv
 py tools/kessbet_parse.py --prepare              # 只生成 match_ids.json
+py tools/bet365_probe.py                         # bet365 可用性自检（见 docs/bet365.md）
 ```
 
 ## 注意
