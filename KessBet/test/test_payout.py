@@ -109,12 +109,32 @@ def test_lp_suspended_only():
 
 
 def test_lp_no_chosen_returns_all_negative():
-    """无套利时，nonzero 投注的收益都是负的（正常抽水）。"""
+    """无套利时，nonzero 投注的收益都是负的（正常抽水）。
+
+    注意赔率要选**真正有抽水**的：1.5 + 3.0 的 Σ(1/o) 恰好是 1.0，
+    那是保本不是亏本。原来的用例用这组赔率能通过，是因为稠密实现
+    返回了 -5.55e-17 的浮点噪声；稀疏实现精确地返回 0，
+    反而暴露了用例本身的期望写错。
+    """
+    n = 2
+    # 1/1.5 + 1/2.5 = 0.667 + 0.400 = 1.067 > 1，有 6.7% 抽水
+    cands = [(_mask([0], n), 1.5, 'a'), (_mask([1], n), 2.5, 'b')]
+    r = lp_solve(cands, n)
+    assert r.status == 'ok'
+    assert r.worst_profit < 0
+
+
+def test_lp_exact_breakeven_is_zero():
+    """Σ(1/赔率) 恰好 = 1 时，最差收益应为 0（保本），不是负数。
+
+    1/1.5 + 1/3.0 = 1.0 精确成立。
+    """
     n = 2
     cands = [(_mask([0], n), 1.5, 'a'), (_mask([1], n), 3.0, 'b')]
     r = lp_solve(cands, n)
     assert r.status == 'ok'
-    assert r.worst_profit < 0
+    assert abs(r.worst_profit) < 1e-9
+    assert not r.is_arbitrage
 
 
 # ---------- verify_payout ----------
