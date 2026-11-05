@@ -266,6 +266,44 @@ def covers(market, side, line, label):
             r = build(lambda *s: f(F(*s)[0] - F(*s)[1]))
     elif base == 'Correct Score' and not side and not is_sub:
         pass  # 由调用方特殊处理（含 other）
+    elif base == 'Halftime/Fulltime Correct Score' and not side and not is_sub:
+        # 标签格式：'半场比分 全场比分'，例如 '0:0 1:1'。
+        # '4+' 表示该维度**总进球** >= 4 —— 用「完备互斥」验证过：
+        # 按总进球解释时 46 个选项并集正好铺满 2025 个状态、零重叠；
+        # 按某队进球解释只有 1070/2025，缺 955 个状态。
+        #
+        # 这是全库唯一一个「半场+全场比分」双维度的盘口。
+        # 它能带来收益的原因与 Correct Score 相同：存在 '0:0 0:0'
+        # 这种只覆盖 1 个状态、赔率很高的窄选项，可以精准补上
+        # 其他盘口漏掉的缝。实测尾部场次 44% 有改善。
+        # 详见 docs/superpowers/specs/2026-11-05-market-coverage-review.md
+        parts = label.split(' ')
+        if len(parts) == 2:
+            def _htft_seg(seg, first_half):
+                """返回一个 (h1,a1,h2,a2) -> bool 的判定函数。"""
+                if seg.endswith('+'):
+                    try:
+                        n = int(seg[:-1])
+                    except ValueError:
+                        return None
+                    if first_half:
+                        return lambda h1, a1, h2, a2: (h1 + a1) >= n
+                    return lambda h1, a1, h2, a2: (h2 + a2) >= n
+                if ':' in seg:
+                    try:
+                        x, y = map(int, seg.split(':'))
+                    except ValueError:
+                        return None
+                    if first_half:
+                        return lambda h1, a1, h2, a2: h1 == x and a1 == y
+                    return lambda h1, a1, h2, a2: h2 == x and a2 == y
+                return None
+
+            fh = _htft_seg(parts[0], True)
+            ff = _htft_seg(parts[1], False)
+            if fh is not None and ff is not None:
+                r = build(lambda h1, a1, h2, a2:
+                          fh(h1, a1, h2, a2) and ff(h1, a1, h2, a2))
     elif base == 'Clean Sheet' and not is_sub and side:
         # 规则: "Predict whether Home/Away team keeps a clean sheet at Full Time"
         # 主队零封 = 客队全场 0 球，客队零封 = 主队全场 0 球
