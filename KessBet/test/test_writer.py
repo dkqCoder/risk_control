@@ -54,7 +54,8 @@ def _purge(d):
     3.2s vs 0.1s，12 个用例前后各清一次就是几十秒。
     """
     with d.conn.cursor() as c:
-        for t in ('kessbet_odds_prematch', 'kessbet_odds_history', 'kessbet_match'):
+        for t in ('kessbet_odds_prematch', 'kessbet_odds_history',
+                  'kessbet_match', 'kessbet_market_removed'):
             c.execute(f"DELETE FROM {t} WHERE platform='kessbet' AND match_id=%s",
                       (TEST_MATCH_ID,))
     d.conn.commit()

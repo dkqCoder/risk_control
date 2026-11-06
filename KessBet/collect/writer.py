@@ -118,9 +118,24 @@ def replace_match(dao, match, selections, now: datetime | None = None) -> dict:
             _fit(s.line, MAX_LINE, 'line', match.match_id),
             _fit(s.label, MAX_SELECTION, 'selection', match.match_id),
         ) for s in selections}
-        db_keys = dao.fetch_keys(match.match_id)
+        db_keys = set(current)          # 第 1 步已经读出来了，不必再查一次
         stale = db_keys - fresh_keys
         if stale:
+            # 先记撤盘日志，再删。顺序不能反 —— 删完就查不到赔率了，
+            # 而「被撤时的最后赔率」正是事后回溯最需要的字段。
+            #
+            # 日志写失败必须吞掉：这是观察用的数据，不能因为它写不进去
+            # 就让整场刷新回滚 —— 那会连带丢掉这次真正的赔率更新，
+            # 而且下次重试时撤盘信息已经没了（行已被删）。
+            try:
+                dao.log_removed(
+                    match.match_id,
+                    [(m, s, l, lab, current[(m, s, l, lab)])
+                     for m, s, l, lab in stale],
+                    removed_time=changed_at, source='http',
+                )
+            except Exception as e:
+                log.warning('log_removed %s failed: %s', match.match_id, e)
             dao.delete_keys(match.match_id, stale)
 
         conn.commit()

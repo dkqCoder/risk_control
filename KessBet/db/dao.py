@@ -497,6 +497,37 @@ class Dao:
             cur.executemany(sql, rows)
             return cur.rowcount
 
+    # ---------- 撤盘日志 ----------
+
+    def log_removed(self, match_id: str, removed: list[tuple],
+                    removed_time, source: str = 'http',
+                    platform: str = 'kessbet') -> int:
+        """把即将被删除的选项记进撤盘日志。
+
+        removed: [(market, side, line, selection, odds), ...]
+                 调用方必须在 DELETE 之前把过期的赔率一起传进来 ——
+                 删完就查不到了。
+
+        失败只打日志不抛异常：这是观察用的记录，不能因为写不进去
+        就让整场刷新失败（那会连带丢掉真正的赔率更新）。
+        """
+        if not removed:
+            return 0
+        sql = """
+        INSERT IGNORE INTO kessbet_market_removed
+          (platform, match_id, market, side, line, selection,
+           odds, removed_time, source)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """
+        rows = [(platform, match_id, m, s, l, lab, o, removed_time, source)
+                for m, s, l, lab, o in removed]
+        try:
+            with self.conn.cursor() as cur:
+                return cur.executemany(sql, rows)
+        except Exception as e:
+            log.warning('log_removed %s failed: %s', match_id, e)
+            return 0
+
     # ---------- 套利命中快照 ----------
 
     def write_arbitrage_snapshot(self, *, match_id: str, sport: str,

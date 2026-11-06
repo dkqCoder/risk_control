@@ -452,6 +452,71 @@ CREATE TABLE IF NOT EXISTS kessbet_match_cost_history (
 
 
 -- =============================================================================
+-- ⑥c kessbet_market_removed — 撤盘事件日志
+-- -----------------------------------------------------------------------------
+-- 记录「某个盘口选项从平台上消失了」这件事。
+--
+-- 为什么需要单独一张表：
+--   kessbet_odds_prematch 是全量替换的 —— 平台上没了就物理 DELETE。
+--   删完之后，这个选项存在过、什么时候没的，系统里**没有任何记录**：
+--     - kessbet_odds_history 只记赔率变化，不记消失
+--     - prematch 删掉就查不到了
+--   于是「这个盘口什么时候撤的」「撤了多久又回来」这类问题无法回答。
+--
+-- 为什么不给 prematch 加 removed_time 字段：
+--   1. 那张表 187MB / 115 万行，MySQL 5.7 加列要重建整表，会锁写入
+--   2. 加了字段就得从「物理删除」改成「软删除」，行只增不减，
+--      表会涨到 200~300 万行
+--   3. 十几处读取都要加 WHERE removed_time IS NULL，漏一处就算错成本
+--   独立表对现有逻辑零影响，而且能记录**多次**撤盘（撤了又回来又撤），
+--   prematch 加字段只能记最后一次。
+--
+-- 与计算的关系：
+--   撤盘仍然物理 DELETE，所以 analyze/web 读 prematch 时天然拿不到已撤选项，
+--   计算逻辑不需要任何改动。这张表纯粹用于事后回溯和数据分析。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS kessbet_market_removed (
+    platform      VARCHAR(16)  NOT NULL
+        COMMENT '平台标识',
+
+    match_id      VARCHAR(32)  NOT NULL
+        COMMENT '平台内部比赛 ID',
+
+    market        VARCHAR(64)  NOT NULL
+        COMMENT '归一化盘口名，与 prematch.market 同口径',
+
+    side          CHAR(1)      NOT NULL DEFAULT ''
+        COMMENT 'H=主队 / A=客队 / 空=全场',
+
+    line          VARCHAR(16)  NOT NULL DEFAULT ''
+        COMMENT '盘线',
+
+    selection     VARCHAR(32)  NOT NULL
+        COMMENT '选项，与 prematch.selection 同口径',
+
+    odds          DECIMAL(8,3) NOT NULL
+        COMMENT '被撤时的最后赔率。事后分析「撤盘前定价」用',
+
+    removed_time  DATETIME     NOT NULL
+        COMMENT '发现撤盘的时刻（北京时间）',
+
+    source        VARCHAR(8)   NOT NULL DEFAULT 'http'
+        COMMENT 'http=全量替换对比发现；ws=推送 delete 字段发现。
+                 同一个选项可能两条都有，用 removed_time + source 区分',
+
+    PRIMARY KEY (platform, match_id, market, side, line, selection,
+                 removed_time),
+    KEY idx_removed (removed_time)
+        COMMENT '按时间分析撤盘规模',
+    KEY idx_match (platform, match_id)
+        COMMENT '查某场比赛撤过哪些盘口',
+    KEY idx_market (market)
+        COMMENT '统计哪个盘口最常被撤'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='撤盘事件日志：物理删除前记一笔，用于回溯和数据分析';
+
+
+-- =============================================================================
 -- ⑦ kessbet_arbitrage_snapshot — 套利命中快照
 -- -----------------------------------------------------------------------------
 -- 只在 cost < 1.0 时写。存的是**命中那一刻的完整盘口**，不是当前值。

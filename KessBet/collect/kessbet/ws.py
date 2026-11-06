@@ -49,7 +49,8 @@ class KessbetWs:
         self._recv_thread: threading.Thread | None = None
 
         # 统计
-        self.stats = {'pings': 0, 'frames': 0, 'pushes': 0, 'reconnects': 0}
+        self.stats = {'pings': 0, 'frames': 0, 'pushes': 0, 'reconnects': 0,
+                      'deletes': 0, 'deleted_markets': 0}
 
     # ---------- 连接 ----------
 
@@ -141,7 +142,27 @@ class KessbetWs:
     def extract_match_id(raw: str) -> str | None:
         """从 bet_change 帧里只取 matchId。
 
-        这是推送相关的**全部**解析逻辑——其余内容不看。
+        推送告诉我们"哪场变了"，HTTP 告诉我们"变成了什么"——
+        这个分工不变，所以这里仍然只返回 match_id 供 mark_dirty 使用。
+        需要看 delete/update 内容的场景用 parse_bet_change()。
+        """
+        body = KessbetWs.parse_bet_change(raw)
+        return body.get('matchId') if body else None
+
+    @staticmethod
+    def parse_bet_change(raw: str) -> dict | None:
+        """解析 bet_change 帧的完整内容。
+
+        返回 {'matchId': str, 'delete': [...], 'insert': [...],
+              'update': [...]}，解析失败返回 None。
+
+        `delete` 是被删除的**盘口 ID** 列表。这是判断「平台真的撤盘」
+        的直接证据 —— HTTP 侧只能看到"返回的选项变少了"，
+        分不清是撤盘还是接口残缺，而推送明确告诉你删了哪些盘口。
+
+        注意：盘口 ID 是平台内部编号（mari 串第一段），
+        目前库里没存这个 ID，所以还不能直接映射到 market 字段。
+        当前只做记录和统计，等积累够数据再决定怎么用。
         """
         if not raw.startswith('42["bet_change"'):
             return None
@@ -150,7 +171,9 @@ class KessbetWs:
             body = arr[1]
             if isinstance(body, str):
                 body = json.loads(body)
-            return body.get('matchId')
+            if not isinstance(body, dict):
+                return None
+            return body
         except (ValueError, IndexError, AttributeError, TypeError):
             return None
 
@@ -183,13 +206,30 @@ class KessbetWs:
                 log.warning('server sent disconnect (41)')
                 break
 
-            match_id = self.extract_match_id(raw)
-            if match_id:
-                self.stats['pushes'] += 1
-                try:
-                    self.on_change(match_id)
-                except Exception:
-                    log.exception('on_change callback failed for %s', match_id)
+            body = self.parse_bet_change(raw)
+            if body:
+                match_id = body.get('matchId')
+                # 统计 delete 规模，供后续判断「平台真撤盘 vs 接口残缺」。
+                # 这一轮只记录不改变行为 —— 覆盖决策仍然由 HTTP 侧的
+                # 比例保护负责。等积累了足够的真实撤盘数据，
+                # 再决定要不要用 delete 作为放行覆盖的依据。
+                deleted = body.get('delete') or []
+                if deleted:
+                    self.stats['deletes'] += 1
+                    self.stats['deleted_markets'] += len(deleted)
+                    log.info('push delete: %s 撤了 %d 个盘口',
+                             match_id, len(deleted))
+
+                # 直接用解析结果，不要调 extract_match_id 再解析一遍
+                if match_id:
+                    self.stats['pushes'] += 1
+                    try:
+                        self.on_change(match_id)
+                    except Exception:
+                        log.exception('on_change callback failed for %s',
+                                      match_id)
+            elif raw.startswith('42["bet_change"'):
+                log.debug('bet_change 解析失败: %s', raw[:120])
 
         self._running = False
 
