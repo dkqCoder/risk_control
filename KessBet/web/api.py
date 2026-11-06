@@ -348,7 +348,36 @@ def match_detail(match_id: str,
 
         rows = dao.get_selections(match_id)
         if not rows:
-            raise HTTPException(404, 'no odds for this match')
+            # 比赛在赛程里但平台还没开盘（常见于提前几天挂牌的比赛）。
+            # 这不是「找不到比赛」，不该用 404 —— 详情页只能显示
+            # 「加载失败：HTTP 404」，用户看不出是没开盘还是链接错了。
+            # 返回 200 + status='nodata'，页面渲染「该场暂无赔率」。
+            return {
+                'match_id': match_id,
+                'canonical_id': canonical_id,
+                'platform': platform,
+                'platforms': platforms,
+                'sport': sport,
+                'home_team': home,
+                'away_team': away,
+                'kickoff_time': _iso(kickoff),
+                'n_markets': 0,
+                'n_selections': 0,
+                'n_candidates': 0,
+                'cost': None,
+                'cost_scope': 'single',
+                'cost_source': 'none',
+                'error': 'no_data',
+                'ilp': None,
+                'lp': None,
+                'cross_ok': True,
+                'cross_gap': 0.0,
+                'is_arbitrage': False,
+                'markets': [],
+                'n_market_groups': 0,
+                'timeline': [],
+                'status': 'nodata',
+            }
 
         # 优先读 analyze 预计算的快照（毫秒级）。
         # 只有在快照缺失或赔率比快照新时才现场算一次 —— 单场 1.2 秒
@@ -425,6 +454,7 @@ def match_detail(match_id: str,
             'markets': markets,
             'n_market_groups': len(markets),
             'timeline': timeline,
+            'status': 'ok',
         }
     finally:
         dao.close()
