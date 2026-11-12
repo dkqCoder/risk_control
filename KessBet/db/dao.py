@@ -783,16 +783,26 @@ class Dao:
 
     def mark_live_finished(self, match_id: str,
                            platform: str = 'kessbet') -> None:
-        """把比赛标记为已结束（status=100），并清掉它的滚球赔率。
+        """把比赛标记为已结束（status=100），并清掉它的滚球赔率与判定结果。
 
         赔率为什么清：比赛结束后接口再也不返回数据，留着只是历史包袱。
         需要历史的话在 kessbet_odds_live_history 里。
+
+        判定结果为什么也要清（踩过的坑，2026-11-12 APIA）：
+          18:20 算出的结果里选中了 `Total H 4.5`，
+          18:21 解析器修复后该盘线被识别为锁定并从赔率表删除。
+          比赛结束后没有任何赔率 → 不在 live_analyze_targets 里
+          → 再也不会被重算 → 结果表里那条引用了已不存在选项的记录就永远留着。
+          页面点进去会看到一个「用锁定盘口算出来的套利」。
         """
         with self.conn.cursor() as cur:
             cur.execute("""UPDATE kessbet_match_live SET status=100
                            WHERE platform=%s AND match_id=%s""",
                         (platform, match_id))
             cur.execute("""DELETE FROM kessbet_odds_live
+                           WHERE platform=%s AND match_id=%s""",
+                        (platform, match_id))
+            cur.execute("""DELETE FROM kessbet_live_result_cost
                            WHERE platform=%s AND match_id=%s""",
                         (platform, match_id))
         self.conn.commit()

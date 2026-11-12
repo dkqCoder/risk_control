@@ -159,6 +159,33 @@ def test_parse_drops_zero_odds_with_line():
     assert sels == [('1.5', 'over', 8.25)]
 
 
+def test_parse_drops_locked_with_normal_odds():
+    """`,0,` 标记 = 平台锁定，即使赔率是正常数值也要丢弃。
+
+    实测（2026-11-12，APIA 第 78 分钟）原始串：
+      3.5 线： `...,1.75,1,over`   → 可投注
+      4.5 线： `...,2.55,0,over`   → 网页上是锁图标
+
+    平台**照样返回锁定的赔率**（2.55 / 1.37 都是正常数值）。
+    不按标记过滤的话，会拿一个根本下不了注的盘口去凑覆盖，
+    算出偏低的成本。
+    """
+    mari = ('4|m,1|3.5,id1/1=id2,1.75,1,over@id3,1.80,1,under'
+            '^4.5,id4/0=id5,2.55,0,over@id6,1.37,0,under|Total')
+    nm, sels = parse_mari(mari)
+    assert nm == 'Total'
+    assert sels == [('3.5', 'over', 1.75), ('3.5', 'under', 1.80)], \
+        '4.5 是锁定盘线，整条都不能要'
+
+
+def test_parse_drops_locked_single_selection():
+    """单选项盘口被锁时整条丢弃。"""
+    mari = '1|m,1|2.5,id1/0=id2,1.90,0,over|Total'
+    nm, sels = parse_mari(mari)
+    assert nm == 'Total'
+    assert sels == []
+
+
 def test_parse_keeps_odds_above_one():
     """正常赔率不受影响。"""
     mari = '1|m,1|id,1.01,1,1|test'

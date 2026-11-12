@@ -37,21 +37,22 @@ def evaluate_live_match(dao, meta: dict, now) -> dict:
     out = {'match_id': mid, 'result': None, 'error': None,
            'ht': None}
 
-    # ★ 赔率新鲜度检查：滚球赔率秒级变动，数据旧了不能判。
-    # 实测反例（2026-11-12，Thailand 0:2）：
-    #   1x2 X @8.25 是 15 分钟前采集的
-    #   Double Chance 12 @1.14 是 22 分钟前的
-    #   平台早已停盘（目标球或事故），分析拿了过期数据算出 Σ=0.9984 的假套利。
+    # ★ 赔率新鲜度：过期时**仍然重算**，只是不告警。
     #
-    # 阈值 90 秒：够覆盖「半场休息/暂停」等正常间隙，但排掉「平台已停盘」的。
+    # 为什么不能直接跳过（踩过一次，2026-11-12 APIA）：
+    #   18:20:46 算出 cost=1.1073，选中 Total H 4.5 over/under
+    #   18:21 解析器修复后，4.5 被识别为锁定盘口，从库中删除
+    #   但赔率超过 90 秒没更新 → stale_odds 一直跳过重算
+    #   → 结果里永远留着已经不存在的 4.5 组合，页面显示一个幽灵套利
+    #
+    # 正确做法：结果必须永远反映库内当前数据。
+    # 过期只影响「要不要当成机会告警」，不影响「算出真实成本」。
     odds_updated = meta.get('odds_updated')
     if odds_updated is None:
         out['error'] = 'no_odds_ts'
         return out
     age = (now - odds_updated).total_seconds()
-    if age > config.LIVE_ODDS_MAX_AGE_SEC:
-        out['error'] = 'stale_odds'
-        return out
+    out['is_stale'] = age > config.LIVE_ODDS_MAX_AGE_SEC
 
     sels = dao.get_live_selections(mid)
     if not sels:
@@ -125,9 +126,6 @@ def analyze_live_once(dao, window_min: int | None = None,
         if err == 'no_score':
             stats['no_score'] += 1
             continue
-        if err == 'stale_odds':
-            stats['stale_odds'] += 1
-            continue
         if err == 'no_cover_or_no_candidate':
             stats['no_cover'] += 1
             continue
@@ -137,16 +135,22 @@ def analyze_live_once(dao, window_min: int | None = None,
 
         r = a['result']
         stats['evaluated'] += 1
+        if a.get('is_stale'):
+            stats['stale_odds'] += 1
         if stats['min_cost'] is None or r['cost'] < stats['min_cost']:
             stats['min_cost'] = r['cost']
 
+        # 成本永远写 —— 保证结果反映库内当前数据。
+        # 赔率过期只影响「要不要告警」，不影响「算出来的成本是真是假」。
         if write_costs:
             try:
                 _persist_cost(dao, meta, r, a['ht'], now)
             except Exception as e:
                 log.exception('写滚球结果成本失败 %s: %s', meta['match_id'], e)
 
-        if r['is_arbitrage']:
+        # 过期数据算出的套利不告警：赔率可能早就不存在了，
+        # 那是个幽灵机会（实测 Thailand 0:2 曾经报过 Σ=0.9984）。
+        if r['is_arbitrage'] and not a.get('is_stale'):
             stats['hits'] += 1
             log.warning('LIVE ARBITRAGE %s %s vs %s  第%s分钟 %s:%s  '
                         'Σ=%.4f  收益 %.2f%%',
