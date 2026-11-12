@@ -554,21 +554,31 @@ def run_loop(dao, interval: int | None = None,
     interval = interval or getattr(config, 'ANALYZE_POLL_SEC', 2)
     full_sweep_sec = full_sweep_sec or getattr(config, 'ANALYZE_FULL_SWEEP_SEC', 300)
     live_enabled = getattr(config, 'LIVE_ENABLED', False)
-    live_full_sweep = getattr(config, 'LIVE_ANALYZE_SEC', 10) * 30
+    live_interval = getattr(config, 'LIVE_ANALYZE_SEC', 2)
 
-    last_sweep = 0.0
-    last_live_sweep = 0.0
     log.info('analyze loop: poll=%ds horizon=%sh concurrency=%s full_sweep=%ds '
-             'live=%s/%d+%d',
+             'live=%s/%ds(独立线程)',
              interval, horizon_hours or config.ANALYZE_HORIZON_HOURS,
              concurrency or getattr(config, 'ANALYZE_CONCURRENCY', 4),
-             full_sweep_sec, 'on' if live_enabled else 'off',
-             interval, live_full_sweep)
+             full_sweep_sec, 'on' if live_enabled else 'off', live_interval)
 
+    # ★ 滚球判定必须跑在**独立线程**里。
+    #
+    # 踩过的坑（2026-11-12）：原来它在主循环里、跟在 analyze_once 后面。
+    # 赛前全量扫一次要 410 秒，这期间滚球判定一次都执行不了 ——
+    # 结果成本 18:30 算出，下一次更新要等到 18:39，中间 9 分钟页面
+    # 一直显示过期的赔率和过期的下注组合。
+    #
+    # 滚球是秒级的事，赛前是分钟级的事，两者节奏差两个数量级，
+    # 放在同一个循环里必然被慢的那个拖死。
+    if live_enabled:
+        _start_live_thread(live_interval,
+                           getattr(config, 'LIVE_ENABLED', True))
+
+    last_sweep = 0.0
     while True:
         t0 = time.time()
         force = (t0 - last_sweep) >= full_sweep_sec
-        live_force = (t0 - last_live_sweep) >= live_full_sweep
 
         try:
             stats = analyze_once(dao, horizon_hours=horizon_hours,
@@ -583,20 +593,54 @@ def run_loop(dao, interval: int | None = None,
         except Exception as e:
             log.exception('analyze round failed: %s', e)
 
-        # 滚球判定和赛前同一节奏（每 interval 秒）——
-        # 赔率变了才重算，不需要独立定时器。
-        if live_enabled:
-            try:
-                from analyze.live.run import analyze_live_once
-                ls = analyze_live_once(dao, force=live_force)
-                if live_force:
-                    last_live_sweep = t0
-                if ls['evaluated'] or ls['hits']:
-                    log.info('live round: %s', ls)
-            except Exception as e:
-                log.exception('live analyze round failed: %s', e)
-
         time.sleep(max(0, interval - (time.time() - t0)))
+
+
+def _start_live_thread(interval: int, enabled: bool) -> None:
+    """起一个独立线程跑滚球判定。
+
+    每个线程用自己的 Dao 连接 —— pymysql 连接不是线程安全的，
+    和 _run_parallel 里每个工作线程 new 一个 Dao 是同样的道理。
+    """
+    import threading
+    from db.dao import Dao
+
+    def loop():
+        from analyze.live.run import analyze_live_once
+        d = Dao(**dict(_DSN)) if _DSN else Dao()
+        last_full = 0.0
+        full_every = interval * 150      # 每 5 分钟强制全量兜底
+        try:
+            while True:
+                t0 = time.time()
+                force = (t0 - last_full) >= full_every
+                try:
+                    ls = analyze_live_once(d, force=force)
+                    if force:
+                        last_full = t0
+                        log.info('live full sweep: %s', ls)
+                    elif ls['evaluated'] or ls['hits'] or ls['stale_odds']:
+                        log.info('live round: %s', ls)
+                except Exception as e:
+                    log.exception('live analyze round failed: %s', e)
+                    try:
+                        d.conn.rollback()
+                    except Exception:
+                        pass
+                time.sleep(max(0, interval - (time.time() - t0)))
+        finally:
+            try:
+                d.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=loop, daemon=True, name='live-analyze')
+    t.start()
+    log.info('live analyze thread started')
+
+
+# 主线程的 DSN，供 _start_live_thread 建独立连接
+_DSN: dict = {}
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -648,6 +692,10 @@ def main() -> int:
     setup_logging(args.verbose)
     install_signal_handlers()
     dao = Dao()
+    # 滚球线程要建自己的连接 —— pymysql 连接不是线程安全的。
+    # 复用主连接的 DSN，每个线程各开一个。
+    global _DSN
+    _DSN = dict(getattr(dao, '_dsn', {}) or {})
     try:
         if args.once:
             stats = analyze_once(dao, horizon_hours=args.horizon,

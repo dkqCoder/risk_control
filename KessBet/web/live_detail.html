@@ -114,25 +114,50 @@ td.cost.arb{color:var(--good); font-weight:700}
 .badge.mute{color:var(--muted); border-color:var(--line); background:var(--panel2)}
 .badge.mute i{background:var(--muted)}
 
-/* 盘口分组 */
-.mkt{border-bottom:1px solid rgba(201,207,214,.5); padding:11px 0}
+/* 盘口分组：左标签 / 右数据 两列 */
+.mkt{
+  display:grid; grid-template-columns:190px 1fr; gap:0 18px;
+  padding:0; border-bottom:1px solid rgba(201,207,214,.5);
+}
 .mkt:last-child{border-bottom:none}
-.mkt-head{display:flex; align-items:baseline; gap:10px; margin-bottom:7px}
-.mkt-name{font-size:13px; font-weight:600}
-.mkt-tag{font-size:11px; color:var(--muted); border:1px solid var(--line);
-  border-radius:3px; padding:0 5px}
-.mkt-manual{font-size:11px; color:var(--warning); margin-left:auto}
+.mkt:hover{background:rgba(31,111,208,.025)}
 
-.sels{display:flex; flex-wrap:wrap; gap:7px}
-.sel{border:1px solid var(--line); border-radius:5px; padding:4px 10px;
-  font-size:12px; background:var(--panel2); display:flex; gap:8px;
-  align-items:baseline; cursor:pointer}
-.sel:hover{border-color:var(--accent)}
-.sel.on{border-color:var(--accent); background:rgba(31,111,208,.08)}
-.sel .lab{color:var(--dim)}
-.sel .o{font-family:ui-monospace,Consolas,monospace; font-weight:600}
+/* 左列：盘口名。右对齐贴着分隔线，扫读时视线不用来回跳 */
+.mkt-head{
+  padding:9px 14px 9px 4px; border-right:1px solid rgba(201,207,214,.5);
+  display:flex; flex-direction:column; gap:2px; justify-content:center;
+}
+.mkt-name{font-size:13px; font-weight:600; line-height:1.35;
+  word-break:break-word}
+.mkt-sub{font-size:10px; color:var(--muted); font-variant-numeric:tabular-nums;
+  letter-spacing:.02em}
+.mkt-sub.warn{color:var(--warning)}
+.mkt-tag{display:inline-block; font-size:10px; color:var(--warning);
+  border:1px solid rgba(138,90,0,.35); background:rgba(138,90,0,.07);
+  border-radius:3px; padding:0 5px; width:fit-content; margin-top:2px}
+
+/* 右列：选项 */
+.sels{display:flex; flex-wrap:wrap; gap:6px; padding:10px 0 10px 0;
+  align-content:center}
+.sel{border:1px solid var(--line); border-radius:5px; padding:5px 11px;
+  font-size:12px; background:var(--panel2); display:inline-flex; gap:9px;
+  align-items:baseline; cursor:pointer; transition:all .12s ease;
+  font-variant-numeric:tabular-nums}
+.sel:hover{border-color:var(--accent); background:rgba(31,111,208,.06)}
+.sel.on{border-color:var(--accent); background:rgba(31,111,208,.1);
+  box-shadow:0 0 0 2px rgba(31,111,208,.12)}
+.sel .lab{color:var(--dim); white-space:nowrap}
+.sel .o{font-family:ui-monospace,Consolas,monospace; font-weight:600;
+  color:var(--fg); min-width:38px; text-align:right}
 .sel .up{color:var(--critical); font-size:11px}
 .sel .down{color:var(--good); font-size:11px}
+
+@media (max-width:720px){
+  .mkt{grid-template-columns:1fr}
+  .mkt-head{border-right:none; border-bottom:1px solid rgba(201,207,214,.4);
+    padding:10px 0 6px}
+  .sels{padding-top:8px}
+}
 
 .empty{padding:36px 20px; text-align:center; color:var(--muted); font-size:13px}
 .spark{width:100%; height:120px; display:block}
@@ -315,9 +340,15 @@ function renderMarkets(markets){
   }
   $('mkts').innerHTML = markets.map(m => {
     const isWin = m.base === 'Which Team Wins The Rest Of The Match';
+    const n = m.selections.length;
+    // 只列了 1 个选项的盘口多半是残缺（平台只挂了一条腿），
+    // 标出来便于判断「这个盘口看起来便宜是不是因为数据不全」。
+    const partial = n === 1;
     return `<div class="mkt">
       <div class="mkt-head">
         <span class="mkt-name">${esc(m.name)}</span>
+        <span class="mkt-sub ${partial ? 'warn' : ''}">${
+          partial ? '只有 1 个选项' : n + ' 个选项'}</span>
         ${isWin ? '<span class="mkt-tag">剩余时间</span>' : ''}
       </div>
       <div class="sels">${m.selections.map(s => {
@@ -440,8 +471,25 @@ async function load(){
   loadHistory();
 }
 
+async function loadLight(){
+  if (!MID) return;
+  try{
+    const r = await fetch('/api/live/' + encodeURIComponent(MID));
+    if (!r.ok) return;
+    const d = await r.json();
+    DATA = d;
+    renderBoard(d);
+    renderResult(d.result);
+    // 盘口列表也要刷新 —— 只更新计分板和结果会让赔率数字停在
+    // 页面打开那一刻，用户看到的和平台不一致。
+    // renderMarkets 会按 PICKED 恢复选中态，不会把用户选中的
+    // 走势图弄丢。
+    renderMarkets(d.markets);
+  }catch(e){}
+}
+
 load();
-setInterval(() => { if (!document.hidden) load(); }, 20000);
+setInterval(loadLight, 5000);
 </script>
 </body>
 </html>
