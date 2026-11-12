@@ -336,6 +336,23 @@ let DATA = null;
 
 function fmt(n, d) { d = d === undefined ? 2 : d; return n == null ? '—' : n.toFixed(d); }
 
+// ---------------- 无赔率 ----------------
+// 比赛在赛程里但平台还没开盘。这不是错误，是正常状态：
+// 提前几天挂牌的比赛，通常临近开赛才开价。
+function renderNoData() {
+  const d = DATA;
+  const wrap = document.querySelector('.wrap');
+  wrap.innerHTML =
+    '<div class="card" style="padding:48px 32px;text-align:center">' +
+      '<div style="font-size:15px;color:var(--s2);margin-bottom:8px">' +
+        '该场暂无赔率</div>' +
+      '<div style="font-size:13px;color:var(--dim);line-height:1.8">' +
+        '平台尚未为这场比赛开盘，或盘口已临时撤下。<br>' +
+        '开赛时间 ' + (d.kickoff_time || '—') + '，采集进程会持续重试。' +
+      '</div>' +
+    '</div>';
+}
+
 // ---------------- 头部 ----------------
 function renderHeader() {
   const d = DATA;
@@ -345,7 +362,11 @@ function renderHeader() {
 
   const cost = d.cost;
   const el = $('hCost');
-  if (cost == null) {
+  if (d.status === 'nodata') {
+    el.textContent = '—';
+    el.style.color = 'var(--muted)';
+    $('hSub').innerHTML = '<span class="tag">无赔率</span>';
+  } else if (cost == null) {
     el.textContent = '—';
     el.style.color = 'var(--muted)';
     $('hSub').innerHTML = '<span style="color:var(--dim)">' + (d.error || '无法计算') + '</span>';
@@ -697,6 +718,10 @@ async function init() {
   }
 
   renderHeader();
+  if (DATA.status === 'nodata') {
+    renderNoData();
+    return;
+  }
   renderStake();
   renderMarkets();
   renderTimeline();
