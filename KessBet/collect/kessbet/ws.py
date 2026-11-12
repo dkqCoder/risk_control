@@ -32,11 +32,16 @@ log = logging.getLogger(__name__)
 class KessbetWs:
     def __init__(self, on_change: Callable[[str], None],
                  proxy: str | None = None,
-                 url: str | None = None):
+                 url: str | None = None,
+                 on_remove: Callable[[str], None] | None = None):
         """
         on_change: 收到 bet_change 时回调，参数是 match_id。
+        on_remove: 推送里带 delete 时回调，参数是 match_id。
+                   与 on_change 分开：delete 是「平台确实撤了盘口」的证据，
+                   调用方用它放行比例保护，不能和普通的赔率变动混在一起。
         """
         self.on_change = on_change
+        self.on_remove = on_remove
         self.url = url or config.WS_URL
         proxy = proxy or config.PROXY
         self.proxies = {'https': proxy, 'http': proxy} if proxy else None
@@ -209,16 +214,21 @@ class KessbetWs:
             body = self.parse_bet_change(raw)
             if body:
                 match_id = body.get('matchId')
-                # 统计 delete 规模，供后续判断「平台真撤盘 vs 接口残缺」。
-                # 这一轮只记录不改变行为 —— 覆盖决策仍然由 HTTP 侧的
-                # 比例保护负责。等积累了足够的真实撤盘数据，
-                # 再决定要不要用 delete 作为放行覆盖的依据。
+                # delete 是平台撤盘的直接证据。比例保护在「接口返回骤减」
+                # 时会拒绝覆盖，分不清是撤盘还是接口残缺；这个信号
+                # 让 refresher 能精确放行。
                 deleted = body.get('delete') or []
                 if deleted:
                     self.stats['deletes'] += 1
                     self.stats['deleted_markets'] += len(deleted)
                     log.info('push delete: %s 撤了 %d 个盘口',
                              match_id, len(deleted))
+                    if match_id and self.on_remove:
+                        try:
+                            self.on_remove(match_id)
+                        except Exception:
+                            log.exception('on_remove callback failed for %s',
+                                          match_id)
 
                 # 直接用解析结果，不要调 extract_match_id 再解析一遍
                 if match_id:

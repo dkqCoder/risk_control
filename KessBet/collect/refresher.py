@@ -42,6 +42,19 @@ class Refresher:
 
         self._dirty: dict[str, float] = {}
         self._lock = threading.Lock()
+
+        # WS delete 信号：match_id -> 收到信号时的 monotonic 时刻。
+        #
+        # 比例保护（REFRESH_MIN_RATIO）防的是「接口残缺返回」，但整场撤盘
+        # 时接口返回 0 也会被它挡住，几百个已失效选项就永久留在库里。
+        # WS 推送的 delete 字段是平台撤盘的直接证据，收到后就放行一次
+        # 覆盖 —— 放行只对下一次刷新有效，避免残缺响应被永久放行。
+        self._removed_at: dict[str, float] = {}
+        self._removed_lock = threading.Lock()
+        # 信号有效期。撤盘后通常会很快触发刷新，留 10 分钟足够，
+        # 太久会让一个陈旧的信号影响后面的无关刷新。
+        self.remove_signal_ttl = 600.0
+
         self._running = False
         # 连续失败计数（成功一次清零）。用锁保护，因为刷新是并发的。
         self._fail_lock = threading.Lock()
@@ -58,6 +71,8 @@ class Refresher:
             'failed': 0,
             'rows': 0,
             'changed': 0,        # 写入历史表的行数
+            'removed_signals': 0,   # 收到的 WS delete 信号数
+            'bypassed_ratio': 0,    # 因 delete 信号而绕过比例保护的次数
             'consecutive_failures': 0,
             'db_resets': 0,
         }
@@ -101,6 +116,22 @@ class Refresher:
             self._dirty[match_id] = time.monotonic()
             self.stats['marked'] += 1
 
+    def mark_removed(self, match_id: str) -> None:
+        """WS 推送 delete 时调用：授权该场下一次刷新绕过比例保护。
+
+        与 mark_dirty 分开是刻意的 —— delete 帧不一定同时触发赔率变动，
+        但它是「平台确实撤了盘口」的独立证据。
+        """
+        with self._removed_lock:
+            self._removed_at[match_id] = time.monotonic()
+            self.stats['removed_signals'] += 1
+
+    def _take_removed(self, match_id: str) -> bool:
+        """取走该场的 delete 许可（一次性 + 有时效）。"""
+        with self._removed_lock:
+            t = self._removed_at.pop(match_id, None)
+        return t is not None and (time.monotonic() - t) <= self.remove_signal_ttl
+
     def _take_ready(self, now: float) -> list[str]:
         """取出已过防抖期的比赛。"""
         with self._lock:
@@ -115,6 +146,61 @@ class Refresher:
             return len(self._dirty)
 
     # ---------- 刷新单场 ----------
+
+    def _clear_if_removed(self, match_id, kickoff, now, sport, home, away):
+        """接口返回空且有 WS delete 信号时，清空该场的库内数据。
+
+        返回删除的行数；没有信号或无需清理时返回 None（调用方按跳过处理）。
+
+        为什么必须清理：整场撤盘时接口返回 0 项，比例保护会拒绝覆盖，
+        几百个已失效选项永久留在 kessbet_odds_prematch。analyze 读到的
+        就是死数据，可能算出假套利。
+        """
+        if not self._take_removed(match_id):
+            return None
+
+        try:
+            db_keys = self.dao.fetch_keys(match_id)
+        except Exception as e:
+            log.warning('fetch_keys %s failed: %s', match_id, e)
+            self.stats['failed'] += 1
+            self._on_failure(str(e))
+            return None
+        if not db_keys:
+            return None
+
+        # 先记撤盘日志（含最后赔率），再删 —— 删完就查不到赔率了
+        try:
+            current = {(m, s, l, lab): o
+                       for m, s, l, lab, o in self.dao.get_selections(match_id)}
+            self.dao.log_removed(
+                match_id,
+                [(k[0], k[1], k[2], k[3], current[k])
+                 for k in db_keys if k in current],
+                removed_time=now, source='ws',
+            )
+        except Exception as e:
+            log.warning('log_removed %s failed: %s', match_id, e)
+
+        try:
+            self.dao.delete_keys(match_id, db_keys)
+            self.dao.conn.commit()
+        except Exception as e:
+            log.warning('clear %s failed: %s', match_id, e)
+            try:
+                self.dao.conn.rollback()
+            except Exception:
+                pass
+            self.stats['failed'] += 1
+            self._on_failure(str(e))
+            return None
+
+        self._on_success()
+        self.stats['removed_signals_used'] = \
+            self.stats.get('removed_signals_used', 0) + 1
+        log.info('cleared %s: 平台整场撤盘，删除 %d 个失效选项',
+                 match_id, len(db_keys))
+        return 0
 
     def refresh_one(self, match_id: str) -> int:
         """拉 HTTP 全量并整场替换。返回写入行数（0 表示跳过）。"""
@@ -143,11 +229,18 @@ class Refresher:
             self._on_failure(str(e))
             return 0
 
+        # 空响应：整场撤盘时接口就是这个样子。
+        # 如果收到过 WS delete 信号，说明平台确实撤了，直接清空库内数据；
+        # 否则仍按原来的「跳过」处理（可能是接口异常）。
         if not selections:
-            log.debug('skip %s: empty response', match_id)
-            return 0
+            rows = self._clear_if_removed(match_id, kickoff, now, sport, home, away)
+            if rows is None:
+                log.debug('skip %s: empty response', match_id)
+                return 0
+            return rows
 
-        # 比例保护：接口返回远少于库内，判定为残缺响应，不覆盖
+        # 比例保护：接口返回远少于库内，判定为残缺响应，不覆盖。
+        # 但 WS delete 信号是平台撤盘的直接证据，此时放行一次。
         try:
             db_count = self.dao.count_odds(match_id)
         except Exception as e:
@@ -156,10 +249,17 @@ class Refresher:
             self._on_failure(str(e))
             return 0
         if db_count > 0 and len(selections) < db_count * config.REFRESH_MIN_RATIO:
-            log.warning('suspicious %s: api=%d db=%d, skip overwrite',
-                        match_id, len(selections), db_count)
-            self.stats['skipped_suspicious'] += 1
-            return 0
+            if self._take_removed(match_id):
+                self.stats['bypassed_ratio'] += 1
+                log.info('removed-signal %s: api=%d db=%d, 平台撤盘，允许覆盖',
+                         match_id, len(selections), db_count)
+            else:
+                log.warning('suspicious %s: api=%d db=%d, skip overwrite',
+                            match_id, len(selections), db_count)
+                self.stats['skipped_suspicious'] += 1
+                return 0
+        # 比例正常时不消费信号：信号是基于时间的一次性许可（ttl 到期自动失效），
+        # 在这里消费掉会让紧跟其后的整场撤盘（下一次返回 0）失去放行机会。
 
         # 构造 Match 对象供 writer 使用
         from common.models import Match

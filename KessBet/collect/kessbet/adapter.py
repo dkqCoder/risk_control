@@ -16,6 +16,7 @@ class KessbetAdapter(Adapter):
         self._http = KessbetHttp(proxy=proxy)
         self._ws: KessbetWs | None = None
         self._on_change = None
+        self._on_remove = None
 
     # ---------- Adapter 接口 ----------
 
@@ -30,11 +31,16 @@ class KessbetAdapter(Adapter):
     def on_push(self, callback) -> None:
         self._on_change = callback
 
+    def on_remove(self, callback) -> None:
+        """注册删盘回调（WS delete 字段）。"""
+        self._on_remove = callback
+
     def start_ws(self, initial_ids: list[str] | None = None) -> KessbetWs:
         """建立并启动 WebSocket 连接。"""
         if self._on_change is None:
             raise RuntimeError('on_push() must be called before start_ws()')
-        self._ws = KessbetWs(on_change=self._on_change)
+        self._ws = KessbetWs(on_change=self._on_change,
+                             on_remove=self._on_remove)
         self._ws.start(initial_ids=initial_ids)
         return self._ws
 

@@ -172,6 +172,7 @@ class Collector:
     def _start_ws(self) -> None:
         try:
             self.adapter.on_push(self.refresher.mark_dirty)
+            self.adapter.on_remove(self.refresher.mark_removed)
             self.ws = self.adapter.start_ws(initial_ids=self.upcoming_ids())
             log.info('ws subscribed to %d matches', self.ws.subscribed_count)
         except Exception as e:
