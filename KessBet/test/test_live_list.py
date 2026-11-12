@@ -131,6 +131,9 @@ def test_refresh_live_schedule_only_inserts_unknown(monkeypatch):
     c.adapter = FakeAdapter()
     c.dao = FakeDao()
     c.stats = {}
+    # refresh_live_schedule 发现新比赛后会触发滚球采集，
+    # 用 __new__ 构造时必须显式给出 live（正常走 __init__ 时是 None）
+    c.live = None
     monkeypatch.setattr(R.config, 'LIVE_ENABLED', True)
     monkeypatch.setattr(R.config, 'LIVE_SPORTS', ('sr:sport:1',))
 
