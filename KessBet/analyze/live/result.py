@@ -1,0 +1,319 @@
+"""analyze/live/result.py — 滚球「比赛结果」套利判定（模型 B2）。
+
+## 和模型 A（窗口盘）的区别
+
+模型 A（`window.py`）判的是单个时间窗口盘自不自洽 —— 不需要比分。
+模型 B 判的是**整场比赛的终局**：当前比分已知，所有「比赛结果」盘口
+组合起来，能不能以 Σ(1/赔率) < 1 覆盖全部可达终局。需要比分。
+
+## 状态空间：复用赛前的四元组，不新写一套
+
+赛前 `soccer.STATES` 是 2025 个 `(h1, a1, h2, a2)`。
+滚球时它仍然适用 —— 只是**不是所有终局都可能**。
+
+    当前 1:0，第 62 分钟  →  只可能 h2>=1 且 a2>=0，且半场比分已固定
+
+关键设计：**保持 2025 位宽，用一个「不可达状态」的幽灵候选覆盖掉**。
+
+为什么不用「把 mask 重映射到子集」：
+  重映射要维护一份 index 映射，状态空间定义一改（H/G 调整）就静默错位。
+  实测两种方法结果完全一致，性能差 47ms（90 状态时），不值得。
+  详见 docs/superpowers/specs/2026-11-12-live-result-arbitrage.md §3.1
+
+## 时段过滤：半场盘口必须按时段筛
+
+实测（2026-11-12）：第 60 分钟时 `kessbet_odds_live` 里仍有
+12 个 `1st Half - *` 选项 —— 平台赛前就挂，滚球时不主动撤。
+上半场结束后这些盘口**已结算**，参与判定会算出不可能的套利。
+
+反向同理：`2nd Half - *` 赛前就挂着，上半场时还没生效。
+"""
+from __future__ import annotations
+
+import logging
+
+from analyze import solver
+from analyze.covers import soccer
+
+log = logging.getLogger(__name__)
+
+NS = soccer.NS
+FULL = soccer.FULL
+STATES = soccer.STATES
+
+# 幽灵候选的赔率。1/1e9 ≈ 1e-9，对最优值的影响远小于浮点精度；
+# 用 0 会除零，用极小值能让 solver 选它（成本几乎为 0）又不影响结果。
+GHOST_ODDS = 1e9
+GHOST_DESC = '__unreachable__'
+
+# ---------- 参与判定的盘口 ----------
+
+# 全场结果盘。只列 covers() 支持、且语义是「比赛最终结果」的。
+FULL_TIME_MARKETS = frozenset({
+    '1x2', 'Total', 'Double Chance', 'Both Teams To Score',
+    'Exact Goals', 'Clean Sheet', 'Halftime/Fulltime',
+    'Highest Scoring Half', 'Odd/Even', 'Correct Score', 'Handicap',
+    '1x2 & Both Teams To Score',
+})
+
+# 半场盘。两条都靠 prefix 识别，时段由 half_of() 决定。
+HALF_PREFIXES = ('1st Half - ', '2nd Half - ')
+
+# 明确排除的（不要因为「看起来像结果盘」就放进来）：
+#   Total Corners / Corner 1x2 / Booking 1x2 / Sending Off  → 角球和牌
+#   N Minutes - * From A To B                                → 时间窗口盘
+#   Which Team Wins The Rest Of The Match                    → 剩余时间语义
+#   1st Goal / 2nd Goal / Nth Corner                         → 事件盘
+#   Draw No Bet                                              → covers() 不支持
+EXCLUDED_PREFIXES = ('N Minutes',)
+
+
+def is_result_market(market: str) -> bool:
+    """该盘口是否属于「比赛结果」类，参与判定。"""
+    if not market:
+        return False
+    if any(market.startswith(p) for p in HALF_PREFIXES):
+        base = market.split(' - ', 1)[1]
+        return base in FULL_TIME_MARKETS
+    return market in FULL_TIME_MARKETS
+
+
+def half_of(market: str) -> int:
+    """0=全场，1=上半场，2=下半场。"""
+    if market.startswith('1st Half - '):
+        return 1
+    if market.startswith('2nd Half - '):
+        return 2
+    return 0
+
+
+def market_active(market: str, minute: int | None) -> bool:
+    """该盘口在此刻是否还「活着」（未结算、已生效）。
+
+    没有分钟信息时一律返回 True —— 宁可多算一场，
+    也不要因为缺一个次要字段就整场跳过。
+
+    实测的边界情形：
+      - 第 60 分钟仍有 1st Half 盘口挂着（已结算但没撤）
+      - 第 0 分钟就有 2nd Half 盘口挂着（未生效）
+    """
+    if minute is None:
+        return True
+    h = half_of(market)
+    if h == 1:
+        return minute <= 45
+    if h == 2:
+        return minute > 45
+    return True
+
+
+# ---------- 可达终局 ----------
+
+def reach_mask(home: int, away: int,
+               ht_home: int | None = None,
+               ht_away: int | None = None) -> int:
+    """当前比分下可达的终局，返回 2025 位 mask。
+
+    home/away:    当前全场比分
+    ht_home/away: 半场比分。下半场时必须给（半场已结束，已知）；
+                  上半场时传 None（半场比分就是当前比分或更高）。
+    """
+    m = 0
+    for i, (h1, a1, h2, a2) in enumerate(STATES):
+        if h2 < home or a2 < away:
+            continue
+        if ht_home is not None and (h1 != ht_home or a1 != ht_away):
+            continue
+        m |= 1 << i
+    return m
+
+
+def reach_count(mask: int) -> int:
+    return bin(mask).count('1')
+
+
+# ---------- 候选构造 ----------
+
+def build_candidates(selections, minute: int | None = None,
+                     rm: int | None = None):
+    """把选项转成求解器候选。
+
+    selections: [(market, side, line, label, odds), ...]
+    rm:         可达终局 mask。给了就顺手剔除「已确定」的选项（见下）。
+
+    返回 [(mask, odds, desc), ...]。
+
+    ⚠️ **已确定的选项必须剔除** —— 这是滚球特有的一步，赛前不需要。
+
+    实测（2026-11-12，当前 1:0）：
+        Total|H|0.5|over    覆盖 1980/1980 = 100%   必然成立
+        Total||0.5|over     覆盖 1980/1980 = 100%   必然成立
+        Total|H|0.5|under   覆盖    0/1980 =   0%   必然失败
+
+    平台**不会**因为已经发生就撤掉这些盘，也不把赔率改成 1.00。
+    实测第 15 分钟 1:0 时，`Total H 2.5 over @2.25` 和
+    `Total A 0.5 under @2.50` 都在正常挂牌。
+
+    把它们留在池子里，ILP 会立刻发现「买一个必然成立的选项就够了」，
+    算出 Σ = 1/1.17 = 0.85 这种假套利。实测未过滤时 67% 的快照都
+    被误判成套利，最低 Σ=0.0533。
+
+    剔除后覆盖率既不是 0 也不是 100% 的选项才是真正「未定」的，
+    才构成一次有意义的覆盖问题。
+    """
+    by_market = {}
+    for mkt, side, line, lab, odds in selections:
+        if not is_result_market(mkt):
+            continue
+        if not market_active(mkt, minute):
+            continue
+        by_market.setdefault((mkt, side), []).append((line, lab, float(odds)))
+
+    cands = []
+    for (market, side), sels in by_market.items():
+        if market in ('Correct Score', '1st Half - Correct Score'):
+            named = 0
+            other = None
+            is_half = market.startswith('1st Half')
+            limit = soccer.H if is_half else soccer.G
+            for line, lab, odds in sels:
+                if ':' in lab:
+                    try:
+                        hh, aa = map(int, lab.split(':'))
+                    except ValueError:
+                        continue
+                    if hh >= limit or aa >= limit:
+                        continue
+                    if is_half:
+                        m = soccer.build(lambda h1, a1, h2, a2, x=hh, y=aa:
+                                         h1 == x and a1 == y)
+                    else:
+                        m = soccer.build(lambda h1, a1, h2, a2, x=hh, y=aa:
+                                         h2 == x and a2 == y)
+                    named |= m
+                    cands.append((m, odds, f'{market}|{side}|{line}|{lab}'))
+                elif lab == 'other':
+                    other = odds
+            if other is not None:
+                cands.append((FULL & ~named, other, f'{market}|other'))
+            continue
+
+        for line, lab, odds in sels:
+            m = soccer.covers(market, side, line, lab)
+            if m is not None:
+                cands.append((m, odds, f'{market}|{side}|{line}|{lab}'))
+
+    if rm is not None:
+        cands = _drop_decided(cands, rm)
+    return cands
+
+
+def _drop_decided(cands, rm: int):
+    """剔除在当前比分下已经确定（必然成立或必然失败）的选项。"""
+    n = bin(rm).count('1')
+    if n == 0:
+        return cands
+    out = []
+    for mask, odds, desc in cands:
+        cov = bin(mask & rm).count('1')
+        if cov == 0 or cov == n:
+            continue                    # 必然失败 / 必然成立
+        out.append((mask, odds, desc))
+    return out
+
+
+# ---------- 判定 ----------
+
+def solve(cands, rm: int):
+    """在可达子集上求最小覆盖成本。返回 SolveResult。
+
+    没给候选或没有可达状态时返回 None。
+    """
+    if not cands or rm == 0:
+        return None
+    ghost = FULL & ~rm
+    pool = list(cands)
+    if ghost:
+        pool.append((ghost, GHOST_ODDS, GHOST_DESC))
+    return solver.solve(pool, NS)
+
+
+def check_match(selections, home: int, away: int,
+                minute: int | None = None,
+                ht_home: int | None = None,
+                ht_away: int | None = None) -> dict | None:
+    """判定一场滚球比赛的「比赛结果」套利。
+
+    selections: [(market, side, line, label, odds), ...]
+    返回 None 表示数据不足（没有可建模的结果盘/无法覆盖）。
+    否则返回：
+      {'cost', 'chosen': [(desc, odds)], 'reach', 'n_candidates',
+       'is_arbitrage', 'profit_pct'}
+    """
+    cands = build_candidates(selections, minute)
+    if not cands:
+        return None
+
+    rm = reach_mask(home, away, ht_home, ht_away)
+    # 关键：剔除「在当前比分下已经确定」的选项。
+    # 不做这一步会算出 Σ=0.85 这种假套利（买一个必然成立的选项就够了）。
+    cands = _drop_decided(cands, rm)
+    if not cands:
+        return None
+
+    r = solve(cands, rm)
+    if r is None or r.status != solver.OK or r.cost is None:
+        return None
+
+    # solver 返回的 chosen 是 desc 字符串；把幽灵候选排除掉
+    chosen = []
+    odds_by_desc = {d: o for _, o, d in cands}
+    for d in r.chosen:
+        if d == GHOST_DESC:
+            continue
+        chosen.append((d, odds_by_desc.get(d)))
+
+    return {
+        'cost': r.cost,
+        'chosen': chosen,
+        'reach': reach_count(rm),
+        'n_candidates': len(cands),
+        'is_arbitrage': r.cost < 1.0,
+        'profit_pct': (1.0 / r.cost - 1.0) * 100 if r.cost else None,
+    }
+
+
+def stakes(chosen, cost: float) -> list[tuple[str, float, float]]:
+    """把命中的组合转成下注方案。
+
+    返回 [(desc, odds, weight), ...]，weight 之和为 1。
+    按 1/赔率 反比分配，保证任何结果的返还都相同：
+        s_i = (1/o_i) / Σ(1/o_j)
+    """
+    total = sum(1.0 / o for _, o in chosen if o)
+    if total <= 0:
+        return []
+    return [(d, o, (1.0 / o) / total) for d, o in chosen if o]
+
+
+# ---------- 半场比分 ----------
+
+def half_time_score(rows) -> tuple[int, int] | None:
+    """从赔率流水反推半场比分。
+
+    rows: [(minute, home_score, away_score), ...] 某一场的全部流水行
+
+    取 minute <= 45 的最后一条。取不到返回 None（上半场时本来就不知道）。
+
+    为什么不用 fetch_state 的 msScoreList：
+      实测当前比分 1:0 时它返回两个 0:0 的阶段快照，那是「每个阶段的
+      比分变化记录」，不是半场比分。用它构造可达终局会算错。
+    """
+    best = None
+    for minute, hs, as_ in rows:
+        if minute is None or hs is None or as_ is None:
+            continue
+        if minute <= 45:
+            if best is None or minute >= best[0]:
+                best = (minute, int(hs), int(as_))
+    return (best[1], best[2]) if best else None

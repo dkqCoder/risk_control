@@ -25,7 +25,9 @@ KEY = b'QipVAlnxoMjeQ4I47ne7kWDk'      # AES-192，前端硬编码，不过期
 IV = b'0000000000000000'
 
 ACTION_LIST = '00252'
+ACTION_LIVE_LIST = '00232'      # 滚球列表 —— 赛程接口(00252)不返回滚球
 ACTION_MATCH = '0015'
+ACTION_STATE = '0014'
 
 HEADERS = {
     'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
@@ -134,6 +136,54 @@ class KessbetHttp:
                 out.append(m)
         return out
 
+    # ---------- 滚球列表 ----------
+
+    def live_list_raw(self, tab_id: int) -> list[dict]:
+        """拉某运动**当前正在滚球**的比赛。返回原始记录。
+
+        ## 为什么必须单独一个接口
+
+        `ACTION=00252`（赛程）**只返回未开赛的比赛**。实测：
+        123 场里 ms 全是 0，开赛时间已过的 0 场，翻页到第二页也一样。
+        所以「靠赛前入库 + kickoff_time 判断进滚球窗口」这条路有个硬缺口：
+        某场比赛如果在赛前任何一次赛程刷新时都没被拉到，开赛后平台
+        也不会再告诉你它存在 —— 它就永久消失了。
+
+        实测证据（2026-11-12）：截图里 `Club America vs Toluca` 在
+        我们库里完全查不到，因为它从没进过 kessbet_match。
+
+        `ACTION=00232` 是网页 Live 页用的接口，直接返回滚球比赛：
+        有 ms（6/7/31）、mt、比分、角球，还带一份 `mari`（当前主盘口）。
+
+        ## 参数
+
+        网页实际发的是 `{'tabId':'1','playType':'1','sortBy':6,'specifiers':''}`。
+        实测：
+          - playType  取值 0~4 和空串都返回同样结果，无实际作用
+          - sortBy    0 会漏（返回 2 场而不是 3 场），1~7 都是全的；
+                      3 返回的是另一种结构（只有 leagueGroupList）
+          - tabId     按运动区分，和赛前的 SPORTS 映射一致
+          - 不需要分页，一次返回全部滚球场次
+
+        sortBy 固定用 6 —— 那是网页默认值，实测返回完整。
+        """
+        body = {'tabId': str(tab_id), 'playType': '1',
+                'sortBy': 6, 'specifiers': ''}
+        data = self._post(ACTION_LIVE_LIST, body)
+        if not isinstance(data, dict):
+            return []
+        return list(data.get('matchList') or [])
+
+    def list_live_matches(self, sport: str) -> list[Match]:
+        """拉某运动当前滚球的比赛，转成统一模型。"""
+        tab_id = config.SPORTS[sport]
+        out = []
+        for raw in self.live_list_raw(tab_id):
+            m = self._to_match(raw, sport)
+            if m:
+                out.append(m)
+        return out
+
     @staticmethod
     def _to_match(raw: dict, sport: str) -> Match | None:
         try:
@@ -162,6 +212,33 @@ class KessbetHttp:
         """拉单场全部盘口，返回原始列表。"""
         data = self._post(ACTION_MATCH, {'matchId': match_id})
         return data if isinstance(data, list) else []
+
+    def fetch_state(self, match_id: str) -> dict | None:
+        """拉单场比赛状态（比分、时间、红黄牌）。
+
+        这是滚球分析的**必要**输入 —— 盘口接口(0015)只给赔率，
+        不给「现在几比几」，而滚球判定的状态空间必须从当前比分出发。
+
+        返回的原始字段（实测 2026-11-10）：
+            ms    比赛状态：0=未开始 7=进行中 100=已结束
+            mt    已进行时间，格式 'MM:SS'，如 '65:54'
+            hmp   主队进球，字符串
+            amp   客队进球，字符串
+            hyc   主队黄牌      ayc  客队黄牌
+            hrc   主队红牌      arc  客队红牌
+            hck   主队角球      ack  客队角球
+            msScoreList  分阶段比分记录，不是当前比分，别拿它当比分用
+            tmi   Sportradar ID    tsi  运动编号
+            mbt/mdt  开赛时间/日期   sct  服务端时间戳(毫秒)
+
+        比赛结束后接口返回 None，调用方要处理。
+
+        注意 `mt` 的可靠性：它是平台抓的现场数据，可能有延迟。
+        比分同理 —— 存在从进球到平台更新的窗口期。滚球套利如果
+        依赖这个窗口，需要先实测延迟有多大。
+        """
+        data = self._post(ACTION_STATE, {'matchId': match_id})
+        return data if isinstance(data, dict) else None
 
     def fetch_odds(self, match_id: str, home: str = '', away: str = '') -> list:
         """拉单场全部盘口，解析成 Selection 列表。

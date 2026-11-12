@@ -452,6 +452,258 @@ CREATE TABLE IF NOT EXISTS kessbet_match_cost_history (
 
 
 -- =============================================================================
+-- ⑨ kessbet_match_live — 比赛实时状态（滚球）
+-- -----------------------------------------------------------------------------
+-- 一场一行，采集时覆盖。数据来自平台的状态接口 ACTION=0014。
+--
+-- 为什么需要它：
+--   滚球判定的状态空间必须从**当前比分**出发，而盘口接口(0015)只给赔率
+--   不给比分。0014 提供 hmp/amp（比分）、mt（已进行时间）、
+--   hck/ack（角球）、hyc/ayc/hrc/arc（黄红牌）。
+--
+-- 为什么一场一行而不是流水：
+--   状态是「当前值」，不是「怎么变的」。需要历史的话看
+--   kessbet_odds_live_history —— 那里每一行都带当时的比分上下文。
+--
+-- 为什么冗余 kickoff_time：
+--   让本表可以独立清理，不必依赖 kessbet_match 还在。
+--   如果清理时用子查询关联 kessbet_match，那张表先被删的话，
+--   这里的行就永远清不掉了。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS kessbet_match_live (
+    platform      VARCHAR(16) NOT NULL DEFAULT 'kessbet',
+
+    match_id      VARCHAR(32) NOT NULL,
+
+    status        SMALLINT    NOT NULL
+        COMMENT 'ms 原值。足球：0=未开始 6/7=进行中 31=中场 100=结束 120=点球。
+                 用 SMALLINT 不用 TINYINT —— 实测美式足球出现 ms=303，
+                 TINYINT 上限 127 会直接写入失败（Out of range）。
+                 状态码是平台私有编号，不要假设范围。',
+
+    minute        SMALLINT    DEFAULT NULL
+        COMMENT 'mt 解析出的已进行分钟数。NULL = 无此字段（未开赛/已结束）',
+
+    home_score    SMALLINT    DEFAULT NULL
+        COMMENT 'hmp：主队进球。接口给的是字符串，入库转 int',
+
+    away_score    SMALLINT    DEFAULT NULL
+        COMMENT 'amp：客队进球',
+
+    home_corner   SMALLINT    DEFAULT NULL
+        COMMENT 'hck：主队角球',
+
+    away_corner   SMALLINT    DEFAULT NULL
+        COMMENT 'ack：客队角球',
+
+    home_yellow   SMALLINT    DEFAULT NULL
+        COMMENT 'hyc：主队黄牌',
+
+    away_yellow   SMALLINT    DEFAULT NULL
+        COMMENT 'ayc：客队黄牌',
+
+    home_red      SMALLINT    DEFAULT NULL
+        COMMENT 'hrc：主队红牌',
+
+    away_red      SMALLINT    DEFAULT NULL
+        COMMENT 'arc：客队红牌',
+
+    kickoff_time  DATETIME    NOT NULL
+        COMMENT '开赛时间。冗余自 kessbet_match，让本表能独立清理',
+
+    fetched_time  DATETIME    NOT NULL
+        COMMENT '采集时刻（北京时间）',
+
+    PRIMARY KEY (platform, match_id),
+    KEY idx_kickoff (kickoff_time)
+        COMMENT '按开赛时间清理',
+    KEY idx_status (status, fetched_time)
+        COMMENT '找还在进行中的比赛'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='比赛实时状态（滚球）：一场一行，采集时覆盖';
+
+
+-- =============================================================================
+-- ⑩ kessbet_odds_live — 滚球赔率当前状态
+-- -----------------------------------------------------------------------------
+-- 结构与 kessbet_odds_prematch 完全一致，只是单独一张表。
+--
+-- 为什么不合并到 prematch 加 is_live 字段：
+--   1. prematch 55 万行，MySQL 5.7 加列要重建整表
+--   2. 加字段就得从「物理删除」改「软删除」，表会膨胀
+--   3. 十几处读取都要加 WHERE is_live=0，漏一处就算错成本
+--   独立表对现有逻辑零影响。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS kessbet_odds_live (
+    platform      VARCHAR(16)  NOT NULL DEFAULT 'kessbet',
+
+    match_id      VARCHAR(32)  NOT NULL,
+
+    market        VARCHAR(64)  NOT NULL
+        COMMENT '归一化盘口名，与 prematch 同口径',
+
+    side          CHAR(1)      NOT NULL DEFAULT ''
+        COMMENT 'H=主队 / A=客队 / 空=全场',
+
+    line          VARCHAR(16)  NOT NULL DEFAULT ''
+        COMMENT '盘线',
+
+    selection     VARCHAR(32)  NOT NULL
+        COMMENT '选项',
+
+    odds          DECIMAL(8,3) NOT NULL
+        COMMENT '当前赔率',
+
+    prev_odds     DECIMAL(8,3) DEFAULT NULL
+        COMMENT '上一次赔率',
+
+    kickoff_time  DATETIME     NOT NULL
+        COMMENT '开赛时间，冗余免 join',
+
+    updated_time  DATETIME     NOT NULL
+        COMMENT '最后更新（北京时间）',
+
+    PRIMARY KEY (platform, match_id, market, side, line, selection),
+    KEY idx_match (platform, match_id),
+    KEY idx_kickoff (kickoff_time)
+        COMMENT '按开赛时间清理'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='滚球赔率当前状态：一个选项一行';
+
+
+-- =============================================================================
+-- ⑪ kessbet_odds_live_history — 滚球赔率变动流水
+-- -----------------------------------------------------------------------------
+-- 只增不改。**每一行都带当时的比赛状态**（比分、分钟）。
+--
+-- 为什么必须带比分：
+--   滚球赔率脱离比分就没有意义。`Total 2.5 over @ 3.9` 在
+--   「0:0 第 10 分钟」和「1:0 第 70 分钟」含义完全不同。
+--   如果比分只存在 kessbet_match_live（只保留当前值），
+--   事后就还原不出「这个赔率变动时比赛进行到哪」。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS kessbet_odds_live_history (
+    id            BIGINT      NOT NULL AUTO_INCREMENT,
+
+    platform      VARCHAR(16) NOT NULL DEFAULT 'kessbet',
+    match_id      VARCHAR(32) NOT NULL,
+
+    market        VARCHAR(64) NOT NULL,
+    side          CHAR(1)     NOT NULL DEFAULT '',
+    line          VARCHAR(16) NOT NULL DEFAULT '',
+    selection     VARCHAR(32) NOT NULL,
+
+    odds          DECIMAL(8,3) NOT NULL
+        COMMENT '变动后的赔率',
+
+    prev_odds     DECIMAL(8,3) DEFAULT NULL
+        COMMENT '变动前的赔率。NULL = 首次出现',
+
+    minute        SMALLINT    DEFAULT NULL
+        COMMENT '赔率变动时比赛进行到第几分钟',
+
+    home_score    SMALLINT    DEFAULT NULL
+        COMMENT '赔率变动时的主队进球',
+
+    away_score    SMALLINT    DEFAULT NULL
+        COMMENT '赔率变动时的客队进球',
+
+    kickoff_time  DATETIME    NOT NULL
+        COMMENT '开赛时间，冗余免 join',
+
+    changed_time  DATETIME    NOT NULL
+        COMMENT '写入时刻（北京时间）',
+
+    PRIMARY KEY (id),
+    KEY idx_match_time (platform, match_id, changed_time)
+        COMMENT '查某场的赔率变动序列',
+    KEY idx_kickoff (kickoff_time)
+        COMMENT '按开赛时间清理'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='滚球赔率变动流水：只增不改，带当时的比赛状态';
+
+
+-- =============================================================================
+-- ⑬ kessbet_live_result_cost — 滚球「比赛结果」套利判定快照
+-- -----------------------------------------------------------------------------
+-- 一场比赛一行。存的是「把全部比赛结果盘组合起来，覆盖所有可达终局的
+-- 最小 Σ(1/赔率)」。这是滚球的核心指标 —— 列表页直接显示它。
+--
+-- 一场比赛一行，是列表页直接显示的核心指标。
+-- 参与判定的盘口：1x2 / Total / 让球 / 正确比分 / 半场盘等「比赛结果」类。
+-- 不参与：角球、红黄牌、时间窗口盘（N Minutes 那类）。
+--
+-- reach_states 这个字段是为了事后复核：
+--   滚球时不是所有终局都可能（当前 1:0 时 0:0 不可能）。
+--   记下当时有多少个可达终局，才能判断这个成本数字是怎么算出来的。
+--   上半场 2025 个（几乎没缩小），下半场锁半场比分后只剩 4% 左右。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS kessbet_live_result_cost (
+    platform      VARCHAR(16)  NOT NULL
+        COMMENT '平台标识，当前固定 kessbet',
+
+    match_id      VARCHAR(32)  NOT NULL
+        COMMENT '比赛 ID',
+
+    cost          DOUBLE       NOT NULL
+        COMMENT '覆盖全部可达终局的最小 Σ(1/赔率)。< 1.0 才是套利。
+                 存 DOUBLE 不存 DECIMAL：0.99996 会被 DECIMAL(8,4)
+                 舍入成 1.0000，与「严格 <1」的语义冲突',
+
+    profit_pct    DOUBLE       DEFAULT NULL
+        COMMENT '套利收益率 (1/cost - 1) × 100。cost >= 1 时是负数，
+                 表示抽水有多厚',
+
+    chosen        TEXT
+        COMMENT '命中的选项组合，JSON [{desc, odds, weight}]。
+                 weight 是按 1/赔率 反比算出的下注比例，和为 1',
+
+    reach_states  INT          NOT NULL DEFAULT 0
+        COMMENT '计算时的可达终局数。上半场约 2025，下半场锁半场比分后
+                 约 70~100。事后判断「这个成本是怎么算出来的」要靠它',
+
+    n_candidates  INT          NOT NULL DEFAULT 0
+        COMMENT '参与求解的可建模选项数',
+
+    minute        SMALLINT     DEFAULT NULL
+        COMMENT '计算时比赛进行到第几分钟',
+
+    home_score    SMALLINT     DEFAULT NULL
+        COMMENT '计算时的主队进球',
+
+    away_score    SMALLINT     DEFAULT NULL
+        COMMENT '计算时的客队进球',
+
+    ht_home       SMALLINT     DEFAULT NULL
+        COMMENT '半场主队进球。下半场时从赔率流水反推得到，
+                 上半场为 NULL（那时还不知道）',
+
+    ht_away       SMALLINT     DEFAULT NULL
+        COMMENT '半场客队进球',
+
+    kickoff_time  DATETIME     NOT NULL
+        COMMENT '开赛时间，冗余免 join',
+
+    odds_updated  DATETIME     DEFAULT NULL
+        COMMENT '这份判定对应的赔率版本（kessbet_odds_live 的 MAX(updated_time)），
+                 用来跳过没变的场次',
+
+    computed_time DATETIME     NOT NULL
+        COMMENT '本次计算的时刻（北京时间）',
+
+    PRIMARY KEY (platform, match_id),
+    KEY idx_cost (cost)
+        COMMENT '列表页按成本排序，找最接近套利的',
+    KEY idx_kickoff (kickoff_time)
+        COMMENT '按开赛时间清理',
+    KEY idx_computed (computed_time)
+        COMMENT '排查多久没更新'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='滚球比赛结果套利判定：一场一行，列表页直接显示';
+
+
+
+-- =============================================================================
 -- ⑥c kessbet_market_removed — 撤盘事件日志
 -- -----------------------------------------------------------------------------
 -- 记录「某个盘口选项从平台上消失了」这件事。
@@ -582,6 +834,11 @@ CREATE TABLE IF NOT EXISTS kessbet_arbitrage_snapshot (
     odds_updated   DATETIME     DEFAULT NULL
         COMMENT '这份快照对应的赔率版本（odds_prematch 的 MAX(updated_time)）。
                  与 match_id 一起做唯一键，保证同一份赔率只记一次',
+
+    is_live        TINYINT      NOT NULL DEFAULT 0
+        COMMENT '1=滚球盘套利（窗口盘内部 Σ(1/赔率) < 1），0=赛前完整覆盖套利。
+                 两类命中的证据形态不同：赛前存的是整场盘口快照，
+                 滚球存的是单个窗口盘的选项 —— 页面要能分开看',
 
     PRIMARY KEY (id),
     UNIQUE KEY uk_odds (platform, match_id, odds_updated)
