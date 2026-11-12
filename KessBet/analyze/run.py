@@ -553,16 +553,22 @@ def run_loop(dao, interval: int | None = None,
     """
     interval = interval or getattr(config, 'ANALYZE_POLL_SEC', 2)
     full_sweep_sec = full_sweep_sec or getattr(config, 'ANALYZE_FULL_SWEEP_SEC', 300)
+    live_enabled = getattr(config, 'LIVE_ENABLED', False)
+    live_full_sweep = getattr(config, 'LIVE_ANALYZE_SEC', 10) * 30
 
     last_sweep = 0.0
-    log.info('analyze loop: poll=%ds horizon=%sh concurrency=%s full_sweep=%ds',
+    last_live_sweep = 0.0
+    log.info('analyze loop: poll=%ds horizon=%sh concurrency=%s full_sweep=%ds '
+             'live=%s/%d+%d',
              interval, horizon_hours or config.ANALYZE_HORIZON_HOURS,
              concurrency or getattr(config, 'ANALYZE_CONCURRENCY', 4),
-             full_sweep_sec)
+             full_sweep_sec, 'on' if live_enabled else 'off',
+             interval, live_full_sweep)
 
     while True:
         t0 = time.time()
         force = (t0 - last_sweep) >= full_sweep_sec
+        live_force = (t0 - last_live_sweep) >= live_full_sweep
 
         try:
             stats = analyze_once(dao, horizon_hours=horizon_hours,
@@ -572,11 +578,23 @@ def run_loop(dao, interval: int | None = None,
                 last_sweep = t0
                 log.info('full sweep done in %.1fs: %s', time.time() - t0, stats)
             elif stats['matches']:
-                # 只有真有事可做才打日志，否则每 2 秒刷屏
                 log.info('incremental: %d pending, done in %.1fs: %s',
                          stats['matches'], time.time() - t0, stats)
         except Exception as e:
             log.exception('analyze round failed: %s', e)
+
+        # 滚球判定和赛前同一节奏（每 interval 秒）——
+        # 赔率变了才重算，不需要独立定时器。
+        if live_enabled:
+            try:
+                from analyze.live.run import analyze_live_once
+                ls = analyze_live_once(dao, force=live_force)
+                if live_force:
+                    last_live_sweep = t0
+                if ls['evaluated'] or ls['hits']:
+                    log.info('live round: %s', ls)
+            except Exception as e:
+                log.exception('live analyze round failed: %s', e)
 
         time.sleep(max(0, interval - (time.time() - t0)))
 

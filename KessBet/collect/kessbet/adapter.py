@@ -22,8 +22,24 @@ class KessbetAdapter(Adapter):
     def list_matches(self, sport: str) -> list[Match]:
         return self._http.list_matches(sport)
 
+    def list_live_matches(self, sport: str) -> list[Match]:
+        """当前正在滚球的比赛。
+
+        和 list_matches 是两个不同的平台接口 —— 赛程接口(00252)不返回
+        已经开赛的比赛，见 KessbetHttp.live_list_raw 的说明。
+        """
+        return self._http.list_live_matches(sport)
+
     def fetch_odds(self, match_id: str, home: str = '', away: str = '') -> list[Selection]:
         return self._http.fetch_odds(match_id, home, away)
+
+    def fetch_state(self, match_id: str) -> dict | None:
+        """比赛实时状态（比分/时间/红黄牌/角球）。
+
+        滚球采集的必要输入 —— 盘口接口只给赔率，不给比分。
+        比赛结束或解析失败返回 None。
+        """
+        return self._http.fetch_state(match_id)
 
     # ---------- 推送 ----------
 

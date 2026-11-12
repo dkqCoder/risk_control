@@ -26,6 +26,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import pymysql                                 # noqa: E402
+
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
@@ -34,7 +36,7 @@ from analyze import payout, solver            # noqa: E402
 from analyze.covers import soccer             # noqa: E402
 from collect import config                    # noqa: E402
 from common.markets import describe_pick, group_markets  # noqa: E402
-from db.dao import Dao                        # noqa: E402
+from db.dao import Dao, beijing_now            # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -318,7 +320,209 @@ def _platforms_of(dao: Dao, match_ids: list[str]) -> dict[str, list[str]]:
     return out
 
 
-# ---------------------------------------------------------------- 单场
+# ---------------------------------------------------------------- 滚球
+
+# 比赛状态码 -> 中文标签。实测值（2026-11-11）。
+LIVE_STATUS_LABEL = {
+    0: '未开始',
+    6: '进行中',
+    7: '进行中',
+    31: '中场休息',      # 实测：比分和分钟都在，但久停不动，典型的中场
+    100: '已结束',
+    120: '点球大战',
+}
+
+# 状态码是平台私有编号，不要假设范围 —— 实测美式足球出现过 303。
+# 未知码不要显示成「未知(303)」这种吓人的样子：只要它有比分/有分钟，
+# 用户关心的是「在踢」，不是那个数字。保留原值方便排查。
+
+
+def _status_label(status) -> str:
+    if status is None:
+        return '—'
+    known = LIVE_STATUS_LABEL.get(status)
+    if known:
+        return known
+    return '进行中 · 码 %s' % status
+
+
+def _live_row(r: dict) -> dict:
+    """把一行滚球状态转成 API 结构。"""
+    status = r.get('status')
+    return {
+        'match_id': r['match_id'],
+        'home_team': r.get('home_team') or '',
+        'away_team': r.get('away_team') or '',
+        'league': r.get('league') or '',
+        'sport': r.get('sport') or '',
+        'kickoff_time': _iso(r.get('kickoff_time')),
+        'status': status,
+        'status_label': _status_label(status),
+        'minute': r.get('minute'),
+        'home_score': r.get('home_score'),
+        'away_score': r.get('away_score'),
+        'home_corner': r.get('home_corner'),
+        'away_corner': r.get('away_corner'),
+        'home_yellow': r.get('home_yellow'),
+        'away_yellow': r.get('away_yellow'),
+        'home_red': r.get('home_red'),
+        'away_red': r.get('away_red'),
+        'n_markets': int(r.get('n_markets') or 0),
+        'n_selections': int(r.get('n_selections') or 0),
+        'fetched_time': _iso(r.get('fetched_time')),
+        'odds_updated': _iso(r.get('odds_updated')),
+    }
+
+
+@app.get('/api/live')
+def list_live(
+    sport: str = Query('sr:sport:1'),
+    only_in_play: bool = Query(True, description='只看进行中的'),
+    limit: int = Query(50, ge=1, le=200),
+) -> dict:
+    """滚球比赛列表。
+
+    数据来自 kessbet_match_live（采集器每 10 秒刷一次状态）。
+    赔率和盘口数来自 kessbet_odds_live。
+
+    与 /api/matches 的区别：那个是赛前，这个是已经开赛的。
+    两者时间区间不重叠。
+    """
+    dao = _dao()
+    try:
+        where = ["l.platform = 'kessbet'", 'm.sport = %s']
+        args: list[Any] = [sport]
+        if only_in_play:
+            # 用**黑名单**（排除终态和未开赛），不要用白名单（IN (6,7)）。
+            #
+            # 白名单的坑实测踩过两次：
+            #   1. ms=31（中场休息）被排除 —— 中场当然还属于「进行中」
+            #   2. 美式足球的 ms=303 也会被排除
+            # 状态码是平台私有编号，未知码会不断出现。用黑名单的话，
+            # 新码默认当成进行中显示出来，最多是多显示一场；
+            # 用白名单则会静默隐藏，而且很难发现。
+            where.append('l.status NOT IN (0, 100, 120)')
+        # 只显示还在滚球窗口内的，避免堆积历史
+        where.append(
+            "l.kickoff_time > NOW() - INTERVAL %s MINUTE")
+        args.append(config.LIVE_WINDOW_MIN)
+
+        sql = f"""
+        SELECT l.match_id, l.status, l.minute,
+               l.home_score, l.away_score,
+               l.home_corner, l.away_corner,
+               l.home_yellow, l.away_yellow,
+               l.home_red, l.away_red,
+               l.kickoff_time, l.fetched_time,
+               m.home_team, m.away_team, m.league, m.sport,
+               (SELECT COUNT(DISTINCT CONCAT_WS('|', o.market, o.side))
+                FROM kessbet_odds_live o
+                WHERE o.platform = l.platform AND o.match_id = l.match_id)
+                 AS n_markets,
+               (SELECT COUNT(*) FROM kessbet_odds_live o
+                WHERE o.platform = l.platform AND o.match_id = l.match_id)
+                 AS n_selections,
+               (SELECT MAX(o.updated_time) FROM kessbet_odds_live o
+                WHERE o.platform = l.platform AND o.match_id = l.match_id)
+                 AS odds_updated
+        FROM kessbet_match_live l
+        JOIN kessbet_match m
+          ON m.platform = l.platform AND m.match_id = l.match_id
+        WHERE {' AND '.join(where)}
+        ORDER BY l.kickoff_time DESC
+        LIMIT %s
+        """
+        with dao.conn.cursor(pymysql.cursors.DictCursor) as c:
+            c.execute(sql, args + [limit])
+            rows = c.fetchall()
+
+        # 列表页要显示「这场比赛有没有套利」—— 一次批量查，不要逐场查
+        costs = dao.get_live_result_costs([r['match_id'] for r in rows])
+        out = []
+        for r in rows:
+            item = _live_row(r)
+            rc = costs.get(r['match_id'])
+            item['result'] = ({
+                'cost': rc['cost'],
+                'profit_pct': rc['profit_pct'],
+                'is_arbitrage': (rc['cost'] is not None and rc['cost'] < 1.0),
+                'reach_states': rc['reach_states'],
+                'n_candidates': rc['n_candidates'],
+                'minute': rc['minute'],
+            } if rc else None)
+            out.append(item)
+        return {'total': len(rows), 'matches': out}
+    finally:
+        dao.close()
+
+
+@app.get('/api/live/result-costs')
+def live_result_costs(
+    limit: int = Query(100, ge=1, le=500),
+    max_cost: float | None = Query(None, description='只看成本 <= 该值的'),
+) -> dict:
+    """滚球「比赛结果」套利成本，按成本升序。
+
+    一场一行：把全部比赛结果盘（1x2 / Total / 让球 / 正确比分 / 半场盘）
+    组合起来，覆盖所有可达终局的最小 Σ(1/赔率)。< 1 才是套利。
+
+    必须定义在 /api/live/{match_id} 之前 —— FastAPI 按注册顺序匹配，
+    否则 'result-costs' 会被当成 match_id。
+    """
+    dao = _dao()
+    try:
+        with dao.conn.cursor(pymysql.cursors.DictCursor) as c:
+            where = ["r.platform='kessbet'"]
+            args: list = []
+            if max_cost is not None:
+                where.append('r.cost <= %s')
+                args.append(max_cost)
+            c.execute(f"""
+            SELECT r.match_id, r.cost, r.profit_pct, r.reach_states,
+                   r.n_candidates, r.minute, r.home_score, r.away_score,
+                   r.ht_home, r.ht_away, r.kickoff_time, r.computed_time,
+                   m.home_team, m.away_team, m.league
+            FROM kessbet_live_result_cost r
+            JOIN kessbet_match m
+              ON m.platform = r.platform AND m.match_id = r.match_id
+            WHERE {' AND '.join(where)}
+            ORDER BY r.cost ASC
+            LIMIT %s
+            """, args + [limit])
+            rows = c.fetchall()
+
+            c.execute("""
+            SELECT COUNT(*) AS n, MIN(cost) AS lo, AVG(cost) AS avg_
+            FROM kessbet_live_result_cost WHERE platform='kessbet'
+            """)
+            st = c.fetchone()
+
+        return {
+            'total': int(st['n'] or 0),
+            'min_cost': (float(st['lo']) if st['lo'] is not None else None),
+            'avg_cost': (float(st['avg_']) if st['avg_'] is not None else None),
+            'arbitrage': int(sum(1 for r in rows if float(r['cost']) < 1.0)),
+            'rows': [{
+                'match_id': r['match_id'],
+                'cost': float(r['cost']),
+                'profit_pct': (float(r['profit_pct'])
+                               if r['profit_pct'] is not None else None),
+                'reach_states': r['reach_states'],
+                'n_candidates': r['n_candidates'],
+                'minute': r['minute'],
+                'score': '%s:%s' % (r['home_score'], r['away_score']),
+                'half_time': ('%s:%s' % (r['ht_home'], r['ht_away'])
+                              if r['ht_home'] is not None else None),
+                'home_team': r['home_team'],
+                'away_team': r['away_team'],
+                'league': r['league'],
+                'kickoff_time': _iso(r['kickoff_time']),
+                'computed_time': _iso(r['computed_time']),
+            } for r in rows],
+        }
+    finally:
+        dao.close()
+
 
 @app.get('/api/matches/{match_id}')
 def match_detail(match_id: str,
@@ -430,6 +634,81 @@ def match_detail(match_id: str,
         dao.close()
 
 
+@app.get('/api/live/{match_id}')
+def live_detail(match_id: str) -> dict:
+    """滚球单场详情：当前状态 + 全部盘口 + 窗口盘成本 + 赔率变动。
+
+    和 /api/matches/{id}（赛前详情）的区别：
+      赛前那套有 ILP/LP 两套模型和 2025 状态的收益表；
+      滚球只做窗口盘判定（模型 A），所以这里给的是每个窗口盘的
+      内部成本，以及它自己的赔率变动序列。
+    """
+    dao = _dao()
+    try:
+        with dao.conn.cursor(pymysql.cursors.DictCursor) as c:
+            c.execute("""
+            SELECT l.*, m.home_team, m.away_team, m.league, m.sport,
+                   (SELECT COUNT(DISTINCT CONCAT_WS('|', o.market, o.side))
+                    FROM kessbet_odds_live o
+                    WHERE o.platform = l.platform AND o.match_id = l.match_id)
+                     AS n_markets,
+                   (SELECT COUNT(*) FROM kessbet_odds_live o
+                    WHERE o.platform = l.platform AND o.match_id = l.match_id)
+                     AS n_selections
+            FROM kessbet_match_live l
+            JOIN kessbet_match m
+              ON m.platform = l.platform AND m.match_id = l.match_id
+            WHERE l.platform='kessbet' AND l.match_id=%s
+            """, (match_id,))
+            row = c.fetchone()
+        if not row:
+            raise HTTPException(404, '滚球状态不存在')
+
+        with dao.conn.cursor() as c:
+            # 必须只取 5 列：group_markets 按 (market, side, line, label, odds)
+            # 解包。带上 prev_odds 会直接 ValueError。
+            c.execute("""SELECT market, side, line, selection, odds
+                         FROM kessbet_odds_live
+                         WHERE platform='kessbet' AND match_id=%s
+                         ORDER BY market, side, line, selection""",
+                      (match_id,))
+            rows = c.fetchall()
+
+        out = _live_row(row)
+        out['markets'] = group_markets(rows, row['home_team'], row['away_team'])
+
+        # 比赛结果套利判定（核心指标）
+        rc = dao.get_live_result_cost(match_id)
+        if rc and rc.get('cost') is not None:
+            chosen = json.loads(rc.get('chosen') or '[]')
+            out['result'] = {
+                'cost': rc['cost'],
+                'profit_pct': rc['profit_pct'],
+                'is_arbitrage': rc['cost'] < 1.0,
+                'reach_states': rc['reach_states'],
+                'n_candidates': rc['n_candidates'],
+                'minute': rc['minute'],
+                'score': '%s:%s' % (rc['home_score'], rc['away_score']),
+                'half_time': ('%s:%s' % (rc['ht_home'], rc['ht_away'])
+                              if rc['ht_home'] is not None else None),
+                'chosen': [{
+                    'desc': c['desc'],
+                    'text': describe_pick(c['desc'], row['home_team'],
+                                          row['away_team']),
+                    'odds': float(c['odds']) if c.get('odds') else None,
+                    'weight': c.get('weight'),
+                } for c in chosen],
+                'computed_time': _iso(rc['computed_time']),
+            }
+        else:
+            out['result'] = None
+        return out
+    finally:
+        dao.close()
+
+
+
+
 @app.get('/api/matches/{match_id}/history')
 def selection_history(match_id: str,
                       market: str, label: str,
@@ -448,6 +727,37 @@ def selection_history(match_id: str,
             pts = [{'time': _iso(t), 'odds': float(o),
                     'prev': float(p) if p is not None else None}
                    for o, p, t in c.fetchall()]
+        return {'market': market, 'side': side, 'line': line,
+                'label': label, 'points': pts}
+    finally:
+        dao.close()
+
+
+@app.get('/api/live/{match_id}/history')
+def live_selection_history(match_id: str,
+                           market: str, label: str,
+                           side: str = '', line: str = '') -> dict:
+    """滚球单个选项的赔率走势。
+
+    读 kessbet_odds_live_history —— 只有赔率**变化**才记一行，
+    所以点数是变动的时刻，不是采样序列。
+    每点带当时的比赛分钟和比分，能看到「进球后赔率怎么跳的」。
+    """
+    dao = _dao()
+    try:
+        with dao.conn.cursor() as c:
+            c.execute("""SELECT odds, prev_odds, changed_time, minute,
+                                home_score, away_score
+                         FROM kessbet_odds_live_history
+                         WHERE platform='kessbet' AND match_id=%s
+                           AND market=%s AND side=%s AND line=%s
+                           AND selection=%s
+                         ORDER BY changed_time""",
+                      (match_id, market, side, line, label))
+            pts = [{'time': _iso(t), 'odds': float(o),
+                    'prev': float(p) if p is not None else None,
+                    'minute': m, 'home_score': hs, 'away_score': as_}
+                   for o, p, t, m, hs, as_ in c.fetchall()]
         return {'market': market, 'side': side, 'line': line,
                 'label': label, 'points': pts}
     finally:
@@ -491,6 +801,7 @@ def _arb_row(r: dict) -> dict:
                        'weight': x['weight']}
                       for x in json.loads(r.get('lp_chosen') or '[]')],
         'odds_updated': _iso(r.get('odds_updated')),
+        'is_live': bool(r.get('is_live')),
     }
 
 
@@ -599,3 +910,29 @@ def arbitrage_page():
     if os.path.isfile(p):
         return _page(p)
     raise HTTPException(404, 'web/arbitrage.html not found')
+
+
+@app.get('/live')
+@app.get('/live.html')
+def live_page():
+    p = os.path.join(WEB_DIR, 'live.html')
+    if os.path.isfile(p):
+        return _page(p)
+    raise HTTPException(404, 'web/live.html not found')
+
+
+@app.get('/live/detail')
+@app.get('/live/detail.html')
+@app.get('/live/{match_id}')
+def live_detail_page(match_id: str = ''):
+    """滚球单场详情页。
+
+    支持两种 URL：
+      /live/<match_id>      路径带 id（列表页点进来用的）
+      /live/detail?id=<id>   query 带 id（分享链接时更明确）
+    页面里的 JS 两处都读。
+    """
+    p = os.path.join(WEB_DIR, 'live_detail.html')
+    if os.path.isfile(p):
+        return _page(p)
+    raise HTTPException(404, 'web/live_detail.html not found')

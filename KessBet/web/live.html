@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Odds Monitor · 滚球</title>
+<style>
+:root{
+  --bg:#e9ebee; --panel:#ffffff; --panel2:#f4f5f7; --line:#c9cfd6;
+  --fg:#15181c; --dim:#4a525c; --muted:#7a838d;
+  --s1:#1f6fd0; --s2:#c2410c; --s3:#0b7a52;
+  --good:#0a6e0a; --warning:#8a5a00; --serious:#bc4c00; --critical:#b01818;
+  --accent:#1f6fd0;
+}
+*{box-sizing:border-box}
+body{margin:0; background:var(--bg); color:var(--fg);
+  font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+a{color:var(--accent); text-decoration:none}
+
+header{position:sticky; top:0; z-index:10; background:var(--panel);
+  border-bottom:1px solid var(--line)}
+header .inner{max-width:1240px; margin:0 auto; padding:12px 22px 16px}
+header .top{display:flex; gap:16px; align-items:center; flex-wrap:wrap}
+header h1{font-size:18px; margin:0; font-weight:600; letter-spacing:-.01em}
+
+.tabs{display:flex; gap:2px; align-items:center; margin-right:6px}
+.tab{position:relative; font-size:13px; color:var(--dim); text-decoration:none;
+  padding:6px 12px; border-radius:6px; white-space:nowrap}
+.tab:hover{color:var(--accent); background:rgba(31,111,208,.06)}
+.tab.on{color:var(--fg); font-weight:600; background:var(--panel2)}
+.tab .dot{display:inline-block; min-width:16px; height:16px; margin-left:6px;
+  padding:0 4px; border-radius:8px; background:var(--good); color:#fff;
+  font-size:11px; font-weight:600; line-height:16px; text-align:center;
+  font-variant-numeric:tabular-nums}
+.tab .dot[hidden]{display:none}
+header .tabs::after{content:''; width:1px; height:18px;
+  background:var(--line); margin-left:8px}
+
+.wrap{padding:18px 22px 60px; max-width:1240px; margin:0 auto}
+.filters{display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+  margin-bottom:14px; padding:10px 12px;
+  background:var(--panel); border:1px solid var(--line); border-radius:8px}
+.filters label{font-size:12px; color:var(--dim); margin-right:4px}
+.filters select{background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+  border-radius:5px; padding:5px 8px; font-size:13px}
+.btn{background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+  border-radius:5px; padding:5px 12px; font-size:13px; cursor:pointer}
+.btn:hover{border-color:var(--accent); color:var(--accent)}
+
+table{width:100%; border-collapse:collapse; background:var(--panel);
+  border:1px solid var(--line); border-radius:8px; overflow:hidden;
+  font-variant-numeric:tabular-nums}
+thead th{text-align:left; font-size:11px; font-weight:500; color:var(--dim);
+  padding:9px 12px; border-bottom:1px solid var(--line);
+  text-transform:uppercase; letter-spacing:.03em; white-space:nowrap;
+  background:var(--panel2)}
+thead th.num{text-align:right}
+tbody td{padding:9px 12px; border-bottom:1px solid rgba(201,207,214,.6); font-size:13px}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:rgba(31,111,208,.05); cursor:pointer}
+td.num{text-align:right; font-family:ui-monospace,Consolas,monospace}
+
+.score{font-size:15px; font-weight:600; font-family:ui-monospace,Consolas,monospace}
+.minute{display:inline-block; font-size:11px; padding:1px 6px; border-radius:3px;
+  background:rgba(10,110,10,.1); color:var(--good); border:1px solid rgba(10,110,10,.3);
+  font-weight:600; margin-left:6px}
+.minute.halftime{background:rgba(138,90,0,.1); color:var(--warning);
+  border-color:rgba(138,90,0,.3)}
+.teams{font-weight:500}
+.teams small{display:block; color:var(--dim); font-weight:400; font-size:11px}
+
+
+.empty{background:var(--panel); border:1px solid var(--line); border-radius:8px;
+  padding:48px 24px; text-align:center}
+.empty h2{margin:0 0 10px; font-size:16px; font-weight:400; color:var(--dim)}
+.empty p{margin:6px 0; color:var(--muted); font-size:13px; line-height:1.8}
+
+.footnote{color:var(--dim); font-size:12px; margin-top:14px; line-height:1.8}
+
+
+
+td.cost{font-weight:600}
+td.cost.arb{color:var(--good)}
+td.cost.near{color:var(--warning)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="inner">
+    <div class="top">
+      <nav class="tabs">
+        <a href="/" class="tab">列表</a>
+        <a href="/live" class="tab on" aria-current="page">滚球</a>
+        <a href="/arbitrage" class="tab">套利命中</a>
+      </nav>
+      <h1>滚球</h1>
+      <div style="margin-left:auto; font-size:13px; color:var(--dim)">
+        <span id="stCount">—</span>
+        <span id="stSync" style="margin-left:14px"></span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="filters">
+    <label for="onlyInPlay">范围</label>
+    <select id="onlyInPlay">
+      <option value="true" selected>只看进行中</option>
+      <option value="false">含未开始/已结束</option>
+    </select>
+    <button class="btn" id="refresh">刷新</button>
+    <span style="margin-left:auto; font-size:12px; color:var(--muted)">
+      每 15 秒自动刷新
+    </span>
+  </div>
+
+  <div id="content"></div>
+
+  <p class="footnote">
+    数据来自采集器，状态每 10 秒刷新一次。<br>
+    <b>最低成本</b> = 把全部比赛结果盘（1x2 / 大小球 / 让球 / 正确比分 /
+    半场盘）组合起来，覆盖所有可达终局所需的最小 Σ(1/赔率)。
+    <b>&lt; 1 才是套利</b>；正常区间 1.05–1.15，就是平台抽水。<br>
+    <b>角球/红黄牌</b>不参与判定 —— 那是过程数据，不是比赛结果。
+  </p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const state = { onlyInPlay: true, loading: false, timer: null };
+
+function esc(s){ return String(s == null ? '' : s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function minuteLabel(m){
+  const min = m.minute;
+  if (min == null) return '';
+  // 45 分钟前后是中场休息，但平台不会明说，只能按分钟粗判
+  const cls = (min >= 45 && min <= 47) ? 'minute halftime' : 'minute';
+  return `<span class="${cls}">${min}'</span>`;
+}
+
+// 成本 < 1 才是套利。正常区间 1.05~1.15，就是平台抽水。
+function costClass(v){
+  if (v == null) return '';
+  if (v < 1.0) return 'arb';
+  if (v < 1.05) return 'near';
+  return '';
+}
+
+// 套利徽章：<1 才显示。平时应该是空的 —— 一旦出现就是要立刻处理的事。
+function arbBadge(rc){
+  if (!rc || rc.cost == null){
+    return '<span class="badge mute"><i></i>待算</span>';
+  }
+  if (rc.cost < 1.0){
+    return `<span class="badge crit"><i></i>套利 +${rc.profit_pct.toFixed(2)}%</span>`;
+  }
+  return '<span class="badge ok"><i></i>无</span>';
+}
+
+function scoreCell(m){
+  const h = m.home_score == null ? '—' : m.home_score;
+  const a = m.away_score == null ? '—' : m.away_score;
+  return `<span class="score">${h} : ${a}</span>`;
+}
+
+
+async function load(){
+  if (state.loading) return;
+  state.loading = true;
+  try{
+    const p = new URLSearchParams({
+      sport: 'sr:sport:1',
+      only_in_play: state.onlyInPlay,
+    });
+    const r = await fetch('/api/live?' + p);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    render(d.matches);
+    $('stCount').textContent = `${d.total} 场`;
+    $('stSync').textContent = '更新于 ' + new Date().toLocaleTimeString();
+  }catch(e){
+    $('content').innerHTML =
+      `<div class="empty"><h2>加载失败</h2><p>${esc(e.message)}</p></div>`;
+  }finally{
+    state.loading = false;
+  }
+}
+
+function render(matches){
+  if (!matches.length){
+    $('content').innerHTML = `
+      <div class="empty">
+        <h2>当前没有进行中的比赛</h2>
+        <p>滚球数据只覆盖开赛后 ${'150'} 分钟内的比赛。</p>
+        <p>没有比赛在进行时，这里会显示为空。</p>
+      </div>`;
+    return;
+  }
+
+  $('content').innerHTML = `
+    <table>
+      <thead><tr>
+        <th>状态</th>
+        <th>比赛</th>
+        <th class="num">比分</th>
+        <th class="num" title="把全部比赛结果盘组合起来，覆盖所有可达终局所需的最小 Σ(1/赔率)。&lt; 1 才是套利">最低成本</th>
+        <th>套利</th>
+        <th class="num">盘口</th>
+        <th style="padding-left:14px">赔率更新</th>
+        <th>状态更新</th>
+      </tr></thead>
+      <tbody>${matches.map(m => {
+        const rc = m.result;
+        return `
+        <tr data-id="${esc(m.match_id)}">
+          <td>${esc(m.status_label)}${minuteLabel(m)}</td>
+          <td class="teams">${esc(m.home_team)}
+            <small>vs ${esc(m.away_team)} · ${esc(m.league || '—')}</small></td>
+          <td class="num">${scoreCell(m)}</td>
+          <td class="num cost ${costClass(rc && rc.cost)}">${
+            rc && rc.cost != null ? rc.cost.toFixed(4) : '<span style="color:var(--muted)">—</span>'}</td>
+          <td>${arbBadge(rc)}</td>
+          <td class="num">${m.n_markets || '—'}</td>
+          <td style="color:var(--dim); white-space:nowrap">
+            ${(m.odds_updated || '').slice(11, 19)}</td>
+          <td style="color:var(--dim); white-space:nowrap">
+            ${(m.fetched_time || '').slice(11, 19)}</td>
+        </tr>`;
+      }).join('')}
+      </tbody>
+    </table>`;
+
+  // 点行进详情
+  $('content').querySelectorAll('tr[data-id]').forEach(tr => {
+    tr.addEventListener('click', () => {
+      location.href = `/live/${encodeURIComponent(tr.dataset.id)}`;
+    });
+  });
+}
+
+$('onlyInPlay').addEventListener('change', e => {
+  state.onlyInPlay = e.target.value === 'true';
+  load();
+});
+$('refresh').addEventListener('click', load);
+
+state.timer = setInterval(() => {
+  if (!document.hidden) load();
+}, 15000);
+
+load();
+</script>
+</body>
+</html>

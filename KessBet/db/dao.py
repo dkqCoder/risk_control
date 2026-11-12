@@ -160,6 +160,17 @@ class Dao:
         self.conn.commit()
         return len(rows)
 
+    def known_match_ids(self, platform: str = 'kessbet') -> set[str]:
+        """库里已有的全部 match_id。
+
+        给「滚球列表补采」用：拉回来的滚球场次里，哪些是我们还不知道的。
+        只取一列，4158 场约 100KB，比逐场查便宜得多。
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT match_id FROM kessbet_match WHERE platform=%s",
+                        (platform,))
+            return {r[0] for r in cur.fetchall()}
+
     def get_match(self, match_id: str):
         """返回 (sport, home_team, away_team, kickoff_time) 或 None。"""
         sql = """
@@ -418,6 +429,394 @@ class Dao:
         self.conn.commit()
         return n
 
+    # ---------- 滚球数据 ----------
+
+    def live_matches(self, window_min: int = 150) -> list[dict]:
+        """当前处于滚球窗口内的比赛（已开赛且在窗口内）。
+
+        为什么按 kickoff_time 而不是 status：
+          status 存在 kessbet_match_live 里，但那是「采过之后」才有的。
+          第一次采的时候还没记录，得靠 kickoff_time 判断该不该采。
+        """
+        sql = """
+        SELECT match_id, sport, home_team, away_team, kickoff_time
+        FROM kessbet_match
+        WHERE platform='kessbet'
+          AND kickoff_time <= NOW()
+          AND kickoff_time > NOW() - INTERVAL %s MINUTE
+        ORDER BY kickoff_time
+        """
+        with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(sql, (window_min,))
+            return list(cur.fetchall())
+
+    def save_live_state(self, match_id: str, state: dict, kickoff_time,
+                        platform: str = 'kessbet') -> None:
+        """写比赛实时状态（一场一行，覆盖）。
+
+        state 是 ACTION=0014 的原始响应。字段都是字符串，
+        这里统一转 int —— 存成字符串会让后续比较和计算变麻烦。
+        """
+        def _i(v):
+            if v in (None, '', '-'):
+                return None
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
+        mt = state.get('mt') or ''
+        minute = None
+        if ':' in str(mt):
+            try:
+                minute = int(str(mt).split(':')[0])
+            except (ValueError, IndexError):
+                pass
+
+        sql = """
+        INSERT INTO kessbet_match_live
+          (platform, match_id, status, minute,
+           home_score, away_score, home_corner, away_corner,
+           home_yellow, away_yellow, home_red, away_red,
+           kickoff_time, fetched_time)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON DUPLICATE KEY UPDATE
+          status=VALUES(status), minute=VALUES(minute),
+          home_score=VALUES(home_score), away_score=VALUES(away_score),
+          home_corner=VALUES(home_corner), away_corner=VALUES(away_corner),
+          home_yellow=VALUES(home_yellow), away_yellow=VALUES(away_yellow),
+          home_red=VALUES(home_red), away_red=VALUES(away_red),
+          kickoff_time=VALUES(kickoff_time), fetched_time=NOW()
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (
+                platform, match_id, _i(state.get('ms')), minute,
+                _i(state.get('hmp')), _i(state.get('amp')),
+                _i(state.get('hck')), _i(state.get('ack')),
+                _i(state.get('hyc')), _i(state.get('ayc')),
+                _i(state.get('hrc')), _i(state.get('arc')),
+                kickoff_time,
+            ))
+        self.conn.commit()
+
+    def live_analyze_pending(self, window_min: int = 150,
+                             platform: str = 'kessbet') -> list[dict]:
+        """赔率有更新的滚球比赛。类似 prematch 的 pending_matches，
+        但读的是 live 表。
+
+        只返回「赔率比上次计算新」的场次 —— 赔率没变重算没有意义。
+        """
+        sql = """
+        SELECT m.match_id, m.sport, m.home_team, m.away_team,
+               m.kickoff_time, l.minute, l.status,
+               l.home_score, l.away_score,
+               (SELECT MAX(o.updated_time) FROM kessbet_odds_live o
+                WHERE o.platform=m.platform AND o.match_id=m.match_id)
+                   AS odds_updated
+        FROM kessbet_match m
+        LEFT JOIN kessbet_match_live l
+          ON l.platform=m.platform AND l.match_id=m.match_id
+        WHERE m.platform=%s
+          AND m.sport='sr:sport:1'
+          AND m.kickoff_time <= NOW()
+          AND m.kickoff_time > NOW() - INTERVAL %s MINUTE
+          AND EXISTS (SELECT 1 FROM kessbet_odds_live o
+                      WHERE o.platform=m.platform AND o.match_id=m.match_id)
+          AND NOT EXISTS (
+              SELECT 1 FROM kessbet_live_result_cost c
+              WHERE c.platform=m.platform AND c.match_id=m.match_id
+                AND c.computed_time >= (
+                  SELECT MAX(o2.updated_time)
+                  FROM kessbet_odds_live o2
+                  WHERE o2.platform=m.platform AND o2.match_id=m.match_id))
+        ORDER BY m.kickoff_time
+        """
+        with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(sql, (platform, window_min))
+            return list(cur.fetchall())
+
+    def live_analyze_targets(self, window_min: int = 150,
+                             platform: str = 'kessbet') -> list[dict]:
+        """需要跑滚球套利判定的比赛：窗口内 + 有滚球赔率。
+
+        和不带条件的 live_matches 的区别：
+          - 要求 kessbet_odds_live 里确实有数据（没采到的场次判也没用）
+          - 带上 minute / 总分，判定时要用分钟挡掉过期的窗口盘
+
+        minute 取 kessbet_match_live 的当前值，没有就 NULL。
+        缺失不跳过 —— 没分钟只是不能挡过期窗口，不是不能判定。
+        """
+        sql = """
+        SELECT m.match_id, m.sport, m.home_team, m.away_team,
+               m.kickoff_time, l.minute, l.status,
+               l.home_score, l.away_score,
+               (SELECT MAX(o.updated_time) FROM kessbet_odds_live o
+                WHERE o.platform=m.platform AND o.match_id=m.match_id)
+                   AS odds_updated
+        FROM kessbet_match m
+        LEFT JOIN kessbet_match_live l
+          ON l.platform=m.platform AND l.match_id=m.match_id
+        WHERE m.platform=%s
+          AND m.sport='sr:sport:1'
+          AND m.kickoff_time <= NOW()
+          AND m.kickoff_time > NOW() - INTERVAL %s MINUTE
+          AND EXISTS (SELECT 1 FROM kessbet_odds_live o
+                      WHERE o.platform=m.platform AND o.match_id=m.match_id)
+        ORDER BY m.kickoff_time
+        """
+        with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(sql, (platform, window_min))
+            return list(cur.fetchall())
+
+    def live_odds_updated_at(self, match_id: str,
+                             platform: str = 'kessbet'):
+        """滚球赔率最后一次变更时间，用于跳过没变的场次。"""
+        sql = """SELECT MAX(updated_time) FROM kessbet_odds_live
+                 WHERE platform=%s AND match_id=%s"""
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (platform, match_id))
+            return cur.fetchone()[0]
+
+    def get_live_selections(self, match_id: str,
+                            platform: str = 'kessbet') -> list[tuple]:
+        """读一场比赛的滚球选项，结构和 get_selections 一致。"""
+        sql = """
+        SELECT market, side, line, selection, odds
+        FROM kessbet_odds_live
+        WHERE platform=%s AND match_id=%s
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (platform, match_id))
+            return [(r[0], r[1], r[2], r[3], float(r[4])) for r in cur.fetchall()]
+
+    def live_history_for_half_time(self, match_id: str,
+                                   platform: str = 'kessbet') -> list[tuple]:
+        """某场比赛赔率流水里的 (minute, home_score, away_score)。
+
+        给「反推半场比分」用。只取需要判断半场的行（minute <= 45），
+        避免把整场几万行都读出来。
+
+        为什么不用 fetch_state 的 msScoreList：
+          实测当前比分 1:0 时它返回两个 0:0 的阶段快照，
+          那是「每个阶段的比分变化记录」，不是半场比分。
+        """
+        sql = """
+        SELECT minute, home_score, away_score
+        FROM kessbet_odds_live_history
+        WHERE platform=%s AND match_id=%s
+          AND minute IS NOT NULL AND minute <= 45
+          AND home_score IS NOT NULL AND away_score IS NOT NULL
+        GROUP BY minute, home_score, away_score
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (platform, match_id))
+            return [(r[0], r[1], r[2]) for r in cur.fetchall()]
+
+    def write_live_result_cost(self, match_id: str, kickoff_time, cost: float,
+                               profit_pct, chosen: str, reach_states: int,
+                               n_candidates: int, minute, home_score,
+                               away_score, ht_home, ht_away,
+                               odds_updated, computed_time,
+                               platform: str = 'kessbet') -> None:
+        """写一场比赛的「比赛结果」套利判定（一场一行，覆盖）。
+
+        和窗口成本不同，这个**不删旧行** —— 一场比赛只有一个结果判定，
+        UPSERT 就够了。窗口盘是一场多行、会随时间增删，才需要先删后插。
+        """
+        sql = """
+        INSERT INTO kessbet_live_result_cost
+          (platform, match_id, cost, profit_pct, chosen, reach_states,
+           n_candidates, minute, home_score, away_score, ht_home, ht_away,
+           kickoff_time, odds_updated, computed_time)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON DUPLICATE KEY UPDATE
+          cost=VALUES(cost), profit_pct=VALUES(profit_pct),
+          chosen=VALUES(chosen), reach_states=VALUES(reach_states),
+          n_candidates=VALUES(n_candidates), minute=VALUES(minute),
+          home_score=VALUES(home_score), away_score=VALUES(away_score),
+          ht_home=VALUES(ht_home), ht_away=VALUES(ht_away),
+          kickoff_time=VALUES(kickoff_time),
+          odds_updated=VALUES(odds_updated),
+          computed_time=VALUES(computed_time)
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (
+                platform, match_id, cost, profit_pct, chosen, reach_states,
+                n_candidates, minute, home_score, away_score, ht_home, ht_away,
+                kickoff_time, odds_updated, computed_time,
+            ))
+        self.conn.commit()
+
+    def get_live_result_costs(self, match_ids: list[str],
+                              platform: str = 'kessbet') -> dict[str, dict]:
+        """批量读结果成本，一次查询搞定列表页。"""
+        if not match_ids:
+            return {}
+        ph = ','.join(['%s'] * len(match_ids))
+        sql = f"""
+        SELECT match_id, cost, profit_pct, chosen, reach_states,
+               n_candidates, minute, home_score, away_score,
+               ht_home, ht_away, computed_time
+        FROM kessbet_live_result_cost
+        WHERE platform=%s AND match_id IN ({ph})
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, [platform] + list(match_ids))
+            out = {}
+            for r in cur.fetchall():
+                out[r[0]] = {
+                    'cost': float(r[1]) if r[1] is not None else None,
+                    'profit_pct': float(r[2]) if r[2] is not None else None,
+                    'chosen': r[3], 'reach_states': r[4],
+                    'n_candidates': r[5], 'minute': r[6],
+                    'home_score': r[7], 'away_score': r[8],
+                    'ht_home': r[9], 'ht_away': r[10],
+                    'computed_time': r[11],
+                }
+            return out
+
+    def get_live_result_cost(self, match_id: str,
+                             platform: str = 'kessbet'):
+        return self.get_live_result_costs([match_id], platform).get(match_id)
+
+    def replace_live_odds(self, match_id: str, kickoff_time, selections,
+                          minute=None, home_score=None, away_score=None,
+                          platform: str = 'kessbet') -> dict:
+        """整场替换滚球赔率：写流水 + upsert 当前值 + 删除接口里没有的行。
+
+        selections: [(market, side, line, selection, odds), ...]
+
+        数据源是 HTTP 全量接口，所以「接口里没有」==「平台上真的没有了」。
+        必须删，否则已撤的盘口会一直留在表里：
+          - 窗口盘过期后（比如第 85 分钟还留着 `From 61 To 75`），
+            拿它算 Σ(1/赔率) 会得到一个无法下注的「套利」
+          - 实测 890254 那场表内 353 行、平台只给 170 行，241 个是已撤的
+
+        ⚠️ 与赛前不同，这里**不做**「接口返回少于库内就跳过」的比例保护：
+          滚球盘口会大规模上下架，比例保护会误挡正常撤盘。
+          但如果接口返回空，应当由调用方跳过（空响应多半是接口故障）。
+        """
+        if not selections:
+            return {'written': 0, 'changed': 0, 'removed': 0}
+
+        # 读当前值，找出真正变化的
+        sql_cur = """
+        SELECT market, side, line, selection, odds
+        FROM kessbet_odds_live
+        WHERE platform=%s AND match_id=%s
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql_cur, (platform, match_id))
+            current = {(r[0], r[1], r[2], r[3]): float(r[4])
+                       for r in cur.fetchall()}
+
+        history_rows = []
+        for m, s, l, lab, odds in selections:
+            key = (m, s, l, lab)
+            old = current.get(key)
+            if old is None or abs(old - odds) > 1e-9:
+                history_rows.append((
+                    platform, match_id, m, s, l, lab, odds, old,
+                    minute, home_score, away_score, kickoff_time,
+                ))
+
+        fresh_keys = {(m, s, l, lab) for m, s, l, lab, _ in selections}
+        stale = set(current) - fresh_keys
+
+        try:
+            with self.conn.cursor() as cur:
+                if history_rows:
+                    cur.executemany("""
+                    INSERT INTO kessbet_odds_live_history
+                      (platform, match_id, market, side, line, selection,
+                       odds, prev_odds, minute, home_score, away_score,
+                       kickoff_time, changed_time)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                    """, history_rows)
+
+                # prev_odds 用 MySQL 的 ON DUPLICATE 语义：
+                # 「把旧的 odds 存进 prev_odds，再写新 odds」。
+                # 赋值顺序很重要 —— MySQL 按从左到右求值，
+                # 如果写成 odds=VALUES(odds), prev_odds=odds，
+                # 第二个 odds 已经是新值了。必须先 prev_odds=odds。
+                cur.executemany("""
+                INSERT INTO kessbet_odds_live
+                  (platform, match_id, market, side, line, selection,
+                   odds, kickoff_time, updated_time)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                ON DUPLICATE KEY UPDATE
+                  prev_odds=odds, odds=VALUES(odds), updated_time=NOW()
+                """, [(
+                    platform, match_id, m, s, l, lab, odds, kickoff_time,
+                ) for m, s, l, lab, odds in selections])
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+        # 删已撤的行。放在 commit 之后单独一步：撤盘日志写失败不该
+        # 连带丢掉上面真正的赔率更新（和 writer.replace_match 同样的取舍）。
+        removed = 0
+        if stale:
+            try:
+                self.log_removed(
+                    match_id,
+                    [(m, s, l, lab, current[(m, s, l, lab)])
+                     for m, s, l, lab in stale],
+                    removed_time=beijing_now(), source='live',
+                    platform=platform,
+                )
+            except Exception as e:
+                log.warning('log_removed(live) %s failed: %s', match_id, e)
+            with self.conn.cursor() as cur:
+                cur.executemany("""
+                DELETE FROM kessbet_odds_live
+                WHERE platform=%s AND match_id=%s
+                  AND market=%s AND side=%s AND line=%s AND selection=%s
+                """, [(platform, match_id, m, s, l, lab)
+                      for m, s, l, lab in stale])
+                removed = cur.rowcount
+            self.conn.commit()
+
+        return {'written': len(selections), 'changed': len(history_rows),
+                'removed': removed}
+
+    def mark_live_finished(self, match_id: str,
+                           platform: str = 'kessbet') -> None:
+        """把比赛标记为已结束（status=100），并清掉它的滚球赔率。
+
+        赔率为什么清：比赛结束后接口再也不返回数据，留着只是历史包袱。
+        需要历史的话在 kessbet_odds_live_history 里。
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("""UPDATE kessbet_match_live SET status=100
+                           WHERE platform=%s AND match_id=%s""",
+                        (platform, match_id))
+            cur.execute("""DELETE FROM kessbet_odds_live
+                           WHERE platform=%s AND match_id=%s""",
+                        (platform, match_id))
+        self.conn.commit()
+
+    def cleanup_live(self, days: int = 3) -> dict:
+        """滚球数据保留期比赛前短 —— 比赛结束后就没有分析价值了。
+
+        四张表都按自己的 kickoff_time 清理，互相独立。
+        不要用「子查询 kessbet_match」的方式关联 —— 那张表先被清掉的话，
+        子查询查不到任何行，本表的数据就永远留着成孤儿。
+        """
+        result = {}
+        with self.conn.cursor() as cur:
+            for table, key in (('kessbet_odds_live', 'live_odds'),
+                               ('kessbet_odds_live_history', 'live_history'),
+                               ('kessbet_match_live', 'live_state')):
+                cur.execute(f"DELETE FROM {table} "
+                            f"WHERE kickoff_time < NOW() - INTERVAL %s DAY",
+                            (days,))
+                result[key] = cur.rowcount
+        self.conn.commit()
+        return result
+
+
     def get_costs(self, match_ids: list[str],
                   platform: str = 'kessbet') -> dict[str, dict]:
         """批量读成本快照，一次查询搞定列表页。"""
@@ -538,11 +937,15 @@ class Dao:
                                  ilp_chosen: str, lp_chosen: str,
                                  n_markets: int, n_selections: int,
                                  n_candidates: int, market_detail: str,
-                                 odds_updated, alert_time) -> bool:
+                                 odds_updated, alert_time,
+                                 is_live: int = 0) -> bool:
         """写一条命中快照。返回 True 表示新写入，False 表示这份赔率已记过。
 
         唯一键 (platform, match_id, odds_updated) 负责去重：
         分析每 2 秒轮询，同一份赔率持续命中时不能反复写 60KB 的快照。
+
+        is_live=1 表示滚球窗口盘命中 —— 证据形态不同（只存命中的那个盘口），
+        页面要能分开看。
         """
         sql = """
         INSERT INTO kessbet_arbitrage_snapshot
@@ -550,8 +953,8 @@ class Dao:
            home_team, away_team, league, kickoff_time,
            cost, cost_scope, lp_worst_profit, cross_gap,
            ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
-           market_detail, odds_updated)
-        VALUES (%s,'kessbet',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           market_detail, odds_updated, is_live)
+        VALUES (%s,'kessbet',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON DUPLICATE KEY UPDATE id = id
         """
         with self.conn.cursor() as cur:
@@ -560,26 +963,33 @@ class Dao:
                 home, away, league, kickoff_time,
                 cost, cost_scope, lp_worst_profit, cross_gap,
                 ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
-                market_detail, odds_updated,
+                market_detail, odds_updated, is_live,
             ))
         self.conn.commit()
         # MySQL: INSERT 返回 1，命中重复键返回 0
         return n == 1
 
     def list_arbitrage(self, limit: int = 100, offset: int = 0,
-                       match_id: str | None = None) -> list[tuple]:
-        """命中列表，按告警时间倒序。不返回 market_detail（太大）。"""
+                       match_id: str | None = None,
+                       is_live: int | None = None) -> list[tuple]:
+        """命中列表，按告警时间倒序。不返回 market_detail（太大）。
+
+        is_live: None=全部，0=只看赛前，1=只看滚球
+        """
         where = ["platform='kessbet'"]
         args: list = []
         if match_id:
             where.append('match_id=%s')
             args.append(match_id)
+        if is_live is not None:
+            where.append('is_live=%s')
+            args.append(1 if is_live else 0)
         sql = f"""
         SELECT id, alert_time, match_id, canonical_id, sport,
                home_team, away_team, league, kickoff_time,
                cost, cost_scope, lp_worst_profit, cross_gap,
                ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
-               odds_updated
+               odds_updated, is_live
         FROM kessbet_arbitrage_snapshot
         WHERE {' AND '.join(where)}
         ORDER BY alert_time DESC, id DESC
@@ -589,12 +999,16 @@ class Dao:
             cur.execute(sql, args + [limit, offset])
             return list(cur.fetchall())
 
-    def count_arbitrage(self, match_id: str | None = None) -> int:
+    def count_arbitrage(self, match_id: str | None = None,
+                        is_live: int | None = None) -> int:
         where = ["platform='kessbet'"]
         args: list = []
         if match_id:
             where.append('match_id=%s')
             args.append(match_id)
+        if is_live is not None:
+            where.append('is_live=%s')
+            args.append(1 if is_live else 0)
         with self.conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM kessbet_arbitrage_snapshot "
                         f"WHERE {' AND '.join(where)}", args)
@@ -607,7 +1021,7 @@ class Dao:
                home_team, away_team, league, kickoff_time,
                cost, cost_scope, lp_worst_profit, cross_gap,
                ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
-               market_detail, odds_updated
+               market_detail, odds_updated, is_live
         FROM kessbet_arbitrage_snapshot
         WHERE platform='kessbet' AND id=%s
         """
