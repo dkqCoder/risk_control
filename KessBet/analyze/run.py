@@ -554,13 +554,16 @@ def run_loop(dao, interval: int | None = None,
     interval = interval or getattr(config, 'ANALYZE_POLL_SEC', 2)
     full_sweep_sec = full_sweep_sec or getattr(config, 'ANALYZE_FULL_SWEEP_SEC', 300)
     live_enabled = getattr(config, 'LIVE_ENABLED', False)
+    # 判定开关独立于采集开关：可以让滚球赔率继续采集但不跑判定
+    live_analyze_enabled = getattr(config, 'LIVE_ANALYZE_ENABLED', True)
     live_interval = getattr(config, 'LIVE_ANALYZE_SEC', 2)
 
     log.info('analyze loop: poll=%ds horizon=%sh concurrency=%s full_sweep=%ds '
-             'live=%s/%ds(独立线程)',
+             'live=%s, live_analyze=%s/%ds(独立线程)',
              interval, horizon_hours or config.ANALYZE_HORIZON_HOURS,
              concurrency or getattr(config, 'ANALYZE_CONCURRENCY', 4),
-             full_sweep_sec, 'on' if live_enabled else 'off', live_interval)
+             full_sweep_sec, 'on' if live_enabled else 'off',
+             'on' if live_analyze_enabled else 'off', live_interval)
 
     # ★ 滚球判定必须跑在**独立线程**里。
     #
@@ -571,9 +574,11 @@ def run_loop(dao, interval: int | None = None,
     #
     # 滚球是秒级的事，赛前是分钟级的事，两者节奏差两个数量级，
     # 放在同一个循环里必然被慢的那个拖死。
-    if live_enabled:
-        _start_live_thread(live_interval,
-                           getattr(config, 'LIVE_ENABLED', True))
+    if live_enabled and live_analyze_enabled:
+        _start_live_thread(live_interval, True)
+    elif live_enabled:
+        log.info('live 判定已关闭（LIVE_ANALYZE_ENABLED=False），'
+                 '滚球赔率仍由采集进程正常采集')
 
     last_sweep = 0.0
     while True:
