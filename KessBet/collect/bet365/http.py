@@ -1,28 +1,33 @@
-"""collect/bet365/http.py — bet365 内容接口客户端。
+"""collect/bet365/http.py — bet365 内容接口的**纯 HTTP** 客户端。
 
-【重要：当前实测状态】
+⚠️ 重要：本模块只有首页接口能用，其余全部拿不到内容。真正的取数在
+`browser.py`（真实 Chrome + 站点自己的 Loader）。
 
-中国出口 IP 无法直接访问 bet365；需要境外代理。即便走代理，也只有
-`homepagecontentapi/pod?pd=#HO#P31524#` 能拿到数据（约 260 KB，含
-9 场比赛、33 个选项、5 种盘口）。
+## 实测结论
 
-其余接口（足球页 / 单场全盘口）返回 **HTTP 200 但 0 字节**：
+| 接口 | 纯 HTTP | 说明 |
+|---|---|---|
+| `homepagecontentapi/pod` | ✅ 200 KB | 首页精选，唯一对外部调用放行的接口 |
+| `splashcontentapi/*` | ❌ 200 + 0 字节 | 体育页内容 |
+| `contentdata/*` | ❌ 200 + 0 字节 | 联赛/盘口（真正有赔率的接口） |
 
-    /splashcontentapi/soccertab      体育页内容（足球全盘口入口）
-    /splashcontentapi/getsplashpods   同上，带 tzo 参数
-    /matchbettingcontentapi/coupon    单场全盘口
-    /matchmarketscontentapi/*         赛程/盘口
-    /leftnavcontentapi/validcompetitions  返回 "[]"
+**空响应不是参数或 token 问题。** 证据：
 
-这不是参数或 token 问题：真实浏览器同源 fetch 同样拿到 0 字节，
-而同一会话下 `homepagecontentapi/pod` 正常返回 260 KB。
-判定为服务端按出口 IP 降级——要求代理出口在 bet365 正常运营区。
-换到合格的出口后本模块无需改代码。
+* 真实 Chrome 里页面自己发的请求正常，同一会话手动 `fetch()` 同一 URL 返回 0；
+* 把成功请求的**完整请求头**（含 `X-Net-Sync-Term`）原样重放，能拿到 25 KB——
+  但那个 token 与页面内 `Loader` 实例的 `instanceCounter` 绑定，
+  换请求发出方就失效；
+* 页面内 `new ns_datalib_net.Loader()` 才稳定可用。
 
-协议要点：
+所以本模块保留的价值：
+  1. 首页精选赔率可以直接 HTTP 拿，比开浏览器轻得多；
+  2. 作为诊断工具——`tools/bet365_probe.py --no-browser` 用它证明
+     「HTTP 确实被拒」，把问题定位到调用方而不是网络。
+
+## 协议要点
+
   * GET，查询串 `lid/zid/cid/cgid/ctid` + `pd`（页面描述符，URL 编码）
-  * `cstid/tcstid/crid` 三个参数只有部分接口需要（tzo 系）
-  * 不需要额外 token；`x-net-sync-term` 头可省略
+  * `cstid/tcstid/crid` 只有部分接口需要（tzo 系）
   * cookie 由网关下发（aps03 / __cf_bm / pstk 等），必须带
   * POD 响应是 text/plain 的竖线记录流，不是 JSON
 """

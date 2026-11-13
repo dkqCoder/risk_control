@@ -831,6 +831,10 @@ CREATE TABLE IF NOT EXISTS kessbet_arbitrage_snapshot (
                  [{"name","base","side","selections":[{"line","label","odds"}]}]
                  事后可据此完全重建判定过程。约 30~60 KB/条',
 
+    replay_context MEDIUMTEXT
+        COMMENT '滚球命中的可重放证据包：比分、分钟、半场比分、比赛阶段、
+                 可达状态 mask、算法版本、原始赔率与预期求解结果。赛前命中为空',
+
     odds_updated   DATETIME     DEFAULT NULL
         COMMENT '这份快照对应的赔率版本（odds_prematch 的 MAX(updated_time)）。
                  与 match_id 一起做唯一键，保证同一份赔率只记一次',

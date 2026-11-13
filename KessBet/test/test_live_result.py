@@ -100,6 +100,15 @@ def test_reach_mask_locks_half_time_in_second_half():
     assert lower > 0
 
 
+def test_first_half_live_score_restricts_half_time_states():
+    """上半场当前 1:0 后，半场 0:0 不再是可达状态。"""
+    rm = R.reach_mask(1, 0, first_half_live=True)
+    for i, (h1, a1, _h2, _a2) in enumerate(R.STATES):
+        if (rm >> i) & 1:
+            assert h1 >= 1
+            assert a1 >= 0
+
+
 # ---------- 判定 ----------
 
 def _sels(rows):
@@ -255,6 +264,127 @@ def test_no_fake_arbitrage_from_decided_option():
     r = R.check_match(sels, 1, 0, minute=15)
     if r is not None:
         assert not r['is_arbitrage'], '已兑现的选项不该造出套利'
+
+
+# ---------- 脏数据防线 ----------
+
+@pytest.fixture()
+def broken_filter(monkeypatch):
+    """临时打开「盘口内部和异常就丢弃」的防线。
+
+    这个防线默认关闭（2026-11-13）：还没确定异常报价是平台真的
+    放出来的、还是我们解析错的。测试里显式打开，验证它一旦启用有效。
+    """
+    from collect import config
+    monkeypatch.setattr(config, 'LIVE_DROP_BROKEN_MARKETS', True)
+
+
+def test_broken_market_dropped(broken_filter):
+    """同一盘口内部和 < 0.9 = 数据损坏，整组剔除。
+
+    实测反例（2026-11-13 Madagascar vs Guinea-Bissau）：
+      Handicap 0:1   1 @100.0   2 @100.0   X @5.0
+      Σ = 0.01 + 0.01 + 0.20 = 0.22
+    这是平台停盘时的占位价格（两边主胜都标 100），
+    和新鲜的 1x2 组合能算出 Σ=0.05 的假套利。
+    """
+    sels = _sels([
+        ('Handicap', '', '0:1', '1', 100.0),
+        ('Handicap', '', '0:1', '2', 100.0),
+        ('Handicap', '', '0:1', 'X', 5.00),
+    ])
+    cands = R.build_candidates(sels, minute=90)
+    assert cands == [], '内部和 0.22 的盘口必须整组剔除'
+
+
+def test_normal_market_kept():
+    """正常抽水的盘口（Σ≈1.1）必须保留。"""
+    sels = _sels([
+        ('Handicap', '', '0:1', '1', 4.60),
+        ('Handicap', '', '0:1', '2', 1.75),
+        ('Handicap', '', '0:1', 'X', 3.05),
+    ])   # Σ = 0.217+0.571+0.328 = 1.116
+    cands = R.build_candidates(sels, minute=50)
+    assert len(cands) == 3
+
+
+def test_broken_market_does_not_pollute_result(broken_filter):
+    """坏盘口 + 好盘口混合时，坏的那组被剔除，不会造出假套利。"""
+    sels = _sels([
+        ('1x2', '', '', '1', 8.25),
+        ('1x2', '', '', 'X', 1.06),
+        ('1x2', '', '', '2', 23.0),
+        ('Handicap', '', '0:1', '1', 100.0),
+        ('Handicap', '', '0:1', '2', 100.0),
+        ('Handicap', '', '0:1', 'X', 5.00),
+    ])
+    cands = R.build_candidates(sels, minute=90)
+    assert all('Handicap' not in d for _, _, d in cands)
+    r = R.check_match(sels, 0, 0, minute=90)
+    # 1x2 自身 Σ=1.06+0.94+0.043 ≈ 2.04，覆盖不满 -> 不命中
+    assert r is None or not r['is_arbitrage']
+
+
+# ---------- 缺腿盘口 ----------
+
+def test_incomplete_market_dropped():
+    """缺一条腿的盘口整组剔除。
+
+    实测（2026-11-13，231 轮采样）：127 个「内部和异常」的盘口
+    全部是这种形态 —— 平台锁掉 yes/no 中的一条：
+
+        Both Teams To Score
+          yes  0.00,0   ← 锁定
+          no   4.90     ← 唯一可投注
+
+    剩下的那条价格是冻结的，拿去拼覆盖会得到下不了注的套利。
+    """
+    sels = _sels([
+        ('Both Teams To Score', '', '', 'no', 4.90),
+        ('1x2', '', '', '1', 2.00),
+        ('1x2', '', '', 'X', 3.40),
+        ('1x2', '', '', '2', 3.60),
+    ])
+    cands = R.build_candidates(sels, minute=20)
+    assert all('Both Teams' not in d for _, _, d in cands)
+    assert len(cands) == 3
+
+
+def test_complete_market_kept():
+    """两条腿都在的盘口保留。"""
+    sels = _sels([
+        ('Both Teams To Score', '', '', 'yes', 2.10),
+        ('Both Teams To Score', '', '', 'no', 1.75),
+    ])
+    cands = R.build_candidates(sels, minute=20)
+    assert len(cands) == 2
+
+
+def test_double_chance_needs_three():
+    """Double Chance 缺一个也是残缺。"""
+    sels = _sels([
+        ('Double Chance', '', '', '12', 1.20),
+        ('Double Chance', '', '', '1X', 1.40),
+    ])
+    assert R.build_candidates(sels, minute=20) == []
+
+
+def test_total_needs_over_and_under():
+    """Total 只有 over 也是残缺。"""
+    sels = _sels([('Total', '', '2.5', 'over', 1.80)])
+    assert R.build_candidates(sels, minute=20) == []
+
+
+def test_unknown_label_set_not_restricted():
+    """没有固定标签集的盘口（如 Exact Goals 的 `2`）不做缺腿判断。
+
+    这类盘口本来就可以只挂部分档位（有 3+ 没 4+ 是正常的），
+    强行要求「齐全」会把正常数据全删掉。
+    """
+    sels = _sels([
+        ('Exact Goals', 'H', '', '2', 3.45),
+    ])
+    assert len(R.build_candidates(sels, minute=20)) == 1
 
 
 # ---------- 下注比例 ----------

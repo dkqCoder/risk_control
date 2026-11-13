@@ -64,16 +64,20 @@ start_one() {
         echo "  [!] 清理失效 pidfile（pid $(cat "$pf" 2>/dev/null || echo 空) 不是 $name）"
         rm -f "$pf"
     fi
+    # 重定向到 .out 而不是 .log：日志由 Python 的 TimedRotatingFileHandler
+    # 按天写 logs/<name>.log 并切分（切出来的叫 collect.log.2026-11-13）。
+    # .out 只兜住「日志系统初始化之前」的异常（import 失败之类），
+    # 正常运行时是空的。
     nohup "$PYTHON" -u -m "$@" \
-        >> "$LOG_DIR/$name.log" 2>&1 &
+        >> "$LOG_DIR/$name.out" 2>&1 &
     local pid=$!
     echo "$pid" > "$pf"
     sleep 2
     if kill -0 "$pid" 2>/dev/null; then
-        echo "  $name 已启动 (pid $pid)  日志 logs/$name.log"
+        echo "  $name 已启动 (pid $pid)  日志 logs/$name.log（按天切分，保留 30 天）"
     else
-        echo "  [!] $name 启动后立刻退出，看 logs/$name.log：" >&2
-        tail -20 "$LOG_DIR/$name.log" >&2
+        echo "  [!] $name 启动后立刻退出，看 logs/$name.out / logs/$name.log：" >&2
+        tail -20 "$LOG_DIR/$name.out" >&2
         rm -f "$pf"
         return 1
     fi
@@ -90,17 +94,20 @@ start_api() {
     fi
     [ -f "$pf" ] && rm -f "$pf"
 
+    # uvicorn 不读我们自己的 logger 配置，用 --log-config 指定同样
+    # 按天切分的文件 handler（配置见 deploy/uvicorn-log.json）。
     nohup "$PYTHON" -u -m uvicorn web.api:app \
         --host "$API_HOST" --port "$API_PORT" \
-        >> "$LOG_DIR/$name.log" 2>&1 &
+        --log-config "$SCRIPT_DIR/uvicorn-log.json" \
+        >> "$LOG_DIR/$name.out" 2>&1 &
     local pid=$!
     echo "$pid" > "$pf"
     sleep 3
     if kill -0 "$pid" 2>/dev/null; then
-        echo "  $name 已启动 (pid $pid)  http://$API_HOST:$API_PORT/  日志 logs/$name.log"
+        echo "  $name 已启动 (pid $pid)  http://$API_HOST:$API_PORT/  日志 logs/$name.log（按天切分）"
     else
-        echo "  [!] $name 启动后立刻退出，看 logs/$name.log：" >&2
-        tail -20 "$LOG_DIR/$name.log" >&2
+        echo "  [!] $name 启动后立刻退出，看 logs/$name.out / logs/$name.log：" >&2
+        tail -20 "$LOG_DIR/$name.out" >&2
         rm -f "$pf"
         return 1
     fi

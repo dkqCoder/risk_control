@@ -18,6 +18,7 @@
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pymysql
@@ -58,12 +59,14 @@ class LiveCollector:
     和 analyze/run.py 的做法一致。
     """
 
-    def __init__(self, adapter, dao, dsn: dict | None = None):
+    def __init__(self, adapter, dao, dsn: dict | None = None,
+                 on_snapshot=None):
         self.adapter = adapter
         self.dao = dao
         self._dsn = dsn or {}
         self._running = False
         self._thread = None
+        self._on_snapshot = on_snapshot
 
         # 推送模式下，由 WS 回调写在这里；轮询模式下无用
         self._dirty: dict[str, float] = {}
@@ -78,7 +81,13 @@ class LiveCollector:
             'finished': 0,
             'failed': 0,
             'skipped_empty': 0,
+            'inconsistent_snapshot': 0,
+            'snapshot_analyze_failed': 0,
         }
+
+    def set_snapshot_handler(self, handler) -> None:
+        """设置快照分析回调；采集器本身不依赖分析模块可用。"""
+        self._on_snapshot = handler
 
     # ---------- 触发入口 ----------
 
@@ -127,10 +136,9 @@ class LiveCollector:
             self.stats['finished'] += 1
             return
 
-        dao.save_live_state(match_id, state, kickoff)
-        self.stats['state_ok'] += 1
-
         if not fetch_odds:
+            dao.save_live_state(match_id, state, kickoff)
+            self.stats['state_ok'] += 1
             return
 
         odds = self.adapter.fetch_odds(
@@ -139,19 +147,83 @@ class LiveCollector:
         # 空响应多半是接口故障，不是「盘口全撤了」——
         # 跳过，不覆盖库里的数据。
         if not odds:
+            dao.save_live_state(match_id, state, kickoff)
+            self.stats['state_ok'] += 1
             self.stats['skipped_empty'] += 1
             return
 
+        state_after = self.adapter.fetch_state(match_id)
+        if state_after is None:
+            self.stats['inconsistent_snapshot'] += 1
+            self.mark_dirty(match_id)
+            return
+        if state_after.get('ms') in FINISHED_STATUS:
+            dao.mark_live_finished(match_id)
+            self.stats['finished'] += 1
+            return
+
+        dao.save_live_state(match_id, state_after, kickoff)
+        self.stats['state_ok'] += 1
+        if not _same_snapshot_state(state, state_after):
+            self.stats['inconsistent_snapshot'] += 1
+            self.mark_dirty(match_id)
+            return
+
+        state = state_after
+
         minute = _parse_minute(state.get('mt'))
+        rows = [(s.market, s.side, s.line, s.label, float(s.odds)) for s in odds]
+
+        # ★ 写入前剔除「内部和不可能」的盘口。
+        #
+        # 平台在停盘/占位时会返回垃圾赔率，但标记仍是可投注（`,1,`），
+        # 所以解析层拦不住。实测（2026-11-13）：
+        #   1st Half - Handicap 0:2    1@75.0  2@100.0  X@13.0
+        #   Σ(1/赔率) = 0.013 + 0.010 + 0.077 = 0.10
+        # 单一博彩公司内部必然有抽水，同一个盘口的 Σ 不可能 < 1。
+        # 这种数据留在表里，套利判定会拿它和正常盘口组合，
+        # 算出 Σ=0.05 那种根本不存在的机会。
+        #
+        # 在这里剔除而不是只在分析层过滤，是因为：
+        #   1. 库内数据保持干净，任何读取方都不会被误导
+        #   2. 流水表也不会记下这些假价格，事后回溯不受污染
+        if getattr(config, 'LIVE_DROP_BROKEN_MARKETS', False):
+            before = len(rows)
+            rows = _drop_broken_markets(rows)
+            if len(rows) < before:
+                self.stats['broken_markets'] = (
+                    self.stats.get('broken_markets', 0) + 1)
+
+        if not rows:
+            self.stats['skipped_empty'] += 1
+            return
+
         res = dao.replace_live_odds(
-            match_id, kickoff,
-            [(s.market, s.side, s.line, s.label, float(s.odds)) for s in odds],
+            match_id, kickoff, rows,
             minute=minute,
             home_score=_to_int(state.get('hmp')),
             away_score=_to_int(state.get('amp')),
         )
         self.stats['odds_ok'] += 1
         self.stats['history_rows'] += res.get('changed', 0)
+
+        if self._on_snapshot:
+            snapshot = dict(meta)
+            snapshot.update({
+                'snapshot_id': uuid.uuid4().hex,
+                'minute': minute,
+                'home_score': _to_int(state.get('hmp')),
+                'away_score': _to_int(state.get('amp')),
+                'match_status': state.get('ms'),
+                'match_clock': state.get('mt'),
+                'odds_updated': dao.live_odds_updated_at(match_id),
+                'snapshot_selections': rows,
+            })
+            try:
+                self._on_snapshot(dao, snapshot, rows)
+            except Exception as e:
+                self.stats['snapshot_analyze_failed'] += 1
+                log.exception('live snapshot analyze %s failed: %s', match_id, e)
 
     # ---------- 一轮采集 ----------
 
@@ -291,6 +363,52 @@ class LiveCollector:
         self._running = False
 
 
+# 采集阶段判定「明显异常」的阈值。
+#
+# 只拦真正不可能的数据，不拦「选项不全的盘口」——
+# 平台经常只挂部分选项（1x2 只有 1 和 X），那种盘口内部和天然偏低
+# （实测 ~0.71），但它是有意义的真实报价，不该丢。
+#
+# 实测：
+#   完整盘口      Σ = 1.05 ~ 1.16
+#   部分选项      Σ ≈ 0.70
+#   停盘占位价    Σ = 0.10 ~ 0.22   ← 只拦这一档
+#
+# 更严的「单一博彩公司不可能负抽水」检查放在分析层
+# （analyze/live/result.py 的 _drop_broken_markets，阈值 0.90）——
+# 那里才是正确性关键的地方。
+MIN_MARKET_SUM = 0.30
+
+
+def _drop_broken_markets(rows):
+    """剔除内部和明显不可能的盘口。
+
+    rows: [(market, side, line, selection, odds), ...]
+
+    实测反例（2026-11-13，Equatorial Guinea）：
+       1st Half - Handicap 0:2   1@75.0   2@100.0   X@13.0
+       Σ = 0.10
+
+    平台把「几乎不可能」的选项标到 75/100 这种占位数，两边同时高价，
+    加起来就是一个根本不存在的负抽水盘口。
+    """
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+    for r in rows:
+        groups[(r[0], r[1], r[2])].append(r)
+
+    out = []
+    for key, group in groups.items():
+        total = sum(1.0 / r[4] for r in group if r[4] > 0)
+        if total < MIN_MARKET_SUM:
+            log.debug('剔除异常盘口 %s Σ=%.3f (%d 个选项)',
+                      '|'.join(x or '-' for x in key), total, len(group))
+            continue
+        out.extend(group)
+    return out
+
+
 def _parse_minute(mt) -> int | None:
     """'65:54' -> 65。空值或格式不符返回 None。"""
     if not mt or ':' not in str(mt):
@@ -313,3 +431,17 @@ def _to_int(v) -> int | None:
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+def _same_snapshot_state(before: dict, after: dict) -> bool:
+    """盘口请求前后的关键状态是否属于同一个定价时刻。"""
+    if (_to_int(before.get('hmp')), _to_int(before.get('amp'))) != (
+            _to_int(after.get('hmp')), _to_int(after.get('amp'))):
+        return False
+    if before.get('ms') != after.get('ms'):
+        return False
+    before_minute = _parse_minute(before.get('mt'))
+    after_minute = _parse_minute(after.get('mt'))
+    if before_minute is None or after_minute is None:
+        return True
+    return (before_minute <= 45) == (after_minute <= 45)

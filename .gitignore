@@ -28,3 +28,6 @@ KessBet/deploy/.env
 # 编辑器
 .idea/
 .vscode/
+
+# 日志的运行产物：*.out 是启动脚本的重定向兜底文件
+KessBet/logs/*.out

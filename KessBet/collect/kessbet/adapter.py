@@ -34,6 +34,14 @@ class KessbetAdapter(Adapter):
     def fetch_odds(self, match_id: str, home: str = '', away: str = '') -> list[Selection]:
         return self._http.fetch_odds(match_id, home, away)
 
+    def fetch_raw(self, match_id: str) -> list[dict]:
+        """原始盘口列表（未解析的 mari 串）。
+
+        诊断用：排查「平台到底返回了什么」时，需要看原始串而不是
+        解析后的结果 —— 否则分不清是平台的问题还是解析的问题。
+        """
+        return self._http.fetch_raw(match_id)
+
     def fetch_state(self, match_id: str) -> dict | None:
         """比赛实时状态（比分/时间/红黄牌/角球）。
 

@@ -649,11 +649,9 @@ _DSN: dict = {}
 
 
 def setup_logging(verbose: bool = False) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        datefmt='%H:%M:%S',
-    )
+    """日志：终端里跑输出控制台，被启动脚本拉起则写日志文件（按天切分）。"""
+    from common import logsetup
+    logsetup.setup('analyze', verbose)
 
 
 def install_signal_handlers() -> None:

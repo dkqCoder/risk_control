@@ -145,7 +145,7 @@ class Collector:
         #   比赛进来时可能赔率正停在当前值不动，就永远没数据。
         if new_ids:
             log.info('triggering live collection for %d new matches', len(new_ids))
-            if self.live:
+            if getattr(self, 'live', None):
                 for mid in new_ids:
                     self.live.mark_dirty(mid)
 
@@ -245,6 +245,14 @@ class Collector:
             except Exception as e:
                 log.error('live collector init failed: %s', e)
                 self.live = None
+
+            if self.live is not None:
+                try:
+                    from analyze.live.run import analyze_live_snapshot
+                    self.live.set_snapshot_handler(analyze_live_snapshot)
+                except Exception as e:
+                    log.exception('live snapshot analyzer unavailable; '
+                                  'collection continues: %s', e)
 
         log.info('=== phase 1: schedule ===')
         self.refresh_schedule()
@@ -411,11 +419,9 @@ class Collector:
 
 
 def setup_logging(verbose: bool = False) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        datefmt='%H:%M:%S',
-    )
+    """日志：终端里跑输出控制台，被启动脚本拉起则写日志文件（按天切分）。"""
+    from common import logsetup
+    logsetup.setup('collect', verbose)
 
 
 def install_signal_handlers() -> None:

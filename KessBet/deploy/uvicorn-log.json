@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "default": {
+      "format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+      "datefmt": "%H:%M:%S"
+    },
+    "access": {
+      "format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+      "datefmt": "%H:%M:%S"
+    }
+  },
+  "handlers": {
+    "file": {
+      "()": "common.logsetup.daily_handler",
+      "formatter": "default",
+      "filename": "logs/api.log",
+      "backupCount": 30,
+      "encoding": "utf-8"
+    }
+  },
+  "loggers": {
+    "uvicorn": {"handlers": ["file"], "level": "INFO", "propagate": false},
+    "uvicorn.error": {"handlers": ["file"], "level": "INFO", "propagate": false},
+    "uvicorn.access": {"handlers": ["file"], "level": "INFO", "propagate": false}
+  }
+}

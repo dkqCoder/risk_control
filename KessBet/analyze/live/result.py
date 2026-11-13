@@ -31,9 +31,11 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 
 from analyze import solver
 from analyze.covers import soccer
+from collect import config
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +113,8 @@ def market_active(market: str, minute: int | None) -> bool:
 
 def reach_mask(home: int, away: int,
                ht_home: int | None = None,
-               ht_away: int | None = None) -> int:
+               ht_away: int | None = None,
+               first_half_live: bool = False) -> int:
     """当前比分下可达的终局，返回 2025 位 mask。
 
     home/away:    当前全场比分
@@ -121,6 +124,8 @@ def reach_mask(home: int, away: int,
     m = 0
     for i, (h1, a1, h2, a2) in enumerate(STATES):
         if h2 < home or a2 < away:
+            continue
+        if first_half_live and (h1 < home or a1 < away):
             continue
         if ht_home is not None and (h1 != ht_home or a1 != ht_away):
             continue
@@ -203,9 +208,127 @@ def build_candidates(selections, minute: int | None = None,
             if m is not None:
                 cands.append((m, odds, f'{market}|{side}|{line}|{lab}'))
 
+    if getattr(config, 'LIVE_DROP_INCOMPLETE_MARKETS', True):
+        cands = _drop_incomplete_markets(cands)
+
+    if getattr(config, 'LIVE_DROP_BROKEN_MARKETS', False):
+        cands = _drop_broken_markets(cands)
+
     if rm is not None:
         cands = _drop_decided(cands, rm)
     return cands
+
+
+def _drop_broken_markets(cands):
+    """剔除内部和明显不可能的盘口（数据损坏）。
+
+    单一博彩公司内部必然有抽水，所以**同一个盘口**的 Σ(1/赔率)
+    不可能显著小于 1。实测反例（2026-11-13 Madagascar）：
+
+        Handicap 0:1   1 @100.0   2 @100.0   X @5.0
+        Σ = 0.01 + 0.01 + 0.20 = 0.22
+
+    这是平台停盘/占位时给的假价格（两边主胜都标 100），
+    拿它和新鲜的 1x2 组合，能算出 Σ=0.05 的「套利」。
+    真实盘口的内部和最小也在 1.05 以上（实测过 6 万组窗口盘，
+    最低 1.0710）。
+
+    阈值 0.90 留了余量：即使出现真实的单盘口定价错误，
+    也很少低到 0.90 以下 —— 而数据损坏往往低到 0.2 这种量级。
+    """
+    by_market = {}
+    for mask, odds, desc in cands:
+        # desc 有两种形态，key 必须归一到同一个维度（market, side, line）：
+        #   `market|side|line|label`  → 4 段（Correct Score 的具名比分也是这种）
+        #   `market|other`            → 2 段（补集）
+        parts = desc.split('|')
+        if len(parts) >= 4:
+            key = (parts[0], parts[1], parts[2])
+        else:
+            key = (parts[0], '', '')
+        by_market.setdefault(key, []).append((mask, odds, desc))
+
+    out = []
+    for key, group in by_market.items():
+        total = sum(1.0 / o for _, o, _ in group if o > 0)
+        if total < 0.90:
+            log.warning('盘口内部和异常，数据不可信，已剔除：%s  Σ=%.4f  (%d 个选项)',
+                        key, total, len(group))
+            continue
+        out.extend(group)
+    return out
+
+
+# 各类盘口「完整」时应该有的标签。
+#
+# 用于剔除残缺盘口：平台经常锁掉一条腿（原始串里标记 `,0,`），
+# 只留另一条。剩下的那条价格是冻结的 —— 因为平台锁腿通常意味着
+# 这个盘口马上要结算。拿它去拼覆盖会得到下不了注的「套利」。
+#
+# 实测（2026-11-13，231 轮滚球采样）：127 个内部和异常的盘口
+# **全部**是这种形态，没有一个是解析错误。
+_EXPECTED_LABELS = {
+    '1x2': {'1', 'X', '2'},
+    'Double Chance': {'1X', '12', 'X2'},
+    'Both Teams To Score': {'yes', 'no'},
+    'Handicap': {'1', 'X', '2'},
+    'Odd/Even': {'odd', 'even'},
+    'Highest Scoring Half': {'1st half', '2nd half', 'equal'},
+    '1st Half - 1x2': {'1', 'X', '2'},
+    '1st Half - Double Chance': {'1X', '12', 'X2'},
+    '1st Half - Both Teams To Score': {'yes', 'no'},
+    '1st Half - Handicap': {'1', 'X', '2'},
+    '2nd Half - 1x2': {'1', 'X', '2'},
+    '2nd Half - Double Chance': {'1X', '12', 'X2'},
+    '2nd Half - Both Teams To Score': {'yes', 'no'},
+}
+
+
+def expected_labels(market: str):
+    """这条盘口完整时应该有哪些标签。无法判断返回 None（不做限制）。
+
+    注意别把 `1x2 & Total` 这类组合盘算进来 —— 它的标签是
+    `1 & over` 这种，没有固定的期望集合。
+    """
+    if market in _EXPECTED_LABELS:
+        return _EXPECTED_LABELS[market]
+    if ' & ' in market:
+        return None
+    if market.startswith('Total') or market.endswith(' Total'):
+        return {'over', 'under'}
+    return None
+
+
+def _drop_incomplete_markets(cands):
+    """剔除缺腿的盘口。
+
+    cands: [(mask, odds, desc)]，desc 形如 `market|side|line|label`
+    """
+    by_market = defaultdict(list)
+    for mask, odds, desc in cands:
+        parts = desc.split('|')
+        if len(parts) < 4:
+            # `market|other` 这种补集形态，本身就代表完整覆盖
+            by_market[None].append((mask, odds, desc))
+            continue
+        by_market[(parts[0], parts[1], parts[2])].append((mask, odds, desc))
+
+    out = list(by_market.pop(None, []))
+    for key, group in by_market.items():
+        market = key[0]
+        exp = expected_labels(market)
+        if exp is None:
+            out.extend(group)
+            continue
+        labels = {c[2].split('|')[3] for c in group}
+        if exp.issubset(labels):
+            out.extend(group)
+        else:
+            log.warning('盘口缺腿，整组剔除：%s %s %s  有 %s 缺 %s',
+                        key[0], key[1] or '-', key[2] or '-',
+                        ','.join(sorted(labels)),
+                        ','.join(sorted(exp - labels)))
+    return out
 
 
 def _drop_decided(cands, rm: int):
@@ -241,7 +364,8 @@ def solve(cands, rm: int):
 def check_match(selections, home: int, away: int,
                 minute: int | None = None,
                 ht_home: int | None = None,
-                ht_away: int | None = None) -> dict | None:
+                ht_away: int | None = None,
+                first_half_live: bool | None = None) -> dict | None:
     """判定一场滚球比赛的「比赛结果」套利。
 
     selections: [(market, side, line, label, odds), ...]
@@ -254,7 +378,13 @@ def check_match(selections, home: int, away: int,
     if not cands:
         return None
 
-    rm = reach_mask(home, away, ht_home, ht_away)
+    if first_half_live is None:
+        first_half_live = (
+            minute is not None and minute <= 45 and ht_home is None)
+    rm = reach_mask(
+        home, away, ht_home, ht_away,
+        first_half_live=first_half_live,
+    )
     # 关键：剔除「在当前比分下已经确定」的选项。
     # 不做这一步会算出 Σ=0.85 这种假套利（买一个必然成立的选项就够了）。
     cands = _drop_decided(cands, rm)
@@ -277,6 +407,7 @@ def check_match(selections, home: int, away: int,
         'cost': r.cost,
         'chosen': chosen,
         'reach': reach_count(rm),
+        'reach_mask': rm,
         'n_candidates': len(cands),
         'is_arbitrage': r.cost < 1.0,
         'profit_pct': (1.0 / r.cost - 1.0) * 100 if r.cost else None,

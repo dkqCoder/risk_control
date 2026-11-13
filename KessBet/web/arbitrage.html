@@ -91,6 +91,43 @@ td.num{text-align:right; font-family:ui-monospace,Consolas,monospace}
   border:1px solid var(--line); border-radius:5px; padding:5px 12px;
   font-size:13px; cursor:pointer; color:var(--fg)}
 .drawer-body{padding:16px 22px 0}
+.drawer-head .vs{color:var(--muted); font-weight:400; margin:0 2px}
+/* 列表里的 matchId：等宽字体，便于复制排查 */
+.mid{font-family:ui-monospace,Consolas,monospace; letter-spacing:.01em}
+/* 顶部元信息条：matchId / 类型 / 开赛 / 赔率版本 */
+.meta-bar{display:flex; flex-wrap:wrap; gap:8px 20px; margin-bottom:14px;
+  font-size:12px; color:var(--dim)}
+.meta-bar b{color:var(--fg); font-weight:600;
+  font-family:ui-monospace,Consolas,monospace}
+.meta-bar b.key{letter-spacing:.02em}
+
+/* 判定结论：一眼看清是真套利还是只是成本低 */
+.verdict{display:flex; align-items:baseline; gap:22px; flex-wrap:wrap;
+  padding:14px 16px; border-radius:8px; margin-bottom:14px;
+  border:1px solid var(--line); background:var(--panel)}
+.verdict.ok{border-color:rgba(10,110,10,.4); background:rgba(10,110,10,.06)}
+.verdict.no{border-color:rgba(138,90,0,.35); background:rgba(138,90,0,.06)}
+.verdict .big{font-size:15px; font-weight:700}
+.verdict.ok .big{color:var(--good)}
+.verdict.no .big{color:var(--warning)}
+.verdict .cost,.verdict .profit{font-size:13px; color:var(--dim)}
+.verdict .cost b,.verdict .profit b{font-size:17px; color:var(--fg);
+  font-variant-numeric:tabular-nums; margin-left:4px}
+.verdict .note{font-size:12px; color:var(--muted); margin-left:auto}
+.verdict .note b{color:var(--fg); font-variant-numeric:tabular-nums}
+
+/* 下注方案表 */
+table.stake{width:100%; border-collapse:collapse;
+  font-variant-numeric:tabular-nums}
+table.stake th{font-size:11px; color:var(--dim); font-weight:500;
+  text-align:left; padding:7px 10px; border-bottom:1px solid var(--line)}
+table.stake th.num{text-align:right}
+table.stake td{padding:7px 10px; font-size:13px;
+  border-bottom:1px solid rgba(201,207,214,.4)}
+table.stake td.num{text-align:right;
+  font-family:ui-monospace,Consolas,monospace}
+table.stake td.back{color:var(--s3); font-weight:600}
+table.stake tbody tr:last-child td{border-bottom:none}
 
 .card{background:var(--panel); border:1px solid var(--line); border-radius:8px;
   padding:14px 16px; margin-bottom:14px}
@@ -227,7 +264,9 @@ async function loadList(){
         <tr data-id="${h.id}">
           <td class="alert-time">${(h.alert_time||'').slice(5,16)}</td>
           <td class="alert-time">${(h.kickoff_time||'').slice(5,16)}</td>
-          <td class="teams">${h.home_team}<small>vs ${h.away_team} · ${h.league||'—'}</small></td>
+          <td class="teams">${h.home_team}
+            <small>vs ${h.away_team} · ${h.league||'—'} ·
+              <span class="mid">${h.match_id}</span></small></td>
           <td class="num cost">${h.cost.toFixed(4)}</td>
           <td class="num profit ${pctClass(h.profit_pct)}">${pct(h.profit_pct, 2)}</td>
           <td class="num" style="color:var(--dim)">${h.n_markets}/${h.n_selections}</td>
@@ -257,15 +296,47 @@ async function openDetail(id){
     $('dwBody').innerHTML = '<div class="banner crit">加载失败</div>';
     return;
   }
-  $('dwTitle').textContent = `${h.home_team} vs ${h.away_team}`;
+  // 滚球命中没有跑 LP（lp_worst_profit 为 NULL），收益只能由成本推算：
+  //   t = 1/cost - 1
+  // 赛前命中以 LP 的结果为准 —— 它允许部分下注，比 ILP 隐含值更优。
+  const profitPct = h.profit_pct;
+  const profitFrom = h.profit_src === 'lp' ? 'LP 实测' : '按成本推算';
+  const isArb = profitPct != null && profitPct > 0;
+
+  $('dwTitle').innerHTML = `
+    ${esc(h.home_team)} <span class="vs">vs</span> ${esc(h.away_team)}`;
 
   const warns = [];
   if(h.cross_gap != null && h.cross_gap < -1e-6)
     warns.push('ILP 与 LP 交叉验证未通过（LP 比 ILP 差），结果可能不可靠');
-  if(h.lp_worst_profit == null || h.lp_worst_profit <= 0)
-    warns.push('LP 最差收益不大于 0，严格来说不构成套利');
+  if(h.lp_worst_profit != null && h.lp_worst_profit <= 0)
+    warns.push('LP 最差收益不大于 0 —— 严格来说不构成套利');
+
+  const lpSorted = [...h.lp_chosen].sort((a, b) => b.weight - a.weight);
+  const STAKES = 1000;
+  const backPerState = h.cost > 0 ? STAKES / h.cost : null;
 
   $('dwBody').innerHTML = `
+    <div class="meta-bar">
+      <span>matchId <b>${esc(h.match_id)}</b></span>
+      <span>${h.is_live ? '滚球' : '赛前'}</span>
+      <span>开赛 <b>${esc(h.kickoff_time || '—')}</b></span>
+      <span>赔率版本 <b>${esc(h.odds_updated || '—')}</b></span>
+      <span>快照时间 <b>${esc(h.alert_time || '—')}</b></span>
+    </div>
+
+    <div class="verdict ${isArb ? 'ok' : 'no'}">
+      <div class="big">${isArb ? '✓ 套利' : '✗ 无套利'}</div>
+      <div class="cost">成本 <b>${h.cost.toFixed(6)}</b></div>
+      <div class="profit">${profitFrom}
+        <b>${profitPct == null ? '—' : (profitPct >= 0 ? '+' : '') + profitPct.toFixed(2) + '%'}</b>
+      </div>
+      ${backPerState
+        ? `<div class="note">投 ${STAKES} 元，任何结果都收回
+           <b>${backPerState.toFixed(0)}</b> 元</div>`
+        : ''}
+    </div>
+
     ${warns.map(w => `<div class="banner crit">⚠ ${w}</div>`).join('')}
     <div class="banner warn">
       这是 <b>${esc(h.alert_time)}</b> 时刻的快照，不是当前赔率。
@@ -273,41 +344,30 @@ async function openDetail(id){
     </div>
 
     <div class="card">
-      <h3>判定结果</h3>
-      <div class="kv">
-        <div class="item"><div class="k">最小覆盖成本</div>
-          <div class="v good">${h.cost.toFixed(6)}</div></div>
-        <div class="item"><div class="k">LP 最差收益</div>
-          <div class="v ${pctClass(h.profit_pct) === 'neg' ? 'warn' : 'good'}">${pct(h.profit_pct, 4)}</div></div>
-        <div class="item"><div class="k">盘口 / 选项</div>
-          <div class="v">${h.n_markets} / ${h.n_selections}</div></div>
-        <div class="item"><div class="k">可建模候选</div>
-          <div class="v">${h.n_candidates}</div></div>
-        <div class="item"><div class="k">开赛</div>
-          <div class="v" style="font-size:14px">${esc(h.kickoff_time)}</div></div>
-        <div class="item"><div class="k">赔率版本</div>
-          <div class="v" style="font-size:14px; color:var(--dim)">${esc(h.odds_updated)}</div></div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h3>下注方案（LP）</h3>
-      ${h.lp_chosen.map(x =>
-        `<span class="pick"><span>${esc(x.text)}</span>
-         <span class="w">权重</span><span class="v">${(x.weight*100).toFixed(2)}%</span></span>`
-      ).join('') || '<span style="color:var(--dim)">无</span>'}
-      <div style="clear:both; margin-top:8px; font-size:12px; color:var(--dim)">
-        投 1000 元：${h.lp_chosen.map(x =>
-          `<b>${esc(x.text)}</b> 买 ${(x.weight*1000).toFixed(2)} 元`).join('，') ||
-          '无可下注组合'}
-      </div>
-    </div>
-
-    <div class="card">
-      <h3>ILP 选中组合</h3>
-      ${h.ilp_chosen.map(x =>
-        `<span class="pick"><span class="v">${esc(x.text)}</span></span>`).join('')
-        || '<span style="color:var(--dim)">无</span>'}
+      <h3>下注方案</h3>
+      ${lpSorted.length ? `
+      <table class="stake">
+        <thead><tr>
+          <th>选项</th>
+          <th class="num">赔率</th>
+          <th class="num">权重</th>
+          <th class="num">投 ${STAKES} 元</th>
+          <th class="num">中了收回</th>
+        </tr></thead>
+        <tbody>
+        ${lpSorted.map(x => {
+          const odds = oddsOf(h, x.text);
+          return `<tr>
+            <td>${esc(x.text)}</td>
+            <td class="num">${odds == null ? '—' : odds.toFixed(2)}</td>
+            <td class="num">${(x.weight * 100).toFixed(2)}%</td>
+            <td class="num">${(x.weight * STAKES).toFixed(2)}</td>
+            <td class="num back">${odds == null ? '—'
+              : (x.weight * STAKES * odds).toFixed(2)}</td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table>` : '<span style="color:var(--dim)">无可下注组合</span>'}
     </div>
 
     <div class="card">
@@ -319,9 +379,9 @@ async function openDetail(id){
               ${esc(m.name)}<span class="n">${m.selections.length} 项</span></h4>
             <table><tbody>
               ${m.selections.map(s => `<tr>
-                <td>${esc(s.label)}</td>
-                <td style="color:var(--muted)">${esc(s.line || '—')}</td>
-                <td style="text-align:right">${s.odds.toFixed(2)}</td>
+                <td>${esc(s.text || s.label)}</td>
+                <td style="text-align:right; font-family:ui-monospace,Consolas,monospace"
+                  >${s.odds.toFixed(2)}</td>
               </tr>`).join('')}
             </tbody></table>
           </div>`).join('')}
@@ -330,6 +390,17 @@ async function openDetail(id){
         ? '<p style="color:var(--dim); font-size:12px; margin:8px 0 0">点击盘口标题展开/收起</p>'
         : ''}
     </div>`;
+}
+
+// 从快照的盘口明细里反查某个选项的赔率，用来算「中了收回」
+function oddsOf(h, text){
+  for(const m of (h.market_detail || [])){
+    for(const s of (m.selections || [])){
+      const t = s.text || s.label;
+      if(t === text) return s.odds;
+    }
+  }
+  return null;
 }
 
 $('dwClose').addEventListener('click', () => $('overlay').classList.remove('show'));
@@ -342,6 +413,10 @@ document.addEventListener('keydown', e => {
 
 loadStats();
 loadList();
+
+// 支持 /arbitrage?id=123 直接打开某条快照 —— 便于分享和事后复查
+const _id = new URLSearchParams(location.search).get('id');
+if(_id && /^\d+$/.test(_id)) openDetail(Number(_id));
 </script>
 </body>
 </html>

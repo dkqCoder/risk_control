@@ -806,6 +806,21 @@ def _arb_row(r: dict) -> dict:
     worst = r.get('lp_worst_profit')
     gap = r.get('cross_gap')
     home, away = r['home_team'], r['away_team']
+    cost_f = float(r['cost']) if r.get('cost') is not None else None
+
+    # 收益率的来源有两个：
+    #   赛前命中 → LP 实测的最差净收益（允许部分下注，比 ILP 隐含值更优）
+    #   滚球命中 → 没跑 LP，只能由成本推算 t = 1/cost - 1
+    # 不统一的话滚球那些行「最差收益」永远是空的，页面看起来像没算出结果。
+    if worst is not None:
+        profit_pct = round(float(worst) * 100, 4)
+        profit_src = 'lp'
+    elif cost_f:
+        profit_pct = round((1.0 / cost_f - 1.0) * 100, 4)
+        profit_src = 'cost'
+    else:
+        profit_pct = None
+        profit_src = None
     return {
         'id': r['id'],
         'alert_time': _iso(r['alert_time']),
@@ -819,7 +834,8 @@ def _arb_row(r: dict) -> dict:
         'cost': float(r['cost']),
         'cost_scope': r.get('cost_scope'),
         'lp_worst_profit': float(worst) if worst is not None else None,
-        'profit_pct': round(float(worst) * 100, 4) if worst is not None else None,
+        'profit_pct': profit_pct,
+        'profit_src': profit_src,
         'cross_gap': float(gap) if gap is not None else None,
         'n_markets': int(r.get('n_markets') or 0),
         'n_selections': int(r.get('n_selections') or 0),
@@ -891,10 +907,62 @@ def arbitrage_detail(snap_id: int) -> dict:
         if not r:
             raise HTTPException(404, 'snapshot not found')
         out = _arb_row(r)
-        out['market_detail'] = json.loads(r.get('market_detail') or '[]')
+        detail = json.loads(r.get('market_detail') or '[]')
+        _annotate_detail(detail, r.get('home_team') or '',
+                         r.get('away_team') or '')
+        out['market_detail'] = detail
+        out['replay_available'] = bool(r.get('replay_context'))
         return out
     finally:
         dao.close()
+
+
+@app.get('/api/arbitrage/{snap_id}/replay')
+def replay_arbitrage(snap_id: int) -> dict:
+    """用命中时保存的证据包重新计算滚球套利，验证结果能否复现。"""
+    from analyze.live.run import replay_live_evidence
+
+    dao = _dao()
+    try:
+        r = dao.get_arbitrage(snap_id)
+        if not r:
+            raise HTTPException(404, 'snapshot not found')
+        if not r.get('is_live'):
+            raise HTTPException(400, 'replay is only available for live snapshots')
+        replay = replay_live_evidence(r.get('replay_context'))
+        replay['snapshot_id'] = snap_id
+        replay['match_id'] = r.get('match_id')
+        replay['alert_time'] = _iso(r.get('alert_time'))
+        replay['odds_updated'] = _iso(r.get('odds_updated'))
+        return replay
+    finally:
+        dao.close()
+
+
+def _annotate_detail(detail: list, home: str, away: str) -> None:
+    """给快照里的每个选项补一个可读的 text。
+
+    两种来源的格式不一样：
+      赛前命中 → group_markets 产出，label 是干净的（`over`），line 单独一列
+      滚球命中 → 直接存的是求解器的内部键（`Handicap|2:0|1`）
+
+    不统一的话，页面会把内部键原样显示成 `Handicap|2:0|1`，
+    用户看不懂这是哪个盘口的哪个选项。
+    """
+    for mk in detail:
+        name = mk.get('name') or mk.get('base') or ''
+        for s in mk.get('selections') or []:
+            lab = s.get('label') or ''
+            if '|' in lab:
+                s['text'] = describe_pick(lab, home, away)
+                parts = lab.split('|')
+                if len(parts) >= 4:
+                    s['line'] = s.get('line') or parts[2]
+                    s['label'] = parts[3]
+            else:
+                line = s.get('line') or ''
+                tail = ' '.join(x for x in (line, lab) if x)
+                s['text'] = f'{name} · {tail}' if tail else name
 
 
 # ---------------------------------------------------------------- 静态页

@@ -53,27 +53,50 @@ def test_parse_missing_pipe():
 
 
 def test_parse_skips_bad_odds():
-    """赔率不是数字的段应跳过。
+    """赔率不是数字的段应跳过，但它带的盘线名必须留下。
 
-    注意副作用：被跳过的段不会更新「当前盘线」，所以后续选项继承到的是
-    上一个有效段之前的盘线（这里是空）。这是既有行为，重构时必须保持一致。
+    这是 2026-11-13 修的 bug：原来只有解析成功才更新 current_line，
+    于是某条盘线的第一个选项无效时，盘线名就丢了，后续选项会被算到
+    上一条盘线头上（跨盘线串门）。实测导致两个 `2` 挤在同一条线下，
+    内部和只有 0.55，进而算出假套利。
     """
     mari = '1|m,1|0.5,id/1=id,abc,1,over@id,1.50,1,under|Total'
     nm, sels = parse_mari(mari)
     assert nm == 'Total'
-    assert sels == [('', 'under', 1.50)]
+    assert sels == [('0.5', 'under', 1.50)], 'under 属于 0.5 这条线'
 
 
 def test_parse_bad_odds_does_not_lose_following_line():
-    """赔率非法的段之后如果有新盘线，新盘线仍能正确接管。"""
+    """前一条盘线的第一个选项赔率非法，后续选项仍属于该盘线。"""
     mari = ('1|m,1|0.5,id/1=id,abc,1,over@id,1.50,1,under'
             '^2.5,id/1=id,1.85,1,over@id,2.01,1,under|Total')
     nm, sels = parse_mari(mari)
     assert nm == 'Total'
     assert sels == [
-        ('', 'under', 1.50),
+        ('0.5', 'under', 1.50),
         ('2.5', 'over', 1.85), ('2.5', 'under', 2.01),
     ]
+
+
+def test_locked_first_option_does_not_bleed_line():
+    """回归：某条盘线的第一个选项被锁定时，后面的选项不能串到下一条线。
+
+    实测形态（matchId ...123237，第 45 分钟 1:2）：
+        line 2:0   2 @12.50   ← 属于 2:0
+        line 2:0   X @3.55    ← 属于 2:0
+        line 2:0   2 @4.85    ← 其实属于 1:0，被错误合并
+    结果是同一条线下两个 `2`、没有 `1`，内部和 0.55。
+    """
+    mari = ('7|m,1|2:0,idA/1=idB,12.50,1,2@idC,3.55,1,X'
+            '^1:0,idD/0=idE,9.00,0,1@idF,4.85,1,2@idG,2.10,1,X|Handicap')
+    nm, sels = parse_mari(mari)
+    assert nm == 'Handicap'
+    by_line = {}
+    for line, label, odds in sels:
+        by_line.setdefault(line, []).append((label, odds))
+    assert by_line['2:0'] == [('2', 12.50), ('X', 3.55)]
+    assert by_line['1:0'] == [('2', 4.85), ('X', 2.10)], \
+        '1:0 的选项不能被算到 2:0 头上'
 
 
 # ---------- 标签含逗号的盘口（Multiscores） ----------

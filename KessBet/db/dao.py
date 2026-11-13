@@ -473,15 +473,26 @@ class Dao:
             except (ValueError, IndexError):
                 pass
 
+        hs, as_ = _i(state.get('hmp')), _i(state.get('amp'))
+
         sql = """
         INSERT INTO kessbet_match_live
           (platform, match_id, status, minute,
            home_score, away_score, home_corner, away_corner,
            home_yellow, away_yellow, home_red, away_red,
-           kickoff_time, fetched_time)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+           kickoff_time, fetched_time, score_changed_time)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
         ON DUPLICATE KEY UPDATE
           status=VALUES(status), minute=VALUES(minute),
+          -- 比分变化时刷新 score_changed_time，否则保留原值。
+          -- 判定时要用它挡掉「比分已更新、赔率还停在旧比分」的窗口：
+          -- 进球后状态 10 秒内就变了，但赔率要等平台下一次推送才更新，
+          -- 这中间拿新比分套旧赔率会算出假套利（实测 2026-11-13 11:11
+          -- Atletico Morelia Σ=0.7465，进球后赔率还停在 0:0 的价格）。
+          score_changed_time = IF(home_score <=> VALUES(home_score)
+                              AND away_score <=> VALUES(away_score),
+                              COALESCE(score_changed_time, kickoff_time),
+                              NOW()),
           home_score=VALUES(home_score), away_score=VALUES(away_score),
           home_corner=VALUES(home_corner), away_corner=VALUES(away_corner),
           home_yellow=VALUES(home_yellow), away_yellow=VALUES(away_yellow),
@@ -491,7 +502,7 @@ class Dao:
         with self.conn.cursor() as cur:
             cur.execute(sql, (
                 platform, match_id, _i(state.get('ms')), minute,
-                _i(state.get('hmp')), _i(state.get('amp')),
+                hs, as_,
                 _i(state.get('hck')), _i(state.get('ack')),
                 _i(state.get('hyc')), _i(state.get('ayc')),
                 _i(state.get('hrc')), _i(state.get('arc')),
@@ -509,7 +520,7 @@ class Dao:
         sql = """
         SELECT m.match_id, m.sport, m.home_team, m.away_team,
                m.kickoff_time, l.minute, l.status,
-               l.home_score, l.away_score,
+               l.home_score, l.away_score, l.score_changed_time,
                (SELECT MAX(o.updated_time) FROM kessbet_odds_live o
                 WHERE o.platform=m.platform AND o.match_id=m.match_id)
                    AS odds_updated
@@ -549,7 +560,7 @@ class Dao:
         sql = """
         SELECT m.match_id, m.sport, m.home_team, m.away_team,
                m.kickoff_time, l.minute, l.status,
-               l.home_score, l.away_score,
+               l.home_score, l.away_score, l.score_changed_time,
                (SELECT MAX(o.updated_time) FROM kessbet_odds_live o
                 WHERE o.platform=m.platform AND o.match_id=m.match_id)
                    AS odds_updated
@@ -578,16 +589,50 @@ class Dao:
             return cur.fetchone()[0]
 
     def get_live_selections(self, match_id: str,
-                            platform: str = 'kessbet') -> list[tuple]:
-        """读一场比赛的滚球选项，结构和 get_selections 一致。"""
+                            platform: str = 'kessbet',
+                            max_lag_sec: int | None = None) -> list[tuple]:
+        """读一场比赛的滚球选项，结构和 get_selections 一致。
+
+        max_lag_sec: 只保留「跟得上本场最新一次采集」的选项。
+            传了就丢弃 updated_time 比本场 MAX(updated_time) 早超过
+            该秒数的行。
+
+            ## 为什么需要这个（2026-11-13 实测）
+
+            `kessbet_odds_live` 里同一场比赛的新旧行能差 **2.3 小时**：
+              Portland Trail Blazers  跨度 8002s
+              New Orleans Pelicans    跨度 8354s
+
+            原因是 replace_live_odds 的删除只在**收到 WS 推送**时执行。
+            某个盘口停止推送、但其他盘口还在推 → 停了的那批行就永远
+            留在表里。而 odds_updated 取的是 MAX(updated_time)，仍然新鲜，
+            于是分析拿「1 秒前的 1x2」配「50 分钟前的 Handicap」算出
+            Σ=0.05 这种荒谬套利。
+
+            关键前提：upsert 对**每个**返回的选项都会刷新 updated_time
+            （ON DUPLICATE KEY UPDATE ... updated_time=NOW()），
+            所以「没跟上的行」= 「不在最近一次接口响应里」= 平台上已经没有了。
+            用它来判断陈旧是准确的，不是猜。
+        """
         sql = """
-        SELECT market, side, line, selection, odds
+        SELECT market, side, line, selection, odds, updated_time
         FROM kessbet_odds_live
         WHERE platform=%s AND match_id=%s
         """
         with self.conn.cursor() as cur:
             cur.execute(sql, (platform, match_id))
-            return [(r[0], r[1], r[2], r[3], float(r[4])) for r in cur.fetchall()]
+            rows = cur.fetchall()
+
+        if not rows:
+            return []
+
+        if max_lag_sec is None:
+            return [(r[0], r[1], r[2], r[3], float(r[4])) for r in rows]
+
+        newest = max(r[5] for r in rows)
+        cutoff = newest - timedelta(seconds=max_lag_sec)
+        return [(r[0], r[1], r[2], r[3], float(r[4]))
+                for r in rows if r[5] >= cutoff]
 
     def live_history_for_half_time(self, match_id: str,
                                    platform: str = 'kessbet') -> list[tuple]:
@@ -723,6 +768,21 @@ class Dao:
         fresh_keys = {(m, s, l, lab) for m, s, l, lab, _ in selections}
         stale = set(current) - fresh_keys
 
+        # 撤盘日志先写（best effort）。它和下面的替换放在同一个事务里，
+        # 但失败只记日志不回滚 —— 观察用的数据不该拖累真正的赔率更新。
+        if stale:
+            try:
+                self.log_removed(
+                    match_id,
+                    [(m, s, l, lab, current[(m, s, l, lab)])
+                     for m, s, l, lab in stale],
+                    removed_time=beijing_now(), source='live',
+                    platform=platform,
+                )
+            except Exception as e:
+                log.warning('log_removed(live) %s failed: %s', match_id, e)
+
+        removed = 0
         try:
             with self.conn.cursor() as cur:
                 if history_rows:
@@ -749,34 +809,29 @@ class Dao:
                 """, [(
                     platform, match_id, m, s, l, lab, odds, kickoff_time,
                 ) for m, s, l, lab, odds in selections])
+
+                # ★ 删除必须和 upsert 在**同一个事务**里。
+                #
+                # 原来分两次 commit：先写新赔率、再删旧行。两次提交之间
+                # 表里同时存在新旧两批数据，而分析线程每 2 秒读一次库 ——
+                # 正好撞进这个窗口就会拿到混合快照，算出假套利。
+                # 实测（2026-11-13 11:11，Atletico Morelia）：
+                #   分析读到 Σ=0.7465、收益 33.97%，但前后各查一次都正常。
+                #
+                # 这类误报偶发、且用「赔率新鲜度」过滤挡不住 ——
+                # 两批数据的时间戳都是刚才。
+                if stale:
+                    cur.executemany("""
+                    DELETE FROM kessbet_odds_live
+                    WHERE platform=%s AND match_id=%s
+                      AND market=%s AND side=%s AND line=%s AND selection=%s
+                    """, [(platform, match_id, m, s, l, lab)
+                          for m, s, l, lab in stale])
+                    removed = cur.rowcount
             self.conn.commit()
         except Exception:
             self.conn.rollback()
             raise
-
-        # 删已撤的行。放在 commit 之后单独一步：撤盘日志写失败不该
-        # 连带丢掉上面真正的赔率更新（和 writer.replace_match 同样的取舍）。
-        removed = 0
-        if stale:
-            try:
-                self.log_removed(
-                    match_id,
-                    [(m, s, l, lab, current[(m, s, l, lab)])
-                     for m, s, l, lab in stale],
-                    removed_time=beijing_now(), source='live',
-                    platform=platform,
-                )
-            except Exception as e:
-                log.warning('log_removed(live) %s failed: %s', match_id, e)
-            with self.conn.cursor() as cur:
-                cur.executemany("""
-                DELETE FROM kessbet_odds_live
-                WHERE platform=%s AND match_id=%s
-                  AND market=%s AND side=%s AND line=%s AND selection=%s
-                """, [(platform, match_id, m, s, l, lab)
-                      for m, s, l, lab in stale])
-                removed = cur.rowcount
-            self.conn.commit()
 
         return {'written': len(selections), 'changed': len(history_rows),
                 'removed': removed}
@@ -948,7 +1003,8 @@ class Dao:
                                  n_markets: int, n_selections: int,
                                  n_candidates: int, market_detail: str,
                                  odds_updated, alert_time,
-                                 is_live: int = 0) -> bool:
+                                 is_live: int = 0,
+                                 replay_context: str | None = None) -> bool:
         """写一条命中快照。返回 True 表示新写入，False 表示这份赔率已记过。
 
         唯一键 (platform, match_id, odds_updated) 负责去重：
@@ -963,8 +1019,8 @@ class Dao:
            home_team, away_team, league, kickoff_time,
            cost, cost_scope, lp_worst_profit, cross_gap,
            ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
-           market_detail, odds_updated, is_live)
-        VALUES (%s,'kessbet',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            market_detail, replay_context, odds_updated, is_live)
+        VALUES (%s,'kessbet',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON DUPLICATE KEY UPDATE id = id
         """
         with self.conn.cursor() as cur:
@@ -973,7 +1029,7 @@ class Dao:
                 home, away, league, kickoff_time,
                 cost, cost_scope, lp_worst_profit, cross_gap,
                 ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
-                market_detail, odds_updated, is_live,
+                market_detail, replay_context, odds_updated, is_live,
             ))
         self.conn.commit()
         # MySQL: INSERT 返回 1，命中重复键返回 0
@@ -1031,7 +1087,7 @@ class Dao:
                home_team, away_team, league, kickoff_time,
                cost, cost_scope, lp_worst_profit, cross_gap,
                ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
-               market_detail, odds_updated, is_live
+                market_detail, replay_context, odds_updated, is_live
         FROM kessbet_arbitrage_snapshot
         WHERE platform='kessbet' AND id=%s
         """
