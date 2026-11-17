@@ -48,6 +48,27 @@ STATES = soccer.STATES
 GHOST_ODDS = 1e9
 GHOST_DESC = '__unreachable__'
 
+# 状态空间的每队进球上限是 soccer.G-1 = 9。一旦当前比分逼近这个上限，
+# 模型就无法表示“再进一球”的终局（例如 9:0 时的 10:0），任何依赖上限
+# 边界的覆盖都可能是假的。
+#
+# 这是**临时防线**，不是完备性证明：把上限从 9 改到 20/30 只是移动漏洞
+# 边界。正式认证必须由独立的无界反例验证通过（见 docs/
+# live-arbitrage-audit-and-remediation-20261117.md F01）。
+#
+# 阈值取 G-2：8:0 时再进两球就超过上限，模型已经不可信。
+MODEL_CAP_GUARD = soccer.G - 2
+
+
+def score_space_incomplete(home: int | None, away: int | None) -> bool:
+    """当前比分是否已接近状态空间上限，导致模型不完备。
+
+    8:0 及以上（任一队）一律拒绝认证，直到无界验证器上线。
+    """
+    if home is None or away is None:
+        return True
+    return home >= MODEL_CAP_GUARD or away >= MODEL_CAP_GUARD
+
 # ---------- 参与判定的盘口 ----------
 
 # 全场结果盘。只列 covers() 支持、且语义是「比赛最终结果」的。
@@ -168,6 +189,9 @@ def build_candidates(selections, minute: int | None = None,
     """
     by_market = {}
     for mkt, side, line, lab, odds in selections:
+        # F05/v1：半场盘整体隔离。阶段来源未权威前，不用 minute 启用它们。
+        if mkt.startswith(('1st Half - ', '2nd Half - ')):
+            continue
         if not is_result_market(mkt):
             continue
         if not market_active(mkt, minute):
@@ -199,7 +223,17 @@ def build_candidates(selections, minute: int | None = None,
                     cands.append((m, odds, f'{market}|{side}|{line}|{lab}'))
                 elif lab == 'other':
                     other = odds
-            if other is not None:
+            # ★ 默认隔离 `other`，不参与认证。
+            #
+            # 平台临近结束时会锁定/撤下当前比分（3:0 等），解析器只保留
+            # 可售项，`named` 因此缺少它；`FULL & ~named` 就把当前比分补进
+            # `other`，和 Total 大球拼出假套利（2026-11-17 实测 Σ=0.33）。
+            #
+            # 平台对“其他比分”的结算规则没有可核验的定义前，不能根据
+            # 当前可售列表反推它的覆盖范围。原始 `other` 仍保留在快照里，
+            # 只是不进入求解器。
+            if other is not None and getattr(
+                    config, 'LIVE_CERTIFY_CORRECT_SCORE_OTHER', False):
                 cands.append((FULL & ~named, other, f'{market}|other'))
             continue
 
@@ -374,6 +408,18 @@ def check_match(selections, home: int, away: int,
       {'cost', 'chosen': [(desc, odds)], 'reach', 'n_candidates',
        'is_arbitrage', 'profit_pct'}
     """
+    # ★ 状态空间不完备时直接拒绝。
+    #
+    # 模型每队只到 9 球。9:0 时“再进一球”（10:0）不存在于状态空间里，
+    # Total 9.5 under + 客队 Total 0.5 over 会被算成覆盖全部 10 个可达
+    # 状态，但现实中 10:0 两条腿全输。
+    #
+    # 这是临时 guard；正式修复见 F01 的无界反例验证器。
+    if score_space_incomplete(home, away):
+        log.warning('比分接近模型上限，拒绝认证：%s:%s（每队上限 %d）',
+                    home, away, soccer.G - 1)
+        return None
+
     cands = build_candidates(selections, minute)
     if not cands:
         return None
@@ -403,14 +449,43 @@ def check_match(selections, home: int, away: int,
             continue
         chosen.append((d, odds_by_desc.get(d)))
 
+    # ★ 对外成本只能由真实下注腿计算。
+    #
+    # solver 的 cost 含幽灵候选的 1e-9（它覆盖不可达状态）；那是求解技巧，
+    # 不是可下注的价格，不能进入对外展示的成本/收益率。
+    real_cost = sum(1.0 / o for _, o in chosen if o)
+    if real_cost <= 0:
+        return None
+
+    # ★ D02：白名单 + 无界反例验证。
+    #
+    # 有限模型只负责**找候选**；只有独立验证器在整个无界比分域上找不到
+    # 亏损终局，才允许 is_arbitrage=True（进而写正式命中库）。
+    verification = None
+    is_arb = real_cost < 1.0
+    if is_arb:
+        from analyze.live import verify
+        verification = verify.verify_chosen(
+            chosen, home, away, ht_home=ht_home, ht_away=ht_away,
+        )
+        if verification['status'] == 'counterexample_found':
+            ce = verification.get('counterexample') or {}
+            log.warning(
+                '无界验证发现反例，拒绝认证 %s:%s 终局 %s:%s 返还 %.6f',
+                home, away, ce.get('home_score'), ce.get('away_score'),
+                ce.get('payout') or 0.0)
+        is_arb = verification['status'] == 'verified'
+
     return {
-        'cost': r.cost,
+        'cost': real_cost,
         'chosen': chosen,
         'reach': reach_count(rm),
         'reach_mask': rm,
         'n_candidates': len(cands),
-        'is_arbitrage': r.cost < 1.0,
-        'profit_pct': (1.0 / r.cost - 1.0) * 100 if r.cost else None,
+        'is_arbitrage': is_arb,
+        'is_candidate': real_cost < 1.0,
+        'profit_pct': (1.0 / real_cost - 1.0) * 100,
+        'verification': verification,
     }
 
 
@@ -428,23 +503,5 @@ def stakes(chosen, cost: float) -> list[tuple[str, float, float]]:
 
 
 # ---------- 半场比分 ----------
-
-def half_time_score(rows) -> tuple[int, int] | None:
-    """从赔率流水反推半场比分。
-
-    rows: [(minute, home_score, away_score), ...] 某一场的全部流水行
-
-    取 minute <= 45 的最后一条。取不到返回 None（上半场时本来就不知道）。
-
-    为什么不用 fetch_state 的 msScoreList：
-      实测当前比分 1:0 时它返回两个 0:0 的阶段快照，那是「每个阶段的
-      比分变化记录」，不是半场比分。用它构造可达终局会算错。
-    """
-    best = None
-    for minute, hs, as_ in rows:
-        if minute is None or hs is None or as_ is None:
-            continue
-        if minute <= 45:
-            if best is None or minute >= best[0]:
-                best = (minute, int(hs), int(as_))
-    return (best[1], best[2]) if best else None
+# 定义移到 common/scores.py：采集侧要把它冻结进快照，分析侧也从快照读。
+from common.scores import half_time_score  # noqa: E402,F401

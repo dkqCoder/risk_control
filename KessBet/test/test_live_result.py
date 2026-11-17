@@ -133,9 +133,8 @@ def test_first_half_markets_excluded_after_45():
         ('1st Half - 1x2', '', '', '2', 4.0),
     ])
     assert R.check_match(sels, 1, 0, minute=60) is None
-    # 同一批数据在第 30 分钟是可判的
-    r = R.check_match(sels, 1, 0, minute=30)
-    assert r is not None
+    # v1 半场盘整体隔离：第 30 分钟也不进入认证
+    assert R.check_match(sels, 1, 0, minute=30) is None
 
 
 def test_arbitrage_detected_when_odds_sum_below_one():
@@ -190,8 +189,40 @@ def test_ghost_candidate_not_in_chosen():
     assert all(d != R.GHOST_DESC for d, _ in r['chosen'])
 
 
-def test_correct_score_other_complement():
-    """Correct Score 的 other 是具名比分的补集。"""
+def test_reported_cost_excludes_ghost_candidate():
+    """对外成本只能由真实下注腿的赔率算，不能含幽灵候选的 1e-9。"""
+    sels = _sels([
+        ('1x2', '', '', '1', 3.2),
+        ('1x2', '', '', 'X', 3.2),
+        ('1x2', '', '', '2', 3.2),
+    ])
+    r = R.check_match(sels, 0, 0, minute=10)
+    expected = sum(1.0 / o for _, o in r['chosen'])
+    assert r['cost'] == pytest.approx(expected, abs=1e-12)
+
+
+def test_correct_score_other_isolated_by_default():
+    """`other` 默认不参与认证。
+
+    `other` 的覆盖集合由「当次解析成功的具名比分」求补集。平台在临近
+    结束时会把当前比分（例如 3:0）从可售列表里锁掉，解析器丢弃锁定项后，
+    `other` 就会把 3:0 算进覆盖范围，和 Total 3.5 over 拼出 Σ=0.33 的假套利。
+    在平台的结算规则固定之前，一律隔离 `other`。
+    """
+    sels = _sels([
+        ('Correct Score', '', '', '1:0', 6.75),
+        ('Correct Score', '', '', '2:0', 8.25),
+        ('Correct Score', '', '', 'other', 1.30),
+    ])
+    cands = R.build_candidates(sels, minute=50)
+    assert not any(d.endswith('|other') for _, _, d in cands)
+
+
+def test_correct_score_other_complement_when_explicitly_enabled(monkeypatch):
+    """只有显式打开开关时才生成 other（保留旧行为供规则确定后恢复）。"""
+    from collect import config
+    monkeypatch.setattr(config, 'LIVE_CERTIFY_CORRECT_SCORE_OTHER', True)
+
     sels = _sels([
         ('Correct Score', '', '', '1:0', 6.75),
         ('Correct Score', '', '', '2:0', 8.25),
@@ -204,6 +235,133 @@ def test_correct_score_other_complement():
     named = soccer.build(lambda h1, a1, h2, a2: (h2 == 1 and a2 == 0)
                          or (h2 == 2 and a2 == 0))
     assert mask == soccer.FULL & ~named
+
+
+def test_missing_current_score_does_not_create_fake_arb():
+    """回归：3:0 时 3:0 被锁定/撤下，other + 大 3.5 曾算出 Σ=0.33。
+
+    真实盘面里 3:0 仍然是具名比分（只是不可售），`other` 不包含它。
+    隔离 other 后，Total 3.5 over 覆盖不到 3:0，应判定无覆盖。
+    """
+    sels = _sels([
+        ('Correct Score', '', '', '4:0', 5.00),
+        ('Correct Score', '', '', '3:1', 7.75),
+        ('Correct Score', '', '', '4:1', 40.0),
+        ('Correct Score', '', '', '3:2', 100.0),
+        ('Correct Score', '', '', '4:2', 100.0),
+        ('Correct Score', '', '', '3:3', 100.0),
+        ('Correct Score', '', '', '4:3', 100.0),
+        ('Correct Score', '', '', '3:4', 100.0),
+        ('Correct Score', '', '', '4:4', 100.0),
+        ('Correct Score', '', '', 'other', 40.0),
+        ('Total', '', '3.5', 'over', 3.25),
+    ])
+    r = R.check_match(sels, 3, 0, minute=84, ht_home=1, ht_away=0)
+    assert r is None or not r['is_arbitrage']
+
+
+def test_high_score_space_is_incomplete():
+    """状态空间每队只到 9 球；当前 8/9 球时模型无法证明完备。"""
+    assert R.score_space_incomplete(9, 0)
+    assert R.score_space_incomplete(0, 9)
+    assert R.score_space_incomplete(8, 0)
+    assert not R.score_space_incomplete(3, 0)
+    assert not R.score_space_incomplete(7, 0)
+
+
+def test_half_markets_excluded_even_before_45():
+    """F05/v1：半场盘整体隔离，不靠 minute 启用。"""
+    sels = _sels([
+        ('1st Half - 1x2', '', '', '1', 2.0),
+        ('1st Half - 1x2', '', '', 'X', 3.0),
+        ('1st Half - 1x2', '', '', '2', 4.0),
+        ('2nd Half - 1x2', '', '', '1', 2.0),
+    ])
+    assert R.build_candidates(sels, minute=20) == []
+    assert R.build_candidates(sels, minute=60) == []
+
+
+def test_whitelist_verifier_accepts_complete_1x2():
+    """白名单内、整个组合覆盖全部结果，验证通过。"""
+    sels = _sels([
+        ('1x2', '', '', '1', 3.2),
+        ('1x2', '', '', 'X', 3.2),
+        ('1x2', '', '', '2', 3.2),
+    ])
+    r = R.check_match(sels, 0, 0, minute=10)
+    assert r['is_arbitrage'] is True
+    assert r['verification']['status'] == 'verified'
+    assert r['verification']['min_payout'] > 1.0
+
+
+def test_whitelist_verifier_accepts_total_partition():
+    """半球线 Total 的 over/under 是完整划分，验证应通过。"""
+    sels = _sels([
+        ('Total', '', '2.5', 'over', 2.1),
+        ('Total', '', '2.5', 'under', 2.1),
+    ])
+    r = R.check_match(sels, 0, 0, minute=10)
+    assert r['is_arbitrage'] is True
+    assert r['verification']['status'] == 'verified'
+
+
+def test_verifier_handles_high_score_without_total_lines():
+    """审核复现：7:0 且只有 1x2 时，代表点必须覆盖当前比分。
+
+    旧实现的代表点上界只由盘口线生成（无 Total 线时 B=3），
+    7:0 找不到任何可达点，误报 invalid_input / no_reachable_point。
+    """
+    sels = _sels([
+        ('1x2', '', '', '1', 3.2),
+        ('1x2', '', '', 'X', 3.2),
+        ('1x2', '', '', '2', 3.2),
+    ])
+    r = R.check_match(sels, 7, 0, minute=85)
+    assert r is not None
+    assert r['verification']['status'] == 'verified'
+    assert r['verification']['status'] != 'invalid_input'
+    assert r['verification']['min_payout'] > 1.0
+
+
+def test_unbounded_counterexample_at_7_0():
+    """D02 复现输入：7:0 时小 9.5 + 客队大 0.5，10:0 全输。
+
+    这个比分低于旧的 >=8 球 guard，必须靠无界验证器拦截。
+    """
+    sels = _sels([
+        ('Total', '', '9.5', 'under', 1.65),
+        ('Total', '', '9.5', 'over', 2.00),
+        ('Total', 'A', '0.5', 'over', 5.70),
+        ('Total', 'A', '0.5', 'under', 1.10),
+    ])
+    r = R.check_match(sels, 7, 0, minute=85, ht_home=3, ht_away=0)
+    assert r is not None
+    assert r['is_arbitrage'] is False
+    assert r['verification']['status'] == 'counterexample_found'
+    ce = r['verification']['counterexample']
+    assert ce['home_score'] >= 9 or ce['away_score'] >= 2
+
+
+def test_non_whitelisted_market_is_not_certified():
+    """比分盘不在白名单，不能认证。"""
+    from analyze.live import verify
+    v = verify.verify_chosen([('Correct Score|||4:0', 5.0)], 3, 0)
+    assert v['status'] == 'unsupported_rules'
+
+
+def test_high_score_fake_arb_rejected():
+    """回归：9:0 时 Total 9.5 under + Peru Total 0.5 over 曾算出 Σ=0.78。
+
+    现实里巴西再进一球就是 10:0，模型只到 9，必须直接拒绝。
+    """
+    sels = _sels([
+        ('Total', '', '9.5', 'over', 1.95),
+        ('Total', '', '9.5', 'under', 1.65),
+        ('Total', 'A', '0.5', 'over', 5.70),
+        ('Total', 'A', '0.5', 'under', 1.05),
+    ])
+    assert R.check_match(sels, 9, 0, minute=86,
+                         ht_home=2, ht_away=0) is None
 
 
 # ---------- 已确定选项的剔除（关键防线）----------

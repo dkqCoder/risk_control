@@ -27,6 +27,7 @@ import pymysql
 
 from collect import config
 from common.fingerprint import input_fingerprint
+from common.phase import classify_phase, ht_source
 from common.scores import half_time_score
 from common.timeutil import now_beijing
 
@@ -231,10 +232,14 @@ class LiveCollector:
         minute = _parse_minute(state.get('mt'))
         rows = [(s.market, s.side, s.line, s.label, float(s.odds)) for s in odds]
 
+        # 阶段与半场来源分级（F05）。分钟只作辅助，ms/补时不能冒充权威阶段。
+        phase, phase_source = classify_phase(state)
+        hts = ht_source(phase)
+
         # 半场比分在采集时冻结进快照；分析和回放都用这份值，
         # 不再在分析时另读可变的历史流水（D01 输入一致性）。
         ht = None
-        if minute is not None and minute > 45:
+        if hts == 'inferred_history' and minute is not None and minute > 45:
             try:
                 ht = half_time_score(dao.live_history_for_half_time(match_id))
             except Exception as e:
@@ -296,9 +301,6 @@ class LiveCollector:
         else:
             response_json = None
             response_hash = None
-        # Task 3 会替换为 classify_phase；先保留可追溯的占位值。
-        phase, phase_source = 'unknown', 'inferred'
-        ht_source = 'inferred_history' if ht else 'unknown'
         home_i = _to_int(state.get('hmp'))
         away_i = _to_int(state.get('amp'))
         fp = input_fingerprint(
@@ -337,7 +339,7 @@ class LiveCollector:
                 input_fingerprint=fp,
                 phase=phase,
                 phase_source=phase_source,
-                ht_source=ht_source,
+                ht_source=hts,
                 raw_payload=raw_payload,
                 rows_json=rows_json,
                 filter_policy=filter_policy,
@@ -378,7 +380,7 @@ class LiveCollector:
                 'input_fingerprint': fp,
                 'phase': phase,
                 'phase_source': phase_source,
-                'ht_source': ht_source,
+                'ht_source': hts,
                 'match_status': state.get('ms'),
                 'match_clock': state.get('mt'),
                 # 新鲜度基准 = 本地收到赔率响应的时刻，不是 DB 的 NOW()

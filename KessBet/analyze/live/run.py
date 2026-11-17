@@ -35,6 +35,16 @@ LIVE_STATE_SPACE_VERSION = 'soccer-h6-g10'
 LIVE_CANDIDATE_POLICY_VERSION = 'no-correct-score-other/v1'
 
 
+def _effective_ht(obj: dict) -> tuple[int | None, int | None]:
+    """只有权威来源的半场比分才能用于缩小认证结果域。
+
+    v1 没有 official_state 半场来源，因此实际总是返回 (None, None)。
+    """
+    if (obj or {}).get('ht_source') != 'official_state':
+        return None, None
+    return (obj or {}).get('ht_home'), (obj or {}).get('ht_away')
+
+
 def evaluate_live_match(dao, meta: dict, now) -> dict:
     """对一场滚球比赛跑「比赛结果」判定。
 
@@ -93,12 +103,13 @@ def evaluate_live_match(dao, meta: dict, now) -> dict:
         out['error'] = 'score_near_model_cap'
         return out
 
-    # 半场比分用采集时冻结进快照的值，不再在分析时另读可变流水。
-    # 快照缺 ht（上游未取到）时保持 None —— 不缩小状态空间是保守的。
-    ht_home = snap.get('ht_home')
-    ht_away = snap.get('ht_away')
+    # 半场比分用快照冻结值；但只有权威来源才允许缩小认证结果域。
+    ht_home, ht_away = _effective_ht(snap)
     out['ht_home'] = ht_home
     out['ht_away'] = ht_away
+    out['ht_source'] = snap.get('ht_source')
+    out['phase'] = snap.get('phase')
+    out['phase_source'] = snap.get('phase_source')
     out['ht'] = ((ht_home, ht_away)
                  if ht_home is not None and ht_away is not None else None)
     state_after = snap.get('state_after') or {}
@@ -143,9 +154,8 @@ def analyze_live_snapshot(dao, meta: dict, selections: list[tuple], now=None) ->
     if result.score_space_incomplete(home, away):
         return {'result': None, 'error': 'score_near_model_cap'}
 
-    # 半场比分由采集侧随快照一起传入，分析不再另读可变流水。
-    ht_home = meta.get('ht_home')
-    ht_away = meta.get('ht_away')
+    # 半场比分由采集侧随快照一起传入；仅权威来源才用于缩小结果域。
+    ht_home, ht_away = _effective_ht(meta)
     ht = ((ht_home, ht_away)
           if ht_home is not None and ht_away is not None else None)
     meta = dict(meta)
@@ -253,7 +263,9 @@ def analyze_live_once(dao, window_min: int | None = None,
         snap_meta = dict(meta)
         for k in ('minute', 'home_score', 'away_score',
                   'ht_home', 'ht_away', 'match_status', 'match_clock',
-                  'snapshot_id', 'generation', 'odds_updated'):
+                  'phase', 'phase_source', 'ht_source',
+                  'snapshot_id', 'generation', 'odds_updated',
+                  'input_fingerprint'):
             if a.get(k) is not None:
                 snap_meta[k] = a[k]
 
