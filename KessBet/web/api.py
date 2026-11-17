@@ -423,6 +423,8 @@ def _live_result_state(rc: dict, cur_sid) -> tuple[str | None, float | None]:
         if ver in ('counterexample_found', 'unsupported_rules'):
             return 'unverifiable', age
         return 'no_candidate', age
+    if raw == 'shadow_candidate':
+        return 'shadow_candidate', age
     if raw in ('expired', 'invalidated'):
         return raw, age
     return 'waiting', age

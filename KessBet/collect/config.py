@@ -85,6 +85,10 @@ LIVE_ENABLED = True
 # 修复并通过无界结果验证后再恢复；继续保留采集。
 LIVE_ANALYZE_ENABLED = False
 
+# 影子模式：独立于“是否运行分析”。开启时照常计算、写影子状态和证据包，
+# 但不写正式套利命中、不发正式机会告警。正式发布需同时设为 False。
+LIVE_SHADOW_MODE = True
+
 # 是否允许 Correct Score 的 `other`（其他比分）参与认证。
 #
 # 默认 False，且**不要轻易打开**。

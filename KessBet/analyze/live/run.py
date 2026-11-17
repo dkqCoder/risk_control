@@ -174,14 +174,21 @@ def analyze_live_snapshot(dao, meta: dict, selections: list[tuple], now=None) ->
         _persist_status(dao, meta, 'no_cover', now)
         return {'result': None, 'error': 'no_cover_or_no_candidate', 'ht': ht}
 
-    _persist_cost(dao, meta, r, ht, now)
+    shadow = bool(getattr(config, 'LIVE_SHADOW_MODE', True))
+    _persist_cost(dao, meta, r, ht, now, shadow=shadow)
     if r['is_arbitrage']:
-        log.warning('LIVE ARBITRAGE(snapshot) %s 第%s分钟 %s:%s Σ=%.4f 收益 %.2f%%',
-                    meta['match_id'], minute, home, away,
+        tag = 'SHADOW CANDIDATE(snapshot)' if shadow else 'LIVE ARBITRAGE(snapshot)'
+        log.warning('%s %s 第%s分钟 %s:%s Σ=%.4f 收益 %.2f%%',
+                    tag, meta['match_id'], minute, home, away,
                     r['cost'], r['profit_pct'])
-        snap_id = _persist_hit(dao, meta, r, now)
-        if snap_id:
-            _shoot_async(meta, r, snap_id)
+        if shadow:
+            ev = _write_evidence(dao, meta, r)
+            if ev['evidence_status'] != 'complete':
+                log.warning('影子证据包未完成 %s', meta['match_id'])
+        else:
+            snap_id = _persist_hit(dao, meta, r, now)
+            if snap_id:
+                _shoot_async(meta, r, snap_id)
     return {'result': r, 'error': None, 'ht': ht}
 
 
@@ -208,6 +215,8 @@ def analyze_live_once(dao, window_min: int | None = None,
         # 诊断模式：只算不写。
         write_hits = False
         write_costs = False
+
+    shadow = bool(getattr(config, 'LIVE_SHADOW_MODE', True))
     from datetime import datetime, timedelta, timezone
     BJ = timezone(timedelta(hours=8))
     now = datetime.now(timezone.utc).astimezone(BJ).replace(tzinfo=None)
@@ -281,7 +290,8 @@ def analyze_live_once(dao, window_min: int | None = None,
         # 赔率过期只影响「要不要告警」，不影响「算出来的成本是真是假」。
         if write_costs:
             try:
-                _persist_cost(dao, snap_meta, r, a.get('ht'), now)
+                _persist_cost(dao, snap_meta, r, a.get('ht'), now,
+                              shadow=shadow)
             except Exception as e:
                 log.exception('写滚球结果成本失败 %s: %s', meta['match_id'], e)
 
@@ -289,8 +299,10 @@ def analyze_live_once(dao, window_min: int | None = None,
         # 那是个幽灵机会（实测 Thailand 0:2 曾经报过 Σ=0.9984）。
         if r['is_arbitrage'] and not a.get('is_stale'):
             stats['hits'] += 1
-            log.warning('LIVE ARBITRAGE %s %s vs %s  第%s分钟 %s:%s  '
+            tag = 'SHADOW CANDIDATE' if shadow else 'LIVE ARBITRAGE'
+            log.warning('%s %s %s vs %s  第%s分钟 %s:%s  '
                         'Σ=%.4f  收益 %.2f%%',
+                        tag,
                         snap_meta['match_id'], snap_meta.get('home_team'),
                         snap_meta.get('away_team'), snap_meta.get('minute'),
                         snap_meta.get('home_score'),
@@ -298,7 +310,12 @@ def analyze_live_once(dao, window_min: int | None = None,
                         r['cost'], r['profit_pct'])
             for d, o, w in result.stakes(r['chosen'], r['cost']):
                 log.warning('    %-34s @ %.2f  下注 %.1f%%', d, o, w * 100)
-            if write_hits:
+            if shadow:
+                stats['shadow_hits'] = stats.get('shadow_hits', 0) + 1
+                ev = _write_evidence(dao, snap_meta, r)
+                if ev['evidence_status'] != 'complete':
+                    log.warning('影子证据包未完成 %s', meta['match_id'])
+            elif write_hits:
                 try:
                     evidence_meta = dict(snap_meta)
                     evidence_meta['snapshot_selections'] = a.get('selections') or []
@@ -362,8 +379,12 @@ def _shoot_async(meta: dict, r: dict, snap_id: int) -> None:
         log.warning('截图任务未入队 snapshot=%s（队列满）', snap_id)
 
 
-def _persist_cost(dao, meta: dict, r: dict, ht, now) -> None:
-    """写结果成本（一场一行，供列表页只读）。"""
+def _persist_cost(dao, meta: dict, r: dict, ht, now,
+                  shadow: bool = False) -> None:
+    """写结果成本（一场一行，供列表页只读）。
+
+    shadow=True 且 r.is_arbitrage 时写 shadow_candidate，不发布正式机会。
+    """
     chosen = [{'desc': d, 'odds': o, 'weight': round(w, 6)}
               for d, o, w in result.stakes(r['chosen'], r['cost'])]
     dao.write_live_result_cost(
@@ -387,10 +408,14 @@ def _persist_cost(dao, meta: dict, r: dict, ht, now) -> None:
         verification_detail=(json.dumps(r.get('verification'),
                                         ensure_ascii=False)
                              if r.get('verification') else None),
-        analysis_status='valid',
-        status_reason=((r.get('verification') or {}).get('status')
-                       or ('verified' if r.get('is_arbitrage')
-                           else 'no_candidate')),
+        analysis_status=('shadow_candidate'
+                         if shadow and r.get('is_arbitrage') else 'valid'),
+        status_reason=(
+            'shadow_candidate'
+            if shadow and r.get('is_arbitrage')
+            else ((r.get('verification') or {}).get('status')
+                  or ('verified' if r.get('is_arbitrage')
+                      else 'no_candidate'))),
         input_fingerprint=meta.get('input_fingerprint'),
     )
 
@@ -430,6 +455,64 @@ def _persist_status(dao, meta: dict, status: str, now,
     except Exception as e:
         log.warning('写滚球判定状态失败 %s/%s: %s',
                     meta.get('match_id'), status, e)
+
+
+def _write_evidence(dao, meta: dict, r: dict) -> dict:
+    """写 E1 证据包，返回 evidence 字段（不改命中表）。
+
+    影子和正式模式共用；正式模式只有 complete 才能写命中。
+    """
+    mid = meta['match_id']
+    snapshot_id = meta.get('snapshot_id') or meta.get('current_snapshot_id')
+    out = {
+        'evidence_id': None, 'evidence_status': 'failed',
+        'evidence_path': None, 'manifest_hash': None,
+        'analysis_id': snapshot_id, 'snapshot_id': snapshot_id,
+    }
+    try:
+        if not snapshot_id or not hasattr(dao, 'get_live_snapshot'):
+            raise RuntimeError('no snapshot id for evidence')
+        snap = dao.get_live_snapshot(mid, snapshot_id)
+        if not snap:
+            raise RuntimeError('snapshot not found')
+        resp = snap.get('response_json') or {}
+        snap_ev = dict(snap)
+        snap_ev.update({
+            'status': resp.get('status'),
+            'response_status': resp.get('response_status'),
+            'response_headers': resp.get('response_headers'),
+            'raw_body': resp.get('raw_body'),
+            'markets': resp.get('markets') or snap.get('raw_payload'),
+        })
+        from common.evidence import write_evidence_package
+        evidence_path = os.path.join(
+            config.LIVE_EVIDENCE_DIR, mid, str(snapshot_id))
+        manifest = write_evidence_package(
+            evidence_path, snap_ev,
+            {
+                'analysis_id': snapshot_id,
+                'analyzer_version': LIVE_ANALYZER_VERSION,
+                'state_space_version': LIVE_STATE_SPACE_VERSION,
+                'candidate_policy_version': LIVE_CANDIDATE_POLICY_VERSION,
+                'expected': {
+                    'cost': r.get('cost'),
+                    'chosen': r.get('chosen'),
+                    'n_candidates': r.get('n_candidates'),
+                    'is_arbitrage': r.get('is_arbitrage'),
+                    'is_candidate': r.get('is_candidate'),
+                },
+                'verification': r.get('verification'),
+            },
+            r.get('verification') or {})
+        with open(os.path.join(evidence_path, 'manifest.json'), 'rb') as f:
+            manifest_hash = hashlib.sha256(f.read()).hexdigest()
+        out.update({
+            'evidence_id': snapshot_id, 'evidence_status': 'complete',
+            'evidence_path': evidence_path, 'manifest_hash': manifest_hash,
+        })
+    except Exception as e:
+        log.exception('证据包写入失败 %s: %s', mid, e)
+    return out
 
 
 def _persist_hit(dao, meta: dict, r: dict, now) -> int | None:
@@ -515,44 +598,12 @@ def _persist_hit(dao, meta: dict, r: dict, now) -> int | None:
     }
 
     # ★ Task 6：正式命中先落 E1 证据包；包不完整就不写正式命中。
-    snapshot_id = meta.get('snapshot_id') or meta.get('current_snapshot_id')
-    evidence_id = evidence_status = evidence_path = manifest_hash = None
-    try:
-        if not snapshot_id or not hasattr(dao, 'get_live_snapshot'):
-            raise RuntimeError('no snapshot id for evidence')
-        snap = dao.get_live_snapshot(mid, snapshot_id)
-        if not snap:
-            raise RuntimeError('snapshot not found')
-        resp = snap.get('response_json') or {}
-        snap_ev = dict(snap)
-        snap_ev.update({
-            'status': resp.get('status'),
-            'response_status': resp.get('response_status'),
-            'response_headers': resp.get('response_headers'),
-            'raw_body': resp.get('raw_body'),
-            'markets': resp.get('markets') or snap.get('raw_payload'),
-        })
-        from common.evidence import write_evidence_package
-        evidence_path = os.path.join(
-            config.LIVE_EVIDENCE_DIR, mid, str(snapshot_id))
-        manifest = write_evidence_package(
-            evidence_path, snap_ev,
-            {
-                'analysis_id': snapshot_id,
-                'analyzer_version': LIVE_ANALYZER_VERSION,
-                'state_space_version': LIVE_STATE_SPACE_VERSION,
-                'candidate_policy_version': LIVE_CANDIDATE_POLICY_VERSION,
-                'expected': replay_context['expected'],
-                'verification': r.get('verification'),
-            },
-            r.get('verification') or {})
-        with open(os.path.join(evidence_path, 'manifest.json'), 'rb') as f:
-            manifest_hash = hashlib.sha256(f.read()).hexdigest()
-        evidence_id = snapshot_id
-        evidence_status = 'complete'
-    except Exception as e:
-        log.exception('证据包写入失败 %s: %s', mid, e)
-        evidence_status = 'failed'
+    ev = _write_evidence(dao, meta, r)
+    snapshot_id = ev['snapshot_id']
+    evidence_id = ev['evidence_id']
+    evidence_status = ev['evidence_status']
+    evidence_path = ev['evidence_path']
+    manifest_hash = ev['manifest_hash']
     if evidence_status != 'complete':
         log.warning('证据包未完成，不写正式命中 %s', mid)
         return None
