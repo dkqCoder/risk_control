@@ -14,7 +14,7 @@ from Crypto.Cipher import AES
 from curl_cffi import requests as creq
 
 from common.models import Match
-from common.timeutil import from_ts
+from common.timeutil import from_ts, now_beijing
 from collect import config
 from collect.kessbet.parse import parse_mari, parse_market_id
 
@@ -75,27 +75,81 @@ class KessbetHttp:
 
     # ---------- 底层 ----------
 
-    def _post(self, action: str, body: dict) -> dict:
+    def _post_result(self, action: str, body: dict) -> dict:
+        """HTTP 边界的结构化结果，保留真实响应文本、状态码和请求信封。
+
+        不抛异常（Forbidden 也作为 error_kind 返回），让调用方能区分
+        transport_error / protocol_error / ok_empty。`_post()` 负责保持
+        旧的抛异常接口。
+        """
         payload = encrypt({'header': _header(action), 'body': body})
+        request = {
+            'action': action,
+            'body': body,
+            'url': API,
+            'method': 'POST',
+        }
+        result = {
+            'ok': False, 'data': None, 'raw_body': None,
+            'response_status': None, 'response_headers': {},
+            'error': None, 'error_kind': None,
+            'request': request, 'platform_ts': None,
+            'received_at': None,
+        }
         last_err = None
         for attempt in range(config.HTTP_RETRIES + 1):
             try:
                 r = self.session.post(API, data=payload, headers=HEADERS,
                                       timeout=self.timeout)
+                result['response_status'] = r.status_code
+                result['raw_body'] = r.text
+                result['response_headers'] = {
+                    'content-type': r.headers.get('content-type'),
+                    'date': r.headers.get('date'),
+                }
+                result['received_at'] = now_beijing()
                 if r.status_code == 403:
-                    raise ForbiddenError('Cloudflare 403 — 检查代理')
+                    result['error_kind'] = 'forbidden'
+                    result['error'] = 'Cloudflare 403 — 检查代理'
+                    return result
                 r.raise_for_status()
-                j = r.json()
-                if j.get('code') != 1:
-                    raise RuntimeError(f'code={j.get("code")} msg={j.get("msg")}')
-                return j['data']
+                try:
+                    j = r.json()
+                except Exception as e:
+                    result['error_kind'] = 'protocol'
+                    result['error'] = f'bad_json: {e}'
+                    return result
+                if not isinstance(j, dict) or j.get('code') != 1:
+                    result['error_kind'] = 'protocol'
+                    code = j.get('code') if isinstance(j, dict) else None
+                    msg = j.get('msg') if isinstance(j, dict) else None
+                    result['error'] = f'code={code} msg={msg}'
+                    if isinstance(j, dict):
+                        result['platform_ts'] = j.get('sct')
+                    return result
+                result['ok'] = True
+                result['data'] = j.get('data')
+                result['platform_ts'] = j.get('sct')
+                return result
             except ForbiddenError:
-                raise                       # 不重试
+                raise
             except Exception as e:
                 last_err = e
+                result['error_kind'] = 'transport'
+                result['error'] = str(e)
                 if attempt < config.HTTP_RETRIES:
                     time.sleep(1.0 * (attempt + 1))
-        raise last_err
+        if last_err is not None:
+            result['error'] = str(last_err)
+        return result
+
+    def _post(self, action: str, body: dict) -> dict:
+        res = self._post_result(action, body)
+        if res['ok']:
+            return res['data']
+        if res.get('error_kind') == 'forbidden':
+            raise ForbiddenError(res.get('error') or 'Cloudflare 403')
+        raise RuntimeError(res.get('error') or 'request failed')
 
     # ---------- 赛程 ----------
 
@@ -208,10 +262,57 @@ class KessbetHttp:
 
     # ---------- 单场盘口 ----------
 
+    def fetch_raw_result(self, match_id: str) -> dict:
+        """拉单场全部盘口，返回结构化结果（F03）。
+
+        status:
+          ok_nonempty    成功且有可解析盘口
+          ok_empty       成功且明确返回空列表（不是网络失败）
+          transport_error 超时/403/连接失败/服务端错误
+          protocol_error  HTTP 成功但响应结构/业务码不对
+          parsed_empty   原始市场非空，但全部锁定/无法解析
+        """
+        res = self._post_result(ACTION_MATCH, {'matchId': match_id})
+        out = {
+            'status': 'ok_nonempty', 'markets': [],
+            'raw_body': res.get('raw_body'),
+            'response_status': res.get('response_status'),
+            'response_headers': res.get('response_headers') or {},
+            'request': res.get('request'),
+            'error': res.get('error'),
+            'platform_ts': res.get('platform_ts'),
+            'received_at': res.get('received_at'),
+        }
+        if not res.get('ok'):
+            kind = res.get('error_kind')
+            out['status'] = ('transport_error'
+                             if kind in ('transport', 'forbidden')
+                             else 'protocol_error')
+            return out
+
+        data = res.get('data')
+        if not isinstance(data, list):
+            out['status'] = 'protocol_error'
+            out['error'] = 'response data is not a list'
+            return out
+        out['markets'] = data
+        if not data:
+            out['status'] = 'ok_empty'
+            return out
+
+        usable = 0
+        for mk in data:
+            if not isinstance(mk, dict):
+                continue
+            name, sels = parse_mari(mk.get('mari') or '')
+            if name and sels:
+                usable += 1
+        out['status'] = 'ok_nonempty' if usable else 'parsed_empty'
+        return out
+
     def fetch_raw(self, match_id: str) -> list[dict]:
-        """拉单场全部盘口，返回原始列表。"""
-        data = self._post(ACTION_MATCH, {'matchId': match_id})
-        return data if isinstance(data, list) else []
+        """拉单场全部盘口，返回原始列表（兼容旧调用）。"""
+        return self.fetch_raw_result(match_id)['markets']
 
     def fetch_state(self, match_id: str) -> dict | None:
         """拉单场比赛状态（比分、时间、红黄牌）。
@@ -245,11 +346,21 @@ class KessbetHttp:
 
         home / away 用于拆分队名盘口（如 'Arsenal Total' -> side='H'）。
         """
+        return self.fetch_odds_with_raw(match_id, home, away)[0]
+
+    def fetch_odds_with_raw(self, match_id: str, home: str = '',
+                            away: str = '') -> tuple[list, list]:
+        """同一次请求返回 (解析后的 Selection 列表, 原始盘口列表)。
+
+        原始列表必须和解析结果来自**同一次 HTTP 响应** —— 命中后不能
+        再请求一次 raw 来冒充命中输入（赔率早就变了）。
+        """
         from common.models import Selection
         from collect.kessbet.parse import split_team
 
+        raw = self.fetch_raw(match_id)
         out = []
-        for mk in self.fetch_raw(match_id):
+        for mk in raw:
             mari = mk.get('mari') or ''
             name, sels = parse_mari(mari)
             if not name:
@@ -257,4 +368,4 @@ class KessbetHttp:
             side, base = split_team(name, home, away)
             for line, label, odds in sels:
                 out.append(Selection(base, side, line, label, odds))
-        return out
+        return out, raw
