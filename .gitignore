@@ -31,3 +31,8 @@ KessBet/deploy/.env
 
 # 日志的运行产物：*.out 是启动脚本的重定向兜底文件
 KessBet/logs/*.out
+# 按天切分的运行日志不进版本库
+KessBet/logs/
+
+# Playwright MCP 的产物
+.playwright-mcp/

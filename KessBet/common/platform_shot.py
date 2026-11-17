@@ -104,12 +104,44 @@ class _Cdp:
             pass
 
 
-def capture_match(match_id: str, out_path: str,
-                  width: int = 1500, height: int = 1400) -> tuple[bool, str]:
-    """截一张平台官网的单场滚球页。返回 (成功?, 说明)。"""
+_shot_seq = 0
+
+
+def _ts(t: float) -> str:
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t))
+
+
+def _finish(result: dict) -> dict:
+    result['capture_finished_at'] = _ts(time.time())
+    result['elapsed_sec'] = round(
+        time.time() - time.mktime(time.strptime(
+            result['capture_started_at'], '%Y-%m-%d %H:%M:%S')), 2)
+    return result
+
+
+def capture_match_meta(match_id: str, out_path: str,
+                       width: int = 1500, height: int = 2600) -> dict:
+    """截一张平台官网单场页，返回结构化结果（含实际 tab 和页面身份）。
+
+    D03：每次任务使用独立的端口和临时 profile，避免多个 worker 连到
+    同一个 CDP 页面/互相导航。调用方应通过 shot_queue 串行调度。
+    """
+    global _shot_seq
+    result = {
+        'ok': False, 'path': out_path, 'match_id': match_id,
+        'url': MATCH_URL % match_id, 'page_url': None,
+        'tab': None, 'coverage': 'none', 'reason': None,
+        # 即使点击了 All，也只证明 tab 被点开；没有逐项核对目标选项、
+        # 赔率和锁定状态。页面截图始终是辅助证据，不能升级为页面报价已核验。
+        'page_verified': False,
+        'coverage_note': '需逐项 DOM/网络核对，当前仅记录 tab 与截图',
+        'capture_started_at': _ts(time.time()),
+        'capture_finished_at': None, 'elapsed_sec': None,
+    }
     browser = find_browser()
     if not browser:
-        return False, 'no_browser'
+        result['reason'] = 'no_browser'
+        return _finish(result)
 
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     try:
@@ -118,58 +150,107 @@ def capture_match(match_id: str, out_path: str,
     except OSError:
         pass
 
-    port = 9333
-    profile = os.path.join(tempfile.gettempdir(), 'kessbet_shot_profile')
-    proc = subprocess.Popen(
-        [browser, '--headless=new', '--disable-gpu', '--no-sandbox',
-         '--hide-scrollbars', f'--remote-debugging-port={port}',
-         f'--user-data-dir={profile}', f'--window-size={width},{height}',
-         'about:blank'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-
+    profile = tempfile.mkdtemp(prefix='kessbet_shot_')
+    proc = None
     cdp = None
     try:
-        import requests
-        for _ in range(60):
+        # 端口用 0：让 Chrome 自己选，再读 profile 里的
+        # DevToolsActivePort。固定端口会和系统动态端口/并发任务冲突
+        # （2026-11-17 实测 9401 连不上，port=0 正常）。
+        proc = subprocess.Popen(
+            [browser, '--headless=new', '--disable-gpu', '--no-sandbox',
+             '--hide-scrollbars', '--remote-debugging-port=0',
+             f'--user-data-dir={profile}', f'--window-size={width},{height}',
+             'about:blank'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+
+        port = None
+        port_file = os.path.join(profile, 'DevToolsActivePort')
+        for _ in range(80):
             try:
-                if requests.get(f'http://127.0.0.1:{port}/json/version',
-                                timeout=1).ok:
-                    break
-            except Exception:
-                pass
-            time.sleep(0.25)
-        else:
-            return False, 'cdp_not_ready'
+                with open(port_file, encoding='utf-8') as f:
+                    port = int(f.readline().strip())
+                break
+            except (OSError, ValueError):
+                time.sleep(0.25)
+        if not port:
+            result['reason'] = 'cdp_not_ready'
+            return _finish(result)
 
         cdp = _Cdp(port)
         cdp.call('Page.enable')
-        cdp.call('Page.navigate', url=MATCH_URL % match_id)
+        cdp.call('Page.navigate', url=result['url'])
         time.sleep(_LOAD_SEC)
 
-        # 点一下 Main tab —— 不点的话赔率不渲染，截出来只有盘口名
-        cdp.eval("""
+        # 页面身份校验：必须真的落在本场比赛的单场页，不能截到首页。
+        href = cdp.eval('location.href')
+        result['page_url'] = href
+        want = result['url'].split('?')[0]
+        if not href or not str(href).startswith(want):
+            result['reason'] = 'wrong_page'
+            return _finish(result)
+
+        # 点 All 而不是 Main。Main 不含团队总进球/Correct Score 等，
+        # 点了 Main 的图只能算部分覆盖，不能宣称完整。
+        tab = cdp.eval("""
         (() => {
-          const el = [...document.querySelectorAll('*')]
-            .filter(e => e.children.length === 0 &&
-                         (e.innerText || '').trim() === 'Main');
-          if (el.length) { el[0].click(); return 'clicked'; }
+          const pick = name => [...document.querySelectorAll('*')]
+            .find(e => e.children.length === 0 &&
+                       (e.innerText || '').trim() === name);
+          const all = pick('All');
+          if (all) { all.click(); return 'all'; }
+          const main = pick('Main');
+          if (main) { main.click(); return 'main'; }
           return 'no_tab';
         })()
         """)
+        result['tab'] = tab
+        if tab == 'all':
+            result['coverage'] = 'all'
+        elif tab == 'main':
+            result['coverage'] = 'partial'
+            result['reason'] = 'all_tab_missing'
+        else:
+            result['coverage'] = 'none'
+            result['reason'] = 'no_tab'
+        log.info('平台截图 tab=%s coverage=%s %s',
+                 tab, result['coverage'], match_id)
         time.sleep(_AFTER_CLICK_SEC)
 
         cdp.shot(out_path)
         if os.path.isfile(out_path) and os.path.getsize(out_path) > 1024:
-            return True, out_path
-        return False, 'empty_file'
+            # no_tab 时赔率没渲染，图只有盘口名，不能算成功。
+            result['ok'] = tab in ('all', 'main')
+            if not result['ok']:
+                result['reason'] = 'target_not_rendered'
+        else:
+            result['reason'] = 'empty_file'
     except Exception as e:
+        result['reason'] = str(e)
         log.warning('平台截图失败 %s: %s', match_id, e)
-        return False, str(e)
     finally:
         if cdp:
             cdp.close()
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        import shutil
+        shutil.rmtree(profile, ignore_errors=True)
+    return _finish(result)
+
+
+def capture_match(match_id: str, out_path: str,
+                  width: int = 1500,
+                  height: int = 2600) -> tuple[bool, str]:
+    """兼容旧调用：返回 (成功?, 路径/失败原因)。"""
+    r = capture_match_meta(match_id, out_path, width=width, height=height)
+    if r['ok']:
+        return True, r['path']
+    return False, r.get('reason') or 'capture_failed'

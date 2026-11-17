@@ -40,7 +40,7 @@ def test_shoot_async_disabled_does_nothing(monkeypatch):
     monkeypatch.setattr(screenshot, 'capture',
                         lambda *a, **k: called.append(a) or (True, 'x'))
 
-    L._shoot_async({'match_id': 'm1'}, {'cost': 0.9})
+    L._shoot_async({'match_id': 'm1'}, {'cost': 0.9}, 1)
     assert called == [], '开关关闭时不该截图'
 
 
@@ -61,13 +61,15 @@ def test_shoot_async_captures_platform_and_local(monkeypatch, tmp_path):
 
     got = {}
     monkeypatch.setattr(
-        platform_shot, 'capture_match',
-        lambda mid, path, **k: got.update(platform=(mid, path)) or (True, path))
+        platform_shot, 'capture_match_meta',
+        lambda mid, path, **k: got.update(platform=(mid, path)) or {
+            'ok': True, 'path': path, 'tab': 'all', 'coverage': 'all',
+            'reason': None})
     monkeypatch.setattr(
         screenshot, 'capture',
         lambda url, path, **k: got.update(local=(url, path)) or (True, path))
 
-    L._shoot_async({'match_id': '245123456789'}, {'cost': 0.9})
+    L._shoot_async({'match_id': '245123456789'}, {'cost': 0.9}, 486)
     for _ in range(100):
         if len(got) == 2:
             break
@@ -76,12 +78,12 @@ def test_shoot_async_captures_platform_and_local(monkeypatch, tmp_path):
     assert 'platform' in got, '没有截平台官网'
     assert got['platform'][0] == '245123456789'
     assert os.path.basename(got['platform'][1]).endswith(
-        '_245123456789_kessbet.png')
+        '_245123456789_486_kessbet.png')
 
-    assert 'local' in got, '没有截本地详情页'
-    assert got['local'][0] == 'http://x/live/245123456789'
+    assert 'local' in got, '没有截本地证据页'
+    assert got['local'][0] == 'http://x/evidence/486'
     assert os.path.basename(got['local'][1]).endswith(
-        '_245123456789_local.png')
+        '_245123456789_486_local.png')
 
     name = os.path.basename(got['platform'][1])
     assert name[:8].isdigit() and name[8] == '-', '时间戳格式应为 YYYYMMDD-HHMMSS'

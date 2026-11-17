@@ -254,6 +254,10 @@ async function loadList(){
   }
 
   $('content').innerHTML = `
+    <div class="banner warn">
+      ⚠ 滚球命中是<b>内部候选</b>：尚未通过无界覆盖和官网核验，判定已暂停。
+      点击行内「证据」查看原始接口响应；赛前命中不受此提示影响。
+    </div>
     <table>
       <thead><tr>
         <th>告警时间</th><th>开赛</th><th>比赛</th>
@@ -266,7 +270,8 @@ async function loadList(){
           <td class="alert-time">${(h.kickoff_time||'').slice(5,16)}</td>
           <td class="teams">${h.home_team}
             <small>vs ${h.away_team} · ${h.league||'—'} ·
-              <span class="mid">${h.match_id}</span></small></td>
+              <span class="mid">${h.match_id}</span>${
+                h.is_live ? ' · <b style="color:var(--warning)">滚球·未核验</b>' : ''}</small></td>
           <td class="num cost">${h.cost.toFixed(4)}</td>
           <td class="num profit ${pctClass(h.profit_pct)}">${pct(h.profit_pct, 2)}</td>
           <td class="num" style="color:var(--dim)">${h.n_markets}/${h.n_selections}</td>
@@ -315,20 +320,26 @@ async function openDetail(id){
   const lpSorted = [...h.lp_chosen].sort((a, b) => b.weight - a.weight);
   const STAKES = 1000;
   const backPerState = h.cost > 0 ? STAKES / h.cost : null;
+  const isLive = !!h.is_live;
 
   $('dwBody').innerHTML = `
     <div class="meta-bar">
       <span>matchId <b>${esc(h.match_id)}</b></span>
-      <span>${h.is_live ? '滚球' : '赛前'}</span>
+      <span>${isLive ? '滚球 · 内部候选' : '赛前'}</span>
       <span>开赛 <b>${esc(h.kickoff_time || '—')}</b></span>
       <span>赔率版本 <b>${esc(h.odds_updated || '—')}</b></span>
       <span>快照时间 <b>${esc(h.alert_time || '—')}</b></span>
+      ${isLive ? `<span><a href="/evidence/${h.id}" target="_blank"
+        rel="noopener">打开证据页</a></span>` : ''}
     </div>
 
-    <div class="verdict ${isArb ? 'ok' : 'no'}">
-      <div class="big">${isArb ? '✓ 套利' : '✗ 无套利'}</div>
+    ${isLive ? `<div class="banner warn">滚球命中尚未通过无界覆盖与官网核验，
+      只能作为<b>内部候选</b>查看；证据页保存了同一次请求的原始接口响应。</div>` : ''}
+
+    <div class="verdict ${isLive ? '' : (isArb ? 'ok' : 'no')}">
+      <div class="big">${isLive ? '内部候选（未核验）' : (isArb ? '✓ 套利' : '✗ 无套利')}</div>
       <div class="cost">成本 <b>${h.cost.toFixed(6)}</b></div>
-      <div class="profit">${profitFrom}
+      <div class="profit">${isLive ? '计算时' : ''}${profitFrom}
         <b>${profitPct == null ? '—' : (profitPct >= 0 ? '+' : '') + profitPct.toFixed(2) + '%'}</b>
       </div>
       ${backPerState
