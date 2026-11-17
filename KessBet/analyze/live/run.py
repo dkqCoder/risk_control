@@ -189,6 +189,9 @@ def analyze_live_snapshot(dao, meta: dict, selections: list[tuple], now=None) ->
             snap_id = _persist_hit(dao, meta, r, now)
             if snap_id:
                 _shoot_async(meta, r, snap_id)
+            else:
+                # 证据包失败：撤销 verified_candidate，保留可重试原因。
+                _persist_status(dao, meta, 'evidence_failed', now)
     return {'result': r, 'error': None, 'ht': ht}
 
 
@@ -335,6 +338,9 @@ def analyze_live_once(dao, window_min: int | None = None,
                     if snap_id:
                         # 只有首次持久化成功的路径截图，避免即时分析和兜底扫描重复留证。
                         _shoot_async(meta, r, snap_id)
+                    else:
+                        _persist_status(dao, snap_meta,
+                                        'evidence_failed', now, a)
                 except Exception as e:
                     log.exception('写滚球命中快照失败 %s: %s',
                                   meta['match_id'], e)

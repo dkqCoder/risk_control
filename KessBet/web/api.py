@@ -425,6 +425,8 @@ def _live_result_state(rc: dict, cur_sid) -> tuple[str | None, float | None]:
         return 'no_candidate', age
     if raw == 'shadow_candidate':
         return 'shadow_candidate', age
+    if raw == 'evidence_failed':
+        return 'unverifiable', age
     if raw in ('expired', 'invalidated'):
         return raw, age
     return 'waiting', age

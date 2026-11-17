@@ -555,7 +555,9 @@ class Dao:
           AND NOT EXISTS (
               SELECT 1 FROM kessbet_live_result_cost c
               WHERE c.platform=m.platform AND c.match_id=m.match_id
-                AND c.snapshot_id = l.current_snapshot_id)
+                AND c.snapshot_id = l.current_snapshot_id
+                AND (c.analysis_status IS NULL
+                     OR c.analysis_status <> 'evidence_failed'))
         ORDER BY m.kickoff_time
         """
         with self.conn.cursor(pymysql.cursors.DictCursor) as cur:

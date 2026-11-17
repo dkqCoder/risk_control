@@ -115,3 +115,31 @@ def test_post_raises_forbidden_for_legacy_callers():
         pass
     else:
         raise AssertionError('expected ForbiddenError')
+
+
+def test_fetch_odds_raises_on_transport(monkeypatch):
+    """旧接口 fetch_odds 不能把网络失败变成空市场。"""
+    monkeypatch.setattr(
+        KessbetHttp, 'fetch_odds_result',
+        lambda *a, **k: ([], {'status': 'transport_error',
+                              'error': 'timeout',
+                              'error_kind': 'transport'}, []))
+    try:
+        KessbetHttp().fetch_odds('m1')
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('fetch_odds should raise on transport_error')
+
+
+def test_fetch_raw_raises_on_protocol(monkeypatch):
+    monkeypatch.setattr(
+        KessbetHttp, 'fetch_raw_result',
+        lambda *a, **k: {'status': 'protocol_error', 'markets': [],
+                         'error': 'bad', 'error_kind': 'protocol'})
+    try:
+        KessbetHttp().fetch_raw('m1')
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('fetch_raw should raise on protocol_error')

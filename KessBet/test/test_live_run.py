@@ -260,3 +260,37 @@ def test_replay_accepts_equivalent_alternative_optimum(monkeypatch):
     assert replay['ok'] is True
     assert replay['exact_match'] is False
     assert replay['alternative_optimum'] is True
+
+
+def test_evidence_failure_marks_result_unverifiable(monkeypatch):
+    """Important：证据包失败时不能继续发布 verified_candidate。"""
+    monkeypatch.setattr(L.config, 'LIVE_ANALYZE_ENABLED', True)
+    monkeypatch.setattr(L.config, 'LIVE_SHADOW_MODE', False)
+
+    class Dao:
+        def __init__(self):
+            self.calls = []
+
+        def live_analyze_pending(self, _window):
+            return [_meta(current_snapshot_id='s1', generation=1)]
+
+        def write_live_result_cost(self, **kw):
+            self.calls.append(kw)
+
+    monkeypatch.setattr(L, 'evaluate_live_match', lambda *a, **k: {
+        'result': _arbitrage_result(), 'error': None, 'ht': None,
+        'ht_home': None, 'ht_away': None, 'selections': [],
+        'is_stale': False, 'minute': 30, 'home_score': 0,
+        'away_score': 0, 'match_status': 7, 'match_clock': '30:00',
+        'phase': 'first_half', 'phase_source': 'inferred',
+        'ht_source': 'unknown', 'snapshot_id': 's1', 'generation': 1,
+        'input_fingerprint': 'f' * 64,
+        'odds_updated': _meta()['odds_updated'],
+    })
+    monkeypatch.setattr(L, '_persist_hit', lambda *a, **k: None)
+    monkeypatch.setattr(L, '_shoot_async', lambda *a, **k: None)
+
+    d = Dao()
+    L.analyze_live_once(d)
+
+    assert d.calls[-1]['analysis_status'] == 'evidence_failed'

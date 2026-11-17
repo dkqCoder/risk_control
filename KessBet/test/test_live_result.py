@@ -590,3 +590,19 @@ def test_half_time_score_none_if_no_first_half_rows():
 def test_half_time_score_ignores_null_minute():
     rows = [(None, 0, 0), (30, 1, 0), (None, 5, 5)]
     assert R.half_time_score(rows) == (1, 0)
+
+
+def test_solver_pool_is_restricted_to_whitelist():
+    """非白名单盘口不能抢走已验证的白名单组合。"""
+    sels = _sels([
+        ('1x2', '', '', '1', 3.2),
+        ('1x2', '', '', 'X', 3.2),
+        ('1x2', '', '', '2', 3.2),
+        ('Handicap', '', '0:0', '1', 3.4),
+        ('Handicap', '', '0:0', 'X', 3.4),
+        ('Handicap', '', '0:0', '2', 3.4),
+    ])
+    r = R.check_match(sels, 0, 0, minute=10)
+    assert r is not None
+    assert r['verification']['status'] == 'verified'
+    assert all(d.startswith('1x2') for d, _ in r['chosen'])

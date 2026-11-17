@@ -280,6 +280,7 @@ class KessbetHttp:
             'response_headers': res.get('response_headers') or {},
             'request': res.get('request'),
             'error': res.get('error'),
+            'error_kind': res.get('error_kind'),
             'platform_ts': res.get('platform_ts'),
             'received_at': res.get('received_at'),
         }
@@ -311,8 +312,17 @@ class KessbetHttp:
         return out
 
     def fetch_raw(self, match_id: str) -> list[dict]:
-        """拉单场全部盘口，返回原始列表（兼容旧调用）。"""
-        return self.fetch_raw_result(match_id)['markets']
+        """拉单场全部盘口，返回原始列表（兼容旧调用）。
+
+        旧调用方（赛前 refresher）依赖“失败会抛异常”的语义：不能把
+        网络/协议失败伪装成空市场，否则一次超时可能被当成整场撤盘。
+        """
+        res = self.fetch_raw_result(match_id)
+        if res['status'] in ('transport_error', 'protocol_error'):
+            if res.get('error_kind') == 'forbidden':
+                raise ForbiddenError(res.get('error') or 'Cloudflare 403')
+            raise RuntimeError(res.get('error') or res['status'])
+        return res['markets']
 
     def fetch_state(self, match_id: str) -> dict | None:
         """拉单场比赛状态（比分、时间、红黄牌）。
@@ -345,8 +355,15 @@ class KessbetHttp:
         """拉单场全部盘口，解析成 Selection 列表。
 
         home / away 用于拆分队名盘口（如 'Arsenal Total' -> side='H'）。
+        保持旧语义：transport/protocol 失败抛异常，不能变成空市场。
         """
-        return self.fetch_odds_with_raw(match_id, home, away)[0]
+        out, res, _identity = self.fetch_odds_result(
+            match_id, home, away)
+        if res.get('status') in ('transport_error', 'protocol_error'):
+            if res.get('error_kind') == 'forbidden':
+                raise ForbiddenError(res.get('error') or 'Cloudflare 403')
+            raise RuntimeError(res.get('error') or res.get('status'))
+        return out
 
     def fetch_odds_result(self, match_id: str, home: str = '',
                           away: str = '') -> tuple[list, dict, list]:

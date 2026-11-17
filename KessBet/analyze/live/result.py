@@ -421,6 +421,16 @@ def check_match(selections, home: int, away: int,
         return None
 
     cands = build_candidates(selections, minute)
+    # ★ 求解池只保留白名单市场：否则非白名单组合可能因为成本略低
+    # 抢走真正可认证的白名单组合，最后验证器只能返回 unsupported_rules。
+    # build_candidates 仍保留完整盘口（诊断/回放用），这里只过滤求解池。
+    from analyze.live.verify import is_whitelisted
+    certified = []
+    for mask, odds, desc in cands:
+        p = str(desc).split('|')
+        if len(p) == 4 and is_whitelisted(p[0], p[1], p[2], p[3]):
+            certified.append((mask, odds, desc))
+    cands = certified
     if not cands:
         return None
 
