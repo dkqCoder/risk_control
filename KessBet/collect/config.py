@@ -200,6 +200,11 @@ LIVE_SHOT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     'data', 'screenshots')
 
+# E1 证据包目录（不可变，按 evidence_id 一包一目录；data/ 已在 .gitignore）。
+LIVE_EVIDENCE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'data', 'evidence')
+
 # 从滚球列表接口（00232）拉哪些运动。
 #
 # 为什么要单独一份：赛程接口(00252)只返回未开赛的比赛，滚球要靠

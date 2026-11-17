@@ -17,8 +17,10 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import signal
 import time
 
@@ -512,6 +514,49 @@ def _persist_hit(dao, meta: dict, r: dict, now) -> int | None:
         'raw': raw_obj,
     }
 
+    # ★ Task 6：正式命中先落 E1 证据包；包不完整就不写正式命中。
+    snapshot_id = meta.get('snapshot_id') or meta.get('current_snapshot_id')
+    evidence_id = evidence_status = evidence_path = manifest_hash = None
+    try:
+        if not snapshot_id or not hasattr(dao, 'get_live_snapshot'):
+            raise RuntimeError('no snapshot id for evidence')
+        snap = dao.get_live_snapshot(mid, snapshot_id)
+        if not snap:
+            raise RuntimeError('snapshot not found')
+        resp = snap.get('response_json') or {}
+        snap_ev = dict(snap)
+        snap_ev.update({
+            'status': resp.get('status'),
+            'response_status': resp.get('response_status'),
+            'response_headers': resp.get('response_headers'),
+            'raw_body': resp.get('raw_body'),
+            'markets': resp.get('markets') or snap.get('raw_payload'),
+        })
+        from common.evidence import write_evidence_package
+        evidence_path = os.path.join(
+            config.LIVE_EVIDENCE_DIR, mid, str(snapshot_id))
+        manifest = write_evidence_package(
+            evidence_path, snap_ev,
+            {
+                'analysis_id': snapshot_id,
+                'analyzer_version': LIVE_ANALYZER_VERSION,
+                'state_space_version': LIVE_STATE_SPACE_VERSION,
+                'candidate_policy_version': LIVE_CANDIDATE_POLICY_VERSION,
+                'expected': replay_context['expected'],
+                'verification': r.get('verification'),
+            },
+            r.get('verification') or {})
+        with open(os.path.join(evidence_path, 'manifest.json'), 'rb') as f:
+            manifest_hash = hashlib.sha256(f.read()).hexdigest()
+        evidence_id = snapshot_id
+        evidence_status = 'complete'
+    except Exception as e:
+        log.exception('证据包写入失败 %s: %s', mid, e)
+        evidence_status = 'failed'
+    if evidence_status != 'complete':
+        log.warning('证据包未完成，不写正式命中 %s', mid)
+        return None
+
     snap_id = dao.write_arbitrage_snapshot(
         match_id=mid,
         sport=meta.get('sport') or 'sr:sport:1',
@@ -536,6 +581,11 @@ def _persist_hit(dao, meta: dict, r: dict, now) -> int | None:
         alert_time=now,
         is_live=1,
         input_fingerprint=fp,
+        evidence_id=evidence_id,
+        evidence_status=evidence_status,
+        evidence_path=evidence_path,
+        manifest_hash=manifest_hash,
+        analysis_id=snapshot_id,
     )
     if snap_id:
         log.warning('滚球命中已保存 %s snapshot=%s  (Σ=%.4f, 可达终局 %d)',

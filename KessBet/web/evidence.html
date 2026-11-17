@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Odds Monitor · 命中证据</title>
+<style>
+:root{
+  --bg:#e9ebee; --panel:#ffffff; --panel2:#f4f5f7; --line:#c9cfd6;
+  --fg:#15181c; --dim:#4a525c; --muted:#7a838d;
+  --good:#0a6e0a; --warning:#8a5a00; --critical:#b01818; --accent:#1f6fd0;
+}
+*{box-sizing:border-box}
+body{margin:0; background:var(--bg); color:var(--fg);
+  font:14px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+header{background:var(--panel); border-bottom:1px solid var(--line)}
+header .inner{max-width:1240px; margin:0 auto; padding:16px 22px}
+h1{font-size:18px; margin:0 0 6px; font-weight:600}
+.sub{color:var(--dim); font-size:12px}
+.wrap{max-width:1240px; margin:0 auto; padding:18px 22px 60px}
+.card{background:var(--panel); border:1px solid var(--line); border-radius:8px;
+  padding:14px 16px; margin-bottom:14px}
+.card h2{font-size:13px; margin:0 0 10px; font-weight:600; color:var(--accent)}
+.badge{display:inline-block; font-size:12px; padding:2px 9px; border-radius:999px;
+  border:1px solid var(--line); background:var(--panel2); margin-right:8px}
+.badge.warn{color:var(--warning); border-color:rgba(138,90,0,.4); background:rgba(138,90,0,.08)}
+.badge.ok{color:var(--good); border-color:rgba(10,110,10,.4); background:rgba(10,110,10,.08)}
+.kv{display:flex; flex-wrap:wrap; gap:10px 26px; margin-top:8px}
+.kv div{font-size:12px; color:var(--dim)}
+.kv b{color:var(--fg); font-variant-numeric:tabular-nums}
+table{width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums}
+th{font-size:11px; color:var(--dim); font-weight:500; text-align:left;
+  padding:7px 9px; border-bottom:1px solid var(--line); white-space:nowrap}
+th.num, td.num{text-align:right}
+td{padding:7px 9px; font-size:12.5px; border-bottom:1px solid rgba(201,207,214,.5)}
+tr:last-child td{border-bottom:none}
+code,pre{font-family:ui-monospace,Consolas,monospace}
+pre{background:var(--panel2); border:1px solid var(--line); border-radius:6px;
+  padding:10px; overflow:auto; font-size:11px; line-height:1.5; margin:8px 0}
+details summary{cursor:pointer; color:var(--accent); font-size:12px}
+.note{font-size:12px; color:var(--muted); line-height:1.7}
+.warnbox{border-left:3px solid var(--warning); background:rgba(138,90,0,.06);
+  padding:8px 12px; font-size:12px; color:var(--warning); margin-bottom:12px}
+.empty{padding:30px; text-align:center; color:var(--muted)}
+</style>
+</head>
+<body>
+<header><div class="inner">
+  <h1 id="title">命中证据 · 加载中…</h1>
+  <div class="sub" id="sub"></div>
+</div></header>
+
+<div class="wrap">
+  <div id="root"><div class="empty">加载中…</div></div>
+</div>
+
+<script>
+const SNAP = Number(location.pathname.split('/').filter(Boolean).pop());
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+function fmt(v, n=2){ return v == null ? '—' : Number(v).toFixed(n); }
+
+async function load(){
+  if (!SNAP){ $('root').innerHTML = '<div class="empty">缺少 snapshot id</div>'; return; }
+  let d;
+  try{
+    const r = await fetch('/api/evidence/' + SNAP);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    d = await r.json();
+  }catch(e){
+    $('title').textContent = '证据加载失败';
+    $('root').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    return;
+  }
+
+  const ev = d.evidence || {};
+  const rc = d.replay || {};
+  const expected = rc.expected || {};
+  const chosen = (d.lp_chosen || []);
+  const oddsByDesc = new Map((expected.chosen || []).map(x => [x[0], x[1]]));
+  const ver = ev.verification || {};
+  const pkg = ev.package || null;
+  const pkgNote = pkg
+    ? `证据包已生成：${Object.keys(pkg.files || {}).length} 个文件，`
+      + `manifest ${ev.manifest_hash ? ev.manifest_hash.slice(0, 12) : ''}…`
+    : '';
+  let verNote = '';
+  if (ver.status === 'verified'){
+    verNote = `无界验证通过：最低返还 ${Number(ver.min_payout).toFixed(4)}，`
+            + `检查 ${ver.cells} 个代表终局。`;
+  }else if (ver.status === 'counterexample_found'){
+    const ce = ver.counterexample || {};
+    verNote = `无界验证发现亏损反例：${ce.home_score}:${ce.away_score} `
+            + `返还 ${Number(ce.payout || 0).toFixed(4)}。`;
+  }else if (ver.status === 'unsupported_rules'){
+    verNote = '包含非白名单市场，未做无界认证。';
+  }
+
+  $('title').textContent =
+    `${d.home_team} vs ${d.away_team}`;
+  $('sub').textContent =
+    `${d.league || '—'} · 开赛 ${d.kickoff_time || '—'} · 快照 #${d.id}`;
+
+  const stake = 10000;
+  const chosenRows = chosen.map(x => {
+    const odds = oddsByDesc.get(x.desc);
+    const w = x.weight == null ? null : Number(x.weight);
+    const back = (odds != null && w != null) ? w * stake * odds : null;
+    return `<tr>
+      <td>${esc(x.text || x.desc)}</td>
+      <td class="num">${odds == null ? '—' : Number(odds).toFixed(2)}</td>
+      <td class="num">${w == null ? '—' : (w * 100).toFixed(1) + '%'}</td>
+      <td class="num">${w == null ? '—' : Math.round(w * stake)}</td>
+      <td class="num">${back == null ? '—' : back.toFixed(0)}</td>
+    </tr>`;
+  }).join('');
+
+  const parsedRows = (rc.selections || []).map(s => `
+    <tr>
+      <td>${esc(s[0])}</td>
+      <td>${esc(s[1] || '')}</td>
+      <td>${esc(s[2] || '')}</td>
+      <td>${esc(s[3])}</td>
+      <td class="num">${Number(s[4]).toFixed(2)}</td>
+    </tr>`).join('');
+
+  const raw = rc.raw;
+  let rawBlock;
+  if (!raw){
+    rawBlock = `<div class="warnbox">没有同请求原始响应。这份快照只能算
+      <b>仅内部记录</b>，不能证明平台当时返回了什么。</div>`;
+  }else{
+    const markets = raw.markets || [];
+    const marketRows = markets.map((mk, i) => {
+      const mari = mk.mari || '';
+      const name = mari.includes('|') ? mari.split('|').pop() : '';
+      return `<tr>
+        <td>${i + 1}</td>
+        <td>${esc(name)}</td>
+        <td><code style="font-size:10.5px;word-break:break-all">${esc(mari)}</code></td>
+      </tr>`;
+    }).join('');
+    rawBlock = `
+      <div class="kv">
+        <div>原始响应时间 <b>${esc(raw.fetched_time || '—')}</b></div>
+        <div>盘口数 <b>${markets.length}</b></div>
+        <div>平台比赛状态 <b>${esc((raw.state || {}).ms ?? '—')}</b></div>
+        <div>平台时钟 <b>${esc((raw.state || {}).mt ?? '—')}</b></div>
+      </div>
+      <table style="margin-top:10px">
+        <thead><tr><th>#</th><th>盘口</th><th>原始 mari 串</th></tr></thead>
+        <tbody>${marketRows}</tbody>
+      </table>
+      <details style="margin-top:10px">
+        <summary>查看完整原始 JSON</summary>
+        <pre>${esc(JSON.stringify(raw, null, 2))}</pre>
+      </details>`;
+  }
+
+  $('root').innerHTML = `
+    <div class="card">
+      <h2>判定状态</h2>
+      <div>
+        <span class="badge ${ver.status === 'verified' ? 'ok' : 'warn'}">${
+          esc(ev.analysis_status_text || '内部候选')}</span>
+        <span class="badge ${ev.raw_available ? 'ok' : 'warn'}"
+              title="${esc(ev.level_text || '')}">${
+          esc(ev.level_label || '仅内部记录')}</span>
+      </div>
+      ${verNote ? `<p class="note" style="margin:8px 0 0">${esc(verNote)}</p>` : ''}
+      ${pkgNote ? `<p class="note" style="margin:6px 0 0">${esc(pkgNote)}</p>` : ''}
+      <p class="note" style="margin:6px 0 0">
+        证据等级：<b>仅内部记录</b>（无原始接口数据）→
+        <b>原始接口已存</b>（有同请求响应，未做官网核验）→
+        <b>接口报价已核验</b>（可作正式证据；实际成交仍需受理记录）。
+      </p>
+      <div class="kv">
+        <div>计算时比分 <b>${esc(rc.home_score)} : ${esc(rc.away_score)}</b></div>
+        <div>分钟 <b>${esc(rc.minute ?? '—')}</b></div>
+        <div>半场 <b>${rc.ht_home == null ? '—' : esc(rc.ht_home + ' : ' + rc.ht_away)}</b></div>
+        <div>命中时间 <b>${esc(d.alert_time || '—')}</b></div>
+        <div>赔率版本 <b>${esc(d.odds_updated || '—')}</b></div>
+        <div>成本 Σ <b>${fmt(d.cost, 4)}</b></div>
+        <div>${ver.status === 'verified' ? '验证后最低收益'
+              : '模型隐含收益（未验证）'} <b>${
+          d.profit_pct == null ? '—'
+            : (d.profit_pct >= 0 ? '+' : '') + Number(d.profit_pct).toFixed(2) + '%'}</b></div>
+      </div>
+      <p class="note" style="margin:10px 0 0">
+        这是<b>内部计算候选</b>。成本 &lt; 1 只说明在模型的结果空间里存在一组
+        覆盖；是否真实可下注，还要看原始接口响应、结算规则和无界覆盖验证。
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>组合与配资</h2>
+      ${chosen.length ? `
+      <table>
+        <thead><tr>
+          <th>选项</th><th class="num">赔率</th><th class="num">下注比例</th>
+          <th class="num">投 ${stake} 元</th><th class="num">中了收回</th>
+        </tr></thead>
+        <tbody>${chosenRows}</tbody>
+      </table>
+      <p class="note" style="margin:8px 0 0">
+        覆盖重叠时各结果返还更高；上表「中了收回」按单腿计算，不是最坏情况。
+      </p>` : '<div class="empty">没有可下注组合</div>'}
+    </div>
+
+    <div class="card">
+      <h2>同请求原始接口响应（主证据）</h2>
+      ${rawBlock}
+    </div>
+
+    <div class="card">
+      <h2>解析后参与判定的选项（${(rc.selections || []).length} 条）</h2>
+      <table>
+        <thead><tr>
+          <th>盘口</th><th>归属</th><th>盘线</th><th>选项</th><th class="num">赔率</th>
+        </tr></thead>
+        <tbody>${parsedRows || '<tr><td colspan="5" class="empty">无</td></tr>'}</tbody>
+      </table>
+      <p class="note" style="margin:8px 0 0">
+        注意：解析器会丢弃锁定项（原始串里 <code>,0,</code>）。原始串里
+        有、这里没有的选项，就是被平台锁定/过滤掉的。
+      </p>
+    </div>
+  `;
+}
+
+load();
+</script>
+</body>
+</html>

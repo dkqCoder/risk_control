@@ -980,6 +980,12 @@ def _arb_row(r: dict) -> dict:
                       for x in json.loads(r.get('lp_chosen') or '[]')],
         'odds_updated': _iso(r.get('odds_updated')),
         'is_live': bool(r.get('is_live')),
+        'evidence_id': r.get('evidence_id'),
+        'evidence_status': r.get('evidence_status'),
+        'evidence_path': r.get('evidence_path'),
+        'manifest_hash': r.get('manifest_hash'),
+        'analysis_id': r.get('analysis_id'),
+        'input_fingerprint': r.get('input_fingerprint'),
     }
 
 
@@ -1104,6 +1110,26 @@ def evidence_detail(snap_id: int) -> dict:
             'analysis_status_text': analysis_text,
             'verification': ver,
         }
+        # Task 6：优先读取不可变证据包 manifest。
+        pkg_path = r.get('evidence_path')
+        if pkg_path:
+            manifest_path = os.path.join(pkg_path, 'manifest.json')
+            if os.path.isfile(manifest_path):
+                try:
+                    with open(manifest_path, encoding='utf-8') as f:
+                        manifest = json.load(f)
+                except (OSError, ValueError):
+                    manifest = None
+                if manifest:
+                    out['evidence'].update({
+                        'level': 'E1',
+                        'level_label': '原始接口已存',
+                        'level_text': '证据包已生成（含 manifest/SHA-256）',
+                        'package': manifest,
+                        'package_path': pkg_path,
+                        'evidence_status': r.get('evidence_status'),
+                        'manifest_hash': r.get('manifest_hash'),
+                    })
         return out
     finally:
         dao.close()

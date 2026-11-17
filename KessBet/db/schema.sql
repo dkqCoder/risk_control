@@ -942,6 +942,13 @@ CREATE TABLE IF NOT EXISTS kessbet_arbitrage_snapshot (
     input_fingerprint CHAR(64) DEFAULT NULL
         COMMENT '输入指纹；同一输入不重复写正式命中',
 
+    evidence_id     VARCHAR(40) DEFAULT NULL,
+    evidence_status VARCHAR(16) DEFAULT NULL
+        COMMENT 'pending/complete/failed',
+    evidence_path   VARCHAR(255) DEFAULT NULL,
+    manifest_hash   CHAR(64) DEFAULT NULL,
+    analysis_id     VARCHAR(40) DEFAULT NULL,
+
     odds_updated   DATETIME     DEFAULT NULL
         COMMENT '这份快照对应的赔率版本（odds_prematch 的 MAX(updated_time)）。
                  与 match_id 一起做唯一键，保证同一份赔率只记一次',

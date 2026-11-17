@@ -1298,7 +1298,12 @@ class Dao:
                                  odds_updated, alert_time,
                                  is_live: int = 0,
                                  replay_context: str | None = None,
-                                 input_fingerprint: str | None = None) -> int | None:
+                                 input_fingerprint: str | None = None,
+                                 evidence_id: str | None = None,
+                                 evidence_status: str | None = None,
+                                 evidence_path: str | None = None,
+                                 manifest_hash: str | None = None,
+                                 analysis_id: str | None = None) -> int | None:
         """写一条命中快照。返回新快照 id；重复赔率已记过时返回 None。
 
         唯一键 (platform, match_id, odds_updated) 负责去重：
@@ -1314,8 +1319,9 @@ class Dao:
            cost, cost_scope, lp_worst_profit, cross_gap,
            ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
             market_detail, replay_context, odds_updated, is_live,
-           input_fingerprint)
-        VALUES (%s,'kessbet',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           input_fingerprint, evidence_id, evidence_status, evidence_path,
+           manifest_hash, analysis_id)
+        VALUES (%s,'kessbet',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON DUPLICATE KEY UPDATE id = id
         """
         with self.conn.cursor() as cur:
@@ -1325,7 +1331,8 @@ class Dao:
                 cost, cost_scope, lp_worst_profit, cross_gap,
                 ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
                 market_detail, replay_context, odds_updated, is_live,
-                input_fingerprint,
+                input_fingerprint, evidence_id, evidence_status, evidence_path,
+                manifest_hash, analysis_id,
             ))
             new_id = cur.lastrowid if n == 1 else None
         self.conn.commit()
@@ -1396,7 +1403,9 @@ class Dao:
                home_team, away_team, league, kickoff_time,
                cost, cost_scope, lp_worst_profit, cross_gap,
                ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
-                market_detail, replay_context, odds_updated, is_live
+                market_detail, replay_context, odds_updated, is_live,
+                input_fingerprint, evidence_id, evidence_status,
+                evidence_path, manifest_hash, analysis_id
         FROM kessbet_arbitrage_snapshot
         WHERE platform='kessbet' AND id=%s
         """
