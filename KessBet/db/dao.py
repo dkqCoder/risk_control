@@ -3,6 +3,7 @@
 **线程安全**：每个线程持有独立的连接（threading.local）。
 pymysql.Connection 不是线程安全的，多线程共享会导致连接错乱。
 """
+import json
 import logging
 import os
 import threading
@@ -451,11 +452,15 @@ class Dao:
             return list(cur.fetchall())
 
     def save_live_state(self, match_id: str, state: dict, kickoff_time,
-                        platform: str = 'kessbet') -> None:
-        """写比赛实时状态（一场一行，覆盖）。
+                        platform: str = 'kessbet',
+                        commit: bool = True) -> bool:
+        """写比赛实时状态（一场一行，覆盖），返回比分/状态是否变化。
 
-        state 是 ACTION=0014 的原始响应。字段都是字符串，
-        这里统一转 int —— 存成字符串会让后续比较和计算变麻烦。
+        比分或阶段（ms）变化时，SQL 会把 current_snapshot_id 置空 ——
+        旧快照对应的机会立即失效，直到下一次赔率快照成功写入。
+        调用方（状态轮询路径）应根据返回值排队重新拉赔率。
+
+        commit=False 用于把状态、赔率、快照放进同一个事务（D01）。
         """
         def _i(v):
             if v in (None, '', '-'):
@@ -483,12 +488,16 @@ class Dao:
            kickoff_time, fetched_time, score_changed_time)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
         ON DUPLICATE KEY UPDATE
+          -- ★ 必须放在最前面：用旧值判断比分/阶段是否变化，
+          -- 变化时立即清空 current_snapshot_id，旧机会不再有效。
+          -- 位置在 status/home_score 赋值之前，否则比较的是新值。
+          current_snapshot_id = IF(
+              home_score <=> VALUES(home_score)
+              AND away_score <=> VALUES(away_score)
+              AND status <=> VALUES(status),
+              current_snapshot_id, NULL),
           status=VALUES(status), minute=VALUES(minute),
           -- 比分变化时刷新 score_changed_time，否则保留原值。
-          -- 判定时要用它挡掉「比分已更新、赔率还停在旧比分」的窗口：
-          -- 进球后状态 10 秒内就变了，但赔率要等平台下一次推送才更新，
-          -- 这中间拿新比分套旧赔率会算出假套利（实测 2026-11-13 11:11
-          -- Atletico Morelia Σ=0.7465，进球后赔率还停在 0:0 的价格）。
           score_changed_time = IF(home_score <=> VALUES(home_score)
                               AND away_score <=> VALUES(away_score),
                               COALESCE(score_changed_time, kickoff_time),
@@ -499,16 +508,26 @@ class Dao:
           home_red=VALUES(home_red), away_red=VALUES(away_red),
           kickoff_time=VALUES(kickoff_time), fetched_time=NOW()
         """
+        new_status = _i(state.get('ms'))
         with self.conn.cursor() as cur:
+            cur.execute("""SELECT status, home_score, away_score
+                           FROM kessbet_match_live
+                           WHERE platform=%s AND match_id=%s FOR UPDATE""",
+                        (platform, match_id))
+            old = cur.fetchone()
             cur.execute(sql, (
-                platform, match_id, _i(state.get('ms')), minute,
+                platform, match_id, new_status, minute,
                 hs, as_,
                 _i(state.get('hck')), _i(state.get('ack')),
                 _i(state.get('hyc')), _i(state.get('ayc')),
                 _i(state.get('hrc')), _i(state.get('arc')),
                 kickoff_time,
             ))
-        self.conn.commit()
+        changed = bool(old is not None and (
+            old[0] != new_status or old[1] != hs or old[2] != as_))
+        if commit:
+            self.conn.commit()
+        return changed
 
     def live_analyze_pending(self, window_min: int = 150,
                              platform: str = 'kessbet') -> list[dict]:
@@ -521,6 +540,7 @@ class Dao:
         SELECT m.match_id, m.sport, m.home_team, m.away_team,
                m.kickoff_time, l.minute, l.status,
                l.home_score, l.away_score, l.score_changed_time,
+               l.current_snapshot_id, l.generation,
                (SELECT MAX(o.updated_time) FROM kessbet_odds_live o
                 WHERE o.platform=m.platform AND o.match_id=m.match_id)
                    AS odds_updated
@@ -531,15 +551,11 @@ class Dao:
           AND m.sport='sr:sport:1'
           AND m.kickoff_time <= NOW()
           AND m.kickoff_time > NOW() - INTERVAL %s MINUTE
-          AND EXISTS (SELECT 1 FROM kessbet_odds_live o
-                      WHERE o.platform=m.platform AND o.match_id=m.match_id)
+          AND l.current_snapshot_id IS NOT NULL
           AND NOT EXISTS (
               SELECT 1 FROM kessbet_live_result_cost c
               WHERE c.platform=m.platform AND c.match_id=m.match_id
-                AND c.computed_time >= (
-                  SELECT MAX(o2.updated_time)
-                  FROM kessbet_odds_live o2
-                  WHERE o2.platform=m.platform AND o2.match_id=m.match_id))
+                AND c.snapshot_id = l.current_snapshot_id)
         ORDER BY m.kickoff_time
         """
         with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
@@ -561,6 +577,7 @@ class Dao:
         SELECT m.match_id, m.sport, m.home_team, m.away_team,
                m.kickoff_time, l.minute, l.status,
                l.home_score, l.away_score, l.score_changed_time,
+               l.current_snapshot_id, l.generation,
                (SELECT MAX(o.updated_time) FROM kessbet_odds_live o
                 WHERE o.platform=m.platform AND o.match_id=m.match_id)
                    AS odds_updated
@@ -571,8 +588,7 @@ class Dao:
           AND m.sport='sr:sport:1'
           AND m.kickoff_time <= NOW()
           AND m.kickoff_time > NOW() - INTERVAL %s MINUTE
-          AND EXISTS (SELECT 1 FROM kessbet_odds_live o
-                      WHERE o.platform=m.platform AND o.match_id=m.match_id)
+          AND l.current_snapshot_id IS NOT NULL
         ORDER BY m.kickoff_time
         """
         with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
@@ -657,38 +673,83 @@ class Dao:
             cur.execute(sql, (platform, match_id))
             return [(r[0], r[1], r[2]) for r in cur.fetchall()]
 
-    def write_live_result_cost(self, match_id: str, kickoff_time, cost: float,
+    def write_live_result_cost(self, match_id: str, kickoff_time,
+                               cost: float | None,
                                profit_pct, chosen: str, reach_states: int,
                                n_candidates: int, minute, home_score,
                                away_score, ht_home, ht_away,
                                odds_updated, computed_time,
-                               platform: str = 'kessbet') -> None:
+                               platform: str = 'kessbet',
+                               snapshot_id: str | None = None,
+                               generation: int = 0,
+                               verification_status: str | None = None,
+                               verification_detail: str | None = None,
+                               analysis_status: str = 'valid',
+                               input_fingerprint: str | None = None) -> None:
         """写一场比赛的「比赛结果」套利判定（一场一行，覆盖）。
 
-        和窗口成本不同，这个**不删旧行** —— 一场比赛只有一个结果判定，
-        UPSERT 就够了。窗口盘是一场多行、会随时间增删，才需要先删后插。
+        D01/D02：写入必须带 snapshot_id + generation。
+        旧 generation 的分析晚完成时，用 IF(...) 条件写入阻止它覆盖新结果。
+
+        cost=None + analysis_status=no_cover/no_data/... 表示当前快照
+        没有判定结果；这也会覆盖旧成本，避免页面继续显示旧机会。
         """
         sql = """
         INSERT INTO kessbet_live_result_cost
           (platform, match_id, cost, profit_pct, chosen, reach_states,
            n_candidates, minute, home_score, away_score, ht_home, ht_away,
-           kickoff_time, odds_updated, computed_time)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           kickoff_time, odds_updated, computed_time,
+           snapshot_id, generation, verification_status, verification_detail,
+           analysis_status, input_fingerprint)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON DUPLICATE KEY UPDATE
-          cost=VALUES(cost), profit_pct=VALUES(profit_pct),
-          chosen=VALUES(chosen), reach_states=VALUES(reach_states),
-          n_candidates=VALUES(n_candidates), minute=VALUES(minute),
-          home_score=VALUES(home_score), away_score=VALUES(away_score),
-          ht_home=VALUES(ht_home), ht_away=VALUES(ht_away),
-          kickoff_time=VALUES(kickoff_time),
-          odds_updated=VALUES(odds_updated),
-          computed_time=VALUES(computed_time)
+          cost = IF(VALUES(generation) >= generation, VALUES(cost), cost),
+          profit_pct = IF(VALUES(generation) >= generation,
+                          VALUES(profit_pct), profit_pct),
+          chosen = IF(VALUES(generation) >= generation,
+                      VALUES(chosen), chosen),
+          reach_states = IF(VALUES(generation) >= generation,
+                            VALUES(reach_states), reach_states),
+          n_candidates = IF(VALUES(generation) >= generation,
+                            VALUES(n_candidates), n_candidates),
+          minute = IF(VALUES(generation) >= generation,
+                      VALUES(minute), minute),
+          home_score = IF(VALUES(generation) >= generation,
+                          VALUES(home_score), home_score),
+          away_score = IF(VALUES(generation) >= generation,
+                          VALUES(away_score), away_score),
+          ht_home = IF(VALUES(generation) >= generation,
+                       VALUES(ht_home), ht_home),
+          ht_away = IF(VALUES(generation) >= generation,
+                       VALUES(ht_away), ht_away),
+          kickoff_time = IF(VALUES(generation) >= generation,
+                            VALUES(kickoff_time), kickoff_time),
+          odds_updated = IF(VALUES(generation) >= generation,
+                            VALUES(odds_updated), odds_updated),
+          computed_time = IF(VALUES(generation) >= generation,
+                             VALUES(computed_time), computed_time),
+          snapshot_id = IF(VALUES(generation) >= generation,
+                           VALUES(snapshot_id), snapshot_id),
+          verification_status = IF(VALUES(generation) >= generation,
+                                   VALUES(verification_status),
+                                   verification_status),
+          verification_detail = IF(VALUES(generation) >= generation,
+                                   VALUES(verification_detail),
+                                   verification_detail),
+          analysis_status = IF(VALUES(generation) >= generation,
+                               VALUES(analysis_status), analysis_status),
+          input_fingerprint = IF(VALUES(generation) >= generation,
+                                 VALUES(input_fingerprint),
+                                 input_fingerprint),
+          generation = GREATEST(generation, VALUES(generation))
         """
         with self.conn.cursor() as cur:
             cur.execute(sql, (
                 platform, match_id, cost, profit_pct, chosen, reach_states,
                 n_candidates, minute, home_score, away_score, ht_home, ht_away,
                 kickoff_time, odds_updated, computed_time,
+                snapshot_id, generation, verification_status,
+                verification_detail, analysis_status, input_fingerprint,
             ))
         self.conn.commit()
 
@@ -701,7 +762,9 @@ class Dao:
         sql = f"""
         SELECT match_id, cost, profit_pct, chosen, reach_states,
                n_candidates, minute, home_score, away_score,
-               ht_home, ht_away, computed_time
+               ht_home, ht_away, computed_time, verification_status,
+               verification_detail, analysis_status, snapshot_id, generation,
+               odds_updated, input_fingerprint
         FROM kessbet_live_result_cost
         WHERE platform=%s AND match_id IN ({ph})
         """
@@ -717,6 +780,13 @@ class Dao:
                     'home_score': r[7], 'away_score': r[8],
                     'ht_home': r[9], 'ht_away': r[10],
                     'computed_time': r[11],
+                    'verification_status': r[12],
+                    'verification_detail': r[13],
+                    'analysis_status': r[14],
+                    'snapshot_id': r[15],
+                    'generation': r[16],
+                    'odds_updated': r[17],
+                    'input_fingerprint': r[18],
                 }
             return out
 
@@ -726,7 +796,8 @@ class Dao:
 
     def replace_live_odds(self, match_id: str, kickoff_time, selections,
                           minute=None, home_score=None, away_score=None,
-                          platform: str = 'kessbet') -> dict:
+                          platform: str = 'kessbet',
+                          commit: bool = True) -> dict:
         """整场替换滚球赔率：写流水 + upsert 当前值 + 删除接口里没有的行。
 
         selections: [(market, side, line, selection, odds), ...]
@@ -828,13 +899,217 @@ class Dao:
                     """, [(platform, match_id, m, s, l, lab)
                           for m, s, l, lab in stale])
                     removed = cur.rowcount
-            self.conn.commit()
+            if commit:
+                self.conn.commit()
         except Exception:
             self.conn.rollback()
             raise
 
         return {'written': len(selections), 'changed': len(history_rows),
                 'removed': removed}
+
+    # ---------- 不可变输入快照（D01） ----------
+
+    def bump_live_generation(self, match_id: str,
+                             platform: str = 'kessbet') -> int:
+        """把本场 generation 加一并返回新值。
+
+        必须在调用方的事务里执行（不 commit）。行由 save_live_state
+        先行插入/更新，所以这里一定找得到。
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("""UPDATE kessbet_match_live
+                           SET generation = generation + 1
+                           WHERE platform=%s AND match_id=%s""",
+                        (platform, match_id))
+            cur.execute("""SELECT generation FROM kessbet_match_live
+                           WHERE platform=%s AND match_id=%s""",
+                        (platform, match_id))
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def save_live_snapshot(self, *, snapshot_id: str, match_id: str,
+                           generation: int, request_started_at,
+                           response_received_at, state_before, state_after,
+                           minute, home_score, away_score,
+                           ht_home=None, ht_away=None,
+                           raw_payload: str, rows_json: str,
+                           filter_policy: str = '',
+                           request_json: str | None = None,
+                           response_json: str | None = None,
+                           response_hash: str | None = None,
+                           parser_version: str | None = None,
+                           input_fingerprint: str | None = None,
+                           phase: str | None = None,
+                           phase_source: str | None = None,
+                           ht_source: str | None = None,
+                           platform: str = 'kessbet',
+                           commit: bool = False) -> None:
+        """写一份不可变输入快照（不默认 commit，和赔率同一事务）。
+
+        raw_payload、rows_json、state_after、ht_* 必须来自同一次采集，
+        分析/回放都用这份冻结值，不能再读可变的赔率流水。
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO kessbet_live_snapshot
+              (snapshot_id, platform, match_id, generation,
+               request_started_at, response_received_at,
+               state_before, state_after, minute, home_score, away_score,
+               ht_home, ht_away,
+               request_json, response_json, response_hash, parser_version,
+               input_fingerprint, phase, phase_source, ht_source,
+               raw_payload, rows_json, filter_policy, created_time)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+            """, (
+                snapshot_id, platform, match_id, generation,
+                request_started_at, response_received_at,
+                state_before, state_after, minute, home_score, away_score,
+                ht_home, ht_away,
+                request_json, response_json, response_hash, parser_version,
+                input_fingerprint, phase, phase_source, ht_source,
+                raw_payload, rows_json, filter_policy,
+            ))
+        if commit:
+            self.conn.commit()
+
+    def set_current_snapshot(self, match_id: str, snapshot_id: str,
+                             platform: str = 'kessbet',
+                             commit: bool = False) -> None:
+        """把本场当前指针指向新快照（不默认 commit）。"""
+        with self.conn.cursor() as cur:
+            cur.execute("""UPDATE kessbet_match_live
+                           SET current_snapshot_id=%s
+                           WHERE platform=%s AND match_id=%s""",
+                        (snapshot_id, platform, match_id))
+        if commit:
+            self.conn.commit()
+
+    def invalidate_live_snapshot(self, match_id: str,
+                                 platform: str = 'kessbet',
+                                 commit: bool = True) -> None:
+        """让当前机会失效（清空当前快照指针）。
+
+        空响应、状态接口失败、状态不一致、写入事务失败时使用：
+        旧赔率/旧快照可以留作历史，但不能再作为“当前机会”展示。
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("""UPDATE kessbet_match_live
+                           SET current_snapshot_id=NULL
+                           WHERE platform=%s AND match_id=%s""",
+                        (platform, match_id))
+        if commit:
+            self.conn.commit()
+
+    def get_live_snapshot(self, match_id: str, snapshot_id: str | None = None,
+                          platform: str = 'kessbet') -> dict | None:
+        """按 ID 读取不可变快照；snapshot_id=None 时读当前指针。
+
+        返回的 rows 已还原成 (market, side, line, label, odds) 元组。
+        没有快照返回 None —— 调用方必须明确降级，不能按时间猜。
+        """
+        if snapshot_id is None:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT current_snapshot_id
+                               FROM kessbet_match_live
+                               WHERE platform=%s AND match_id=%s""",
+                            (platform, match_id))
+                row = cur.fetchone()
+            if not row or not row[0]:
+                return None
+            snapshot_id = row[0]
+        with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute("""
+            SELECT snapshot_id, match_id, generation,
+                   request_started_at, response_received_at,
+                   state_before, state_after, minute, home_score, away_score,
+                   ht_home, ht_away,
+                   request_json, response_json, response_hash, parser_version,
+                   input_fingerprint, phase, phase_source, ht_source,
+                   raw_payload, rows_json, filter_policy, created_time
+            FROM kessbet_live_snapshot
+            WHERE platform=%s AND match_id=%s AND snapshot_id=%s
+            """, (platform, match_id, snapshot_id))
+            r = cur.fetchone()
+        if not r:
+            return None
+
+        def _load(v):
+            if not v:
+                return None
+            try:
+                return json.loads(v)
+            except (TypeError, ValueError):
+                return None
+
+        r['state_before'] = _load(r.get('state_before'))
+        r['state_after'] = _load(r.get('state_after'))
+        r['raw_payload'] = _load(r.get('raw_payload'))
+        r['request_json'] = _load(r.get('request_json'))
+        r['response_json'] = _load(r.get('response_json'))
+        rows = _load(r.get('rows_json')) or []
+        r['rows'] = [tuple(x) for x in rows]
+        return r
+
+    # ---------- 滚球原始响应（取证） ----------
+
+    def save_live_raw(self, match_id: str, fetched_time, payload: str,
+                      keep: int = 5, platform: str = 'kessbet') -> int | None:
+        """保存一份滚球赔率原始响应，返回新行 id。
+
+        每场只保留最近 keep 份：滚球赔率约 30 秒一变，5 份 ≈ 2.5 分钟，
+        足够 analyzer 按 odds_updated 找到命中时对应的那一版。
+        命中时整份会复制进 snapshot，永久保留，不依赖这张表。
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO kessbet_odds_live_raw
+              (platform, match_id, fetched_time, payload)
+            VALUES (%s,%s,%s,%s)
+            """, (platform, match_id, fetched_time, payload))
+            new_id = cur.lastrowid
+            # 只留最近 keep 份。派生表是为了绕过 MySQL「不能在 DELETE
+            # 的子查询里直接引用同一张表」的限制。
+            cur.execute("""
+            DELETE FROM kessbet_odds_live_raw
+            WHERE platform=%s AND match_id=%s AND id NOT IN (
+                SELECT id FROM (
+                    SELECT id FROM kessbet_odds_live_raw
+                    WHERE platform=%s AND match_id=%s
+                    ORDER BY id DESC LIMIT %s
+                ) keep
+            )
+            """, (platform, match_id, platform, match_id, keep))
+        self.conn.commit()
+        return new_id
+
+    def get_live_raw_near(self, match_id: str, target_time,
+                          max_skew_sec: int = 15,
+                          platform: str = 'kessbet') -> dict | None:
+        """找最接近 target_time 的原始响应（通常是 odds_updated）。
+
+        返回 {'fetched_time', 'payload'}；偏差超过 max_skew_sec 视为
+        没有对应版本，返回 None —— 宁可证据缺失，也不能拿错版本冒充。
+        """
+        if target_time is None:
+            return None
+        with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute("""
+            SELECT fetched_time, payload FROM kessbet_odds_live_raw
+            WHERE platform=%s AND match_id=%s
+            ORDER BY ABS(TIMESTAMPDIFF(SECOND, fetched_time, %s)), id DESC
+            LIMIT 1
+            """, (platform, match_id, target_time))
+            row = cur.fetchone()
+        if not row:
+            return None
+        skew = abs((row['fetched_time'] - target_time).total_seconds())
+        if skew > max_skew_sec:
+            log.warning('原始响应与 odds_updated 偏差 %.1fs，放弃关联：%s',
+                        skew, match_id)
+            return None
+        return row
 
     def mark_live_finished(self, match_id: str,
                            platform: str = 'kessbet') -> None:
@@ -878,6 +1153,19 @@ class Dao:
                             f"WHERE kickoff_time < NOW() - INTERVAL %s DAY",
                             (days,))
                 result[key] = cur.rowcount
+            # 原始响应表没有 kickoff_time，按抓取时间清理。
+            # 每场只留最近 5 份，合规的命中证据已经复制进 snapshot。
+            cur.execute("DELETE FROM kessbet_odds_live_raw "
+                        "WHERE fetched_time < NOW() - INTERVAL %s DAY",
+                        (days,))
+            result['live_raw'] = cur.rowcount
+            # 不可变输入快照：保留期比当前赔率长得多（30 天）。
+            # 判定暂停期间快照可能尚未被分析；不能用 3 天的缓存保留期
+            # 把未分析的输入删掉（D01 要求）。命中证据已另存 snapshot。
+            cur.execute("DELETE FROM kessbet_live_snapshot "
+                        "WHERE response_received_at "
+                        "      < NOW() - INTERVAL 30 DAY")
+            result['live_snapshot'] = cur.rowcount
         self.conn.commit()
         return result
 
@@ -1004,8 +1292,9 @@ class Dao:
                                  n_candidates: int, market_detail: str,
                                  odds_updated, alert_time,
                                  is_live: int = 0,
-                                 replay_context: str | None = None) -> bool:
-        """写一条命中快照。返回 True 表示新写入，False 表示这份赔率已记过。
+                                 replay_context: str | None = None,
+                                 input_fingerprint: str | None = None) -> int | None:
+        """写一条命中快照。返回新快照 id；重复赔率已记过时返回 None。
 
         唯一键 (platform, match_id, odds_updated) 负责去重：
         分析每 2 秒轮询，同一份赔率持续命中时不能反复写 60KB 的快照。
@@ -1019,8 +1308,9 @@ class Dao:
            home_team, away_team, league, kickoff_time,
            cost, cost_scope, lp_worst_profit, cross_gap,
            ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
-            market_detail, replay_context, odds_updated, is_live)
-        VALUES (%s,'kessbet',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            market_detail, replay_context, odds_updated, is_live,
+           input_fingerprint)
+        VALUES (%s,'kessbet',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON DUPLICATE KEY UPDATE id = id
         """
         with self.conn.cursor() as cur:
@@ -1030,10 +1320,24 @@ class Dao:
                 cost, cost_scope, lp_worst_profit, cross_gap,
                 ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
                 market_detail, replay_context, odds_updated, is_live,
+                input_fingerprint,
             ))
+            new_id = cur.lastrowid if n == 1 else None
         self.conn.commit()
-        # MySQL: INSERT 返回 1，命中重复键返回 0
-        return n == 1
+        # MySQL: INSERT 返回 1，命中重复键返回 0（此时 lastrowid 不可用）
+        return new_id
+
+    def has_arbitrage_fingerprint(self, match_id: str, fingerprint: str,
+                                  platform: str = 'kessbet') -> bool:
+        """同一输入指纹是否已经写过正式命中（幂等）。"""
+        if not fingerprint:
+            return False
+        with self.conn.cursor() as cur:
+            cur.execute("""SELECT 1 FROM kessbet_arbitrage_snapshot
+                           WHERE platform=%s AND match_id=%s
+                             AND input_fingerprint=%s LIMIT 1""",
+                        (platform, match_id, fingerprint))
+            return cur.fetchone() is not None
 
     def list_arbitrage(self, limit: int = 100, offset: int = 0,
                        match_id: str | None = None,

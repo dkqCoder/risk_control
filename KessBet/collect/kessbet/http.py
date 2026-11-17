@@ -348,24 +348,36 @@ class KessbetHttp:
         """
         return self.fetch_odds_with_raw(match_id, home, away)[0]
 
-    def fetch_odds_with_raw(self, match_id: str, home: str = '',
-                            away: str = '') -> tuple[list, list]:
-        """同一次请求返回 (解析后的 Selection 列表, 原始盘口列表)。
+    def fetch_odds_result(self, match_id: str, home: str = '',
+                          away: str = '') -> tuple[list, dict, list]:
+        """同一次请求返回 (Selection 列表, 结构化 fetch_result, 身份列表)。
 
-        原始列表必须和解析结果来自**同一次 HTTP 响应** —— 命中后不能
-        再请求一次 raw 来冒充命中输入（赔率早就变了）。
+        身份列表用于输入指纹：每个选项带原始 mari、规范键、赔率和市场 ID。
         """
         from common.models import Selection
-        from collect.kessbet.parse import split_team
+        from collect.kessbet.parse import split_team, parse_market_id
 
-        raw = self.fetch_raw(match_id)
+        res = self.fetch_raw_result(match_id)
         out = []
-        for mk in raw:
+        identity = []
+        for mk in res.get('markets') or []:
             mari = mk.get('mari') or ''
             name, sels = parse_mari(mari)
             if not name:
                 continue
             side, base = split_team(name, home, away)
+            market_id = parse_market_id(mari)
             for line, label, odds in sels:
                 out.append(Selection(base, side, line, label, odds))
-        return out, raw
+                identity.append({
+                    'mari': mari, 'market': base, 'side': side,
+                    'line': line, 'label': label, 'odds': odds,
+                    'market_id': market_id, 'locked': False,
+                })
+        return out, res, identity
+
+    def fetch_odds_with_raw(self, match_id: str, home: str = '',
+                            away: str = '') -> tuple[list, list]:
+        """兼容旧调用：返回 (Selection 列表, 原始盘口列表)。"""
+        out, res, _identity = self.fetch_odds_result(match_id, home, away)
+        return out, res.get('markets') or []

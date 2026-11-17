@@ -28,8 +28,11 @@ from common.timeutil import now_beijing
 
 log = logging.getLogger(__name__)
 
-LIVE_REPLAY_SCHEMA_VERSION = 1
-LIVE_ANALYZER_VERSION = 'live-result-b2-v2'
+LIVE_REPLAY_SCHEMA_VERSION = 2
+# D05：other 隔离、比分 guard、ghost 成本剔除都改变了结果，必须升级版本。
+LIVE_ANALYZER_VERSION = 'live-result-b3-v3'
+LIVE_STATE_SPACE_VERSION = 'soccer-h6-g10'
+LIVE_CANDIDATE_POLICY_VERSION = 'no-correct-score-other/v1'
 
 
 def evaluate_live_match(dao, meta: dict, now) -> dict:
@@ -41,74 +44,76 @@ def evaluate_live_match(dao, meta: dict, now) -> dict:
     out = {'match_id': mid, 'result': None, 'error': None,
            'ht': None, 'selections': None}
 
-    # ★ 赔率新鲜度：过期时**仍然重算**，只是不告警。
+    # ★ D01：分析输入只能是**不可变快照**。
     #
-    # 为什么不能直接跳过（踩过一次，2026-11-12 APIA）：
-    #   18:20:46 算出 cost=1.1073，选中 Total H 4.5 over/under
-    #   18:21 解析器修复后，4.5 被识别为锁定盘口，从库中删除
-    #   但赔率超过 90 秒没更新 → stale_odds 一直跳过重算
-    #   → 结果里永远留着已经不存在的 4.5 组合，页面显示一个幽灵套利
-    #
-    # 正确做法：结果必须永远反映库内当前数据。
-    # 过期只影响「要不要当成机会告警」，不影响「算出真实成本」。
-    odds_updated = meta.get('odds_updated')
+    # 不再用 MAX(updated_time) + 当前赔率表 + 时间窗口拼输入，也不再用
+    # get_live_raw_near 按 15 秒猜 raw。快照里 row/state/raw 来自同一次
+    # HTTP 请求，按 snapshot_id 精确读取；当前指针变了也不会改变本次输入。
+    snapshot_id = meta.get('current_snapshot_id')
+    if not snapshot_id:
+        out['error'] = 'no_snapshot'
+        return out
+    snap = dao.get_live_snapshot(mid, snapshot_id)
+    if snap is None:
+        out['error'] = 'snapshot_missing'
+        return out
+
+    out['snapshot_id'] = snapshot_id
+    out['generation'] = snap.get('generation')
+    odds_updated = snap.get('response_received_at')
     if odds_updated is None:
         out['error'] = 'no_odds_ts'
         return out
+    out['odds_updated'] = odds_updated
+
+    # ★ 赔率新鲜度：过期时仍然重算，只是不告警。
     age = (now - odds_updated).total_seconds()
     out['is_stale'] = age > config.LIVE_ODDS_MAX_AGE_SEC
 
-    # ★ 赔率必须比当前比分新。
-    #
-    # 进球后：状态轮询每 10 秒就更新了比分，但赔率要等平台下一次推送
-    # 才重新定价。这中间拿「新比分」套「按旧比分定的赔率」，是两个世界
-    # 的价格硬拼在一起 —— 必然算出假套利。
-    #
-    # 实测（2026-11-13，Atletico Morelia）：
-    #   11:11:08  赔率最后一次更新（当时 0:0）
-    #   11:11:58  分析命中 Σ=0.7465，此时状态已经是 1:0 第 50 分钟
-    #   11:12:35  赔率才跟上进球（16 条变动）
-    # 前后各查一次成本都正常，只有中间这 87 秒是错的。
-    score_changed = meta.get('score_changed_time')
-    if score_changed is not None and odds_updated < score_changed:
-        out['error'] = 'score_newer_than_odds'
-        return out
-
-    # ★ 只取「跟得上本场最新采集」的选项。
-    #
-    # `odds_updated` 是 MAX(updated_time)，只要有一个盘口在推就是新鲜的，
-    # 但同场的其他盘口可能已经停推几十分钟（实测同场新旧行差 2.3 小时）。
-    # 拿这种混合数据算覆盖，会得出 Σ=0.05 的荒谬套利 —— 1 秒前的 1x2
-    # 配 50 分钟前的 Handicap，那两个价格从来没同时存在过。
-    #
-    # 阈值取 120 秒：一次正常推送周期内所有选项都会一起刷新，
-    # 超过 2 分钟没刷新的说明那次接口响应里就没有它了。
-    sels = dao.get_live_selections(
-        mid, max_lag_sec=getattr(config, 'LIVE_ROW_MAX_LAG_SEC', 120))
+    sels = snap.get('rows') or []
     if not sels:
         out['error'] = 'no_data'
         return out
     out['selections'] = sels
+    out['raw'] = {
+        'payload': snap.get('raw_payload'),
+        'fetched_time': odds_updated,
+    }
 
-    minute = meta.get('minute')
-    home = meta.get('home_score')
-    away = meta.get('away_score')
+    minute = snap.get('minute')
+    home = snap.get('home_score')
+    away = snap.get('away_score')
     if home is None or away is None:
         out['error'] = 'no_score'
         return out
 
-    # 下半场需要半场比分。从赔率流水反推（不看 min 也没关系，
-    # fetch_state 的 msScoreList 不可靠，见 result.half_time_score 的说明）
-    ht = None
-    if minute is not None and minute > 45:
-        rows = dao.live_history_for_half_time(mid)
-        ht = result.half_time_score(rows)
-    out['ht'] = ht
+    # 比分接近状态空间上限（每队 9 球）时，模型无法表示再进一球的终局。
+    # 这是临时防线；正式修复是无界反例验证（F01）。
+    if result.score_space_incomplete(home, away):
+        out['error'] = 'score_near_model_cap'
+        return out
+
+    # 半场比分用采集时冻结进快照的值，不再在分析时另读可变流水。
+    # 快照缺 ht（上游未取到）时保持 None —— 不缩小状态空间是保守的。
+    ht_home = snap.get('ht_home')
+    ht_away = snap.get('ht_away')
+    out['ht_home'] = ht_home
+    out['ht_away'] = ht_away
+    out['ht'] = ((ht_home, ht_away)
+                 if ht_home is not None and ht_away is not None else None)
+    state_after = snap.get('state_after') or {}
+    out['minute'] = minute
+    out['home_score'] = home
+    out['away_score'] = away
+    out['match_status'] = (state_after.get('ms')
+                           if isinstance(state_after, dict) else None)
+    out['match_clock'] = (state_after.get('mt')
+                          if isinstance(state_after, dict) else None)
 
     r = result.check_match(
         sels, home, away, minute=minute,
-        ht_home=ht[0] if ht else None,
-        ht_away=ht[1] if ht else None,
+        ht_home=ht_home,
+        ht_away=ht_away,
     )
     if r is None:
         out['error'] = 'no_cover_or_no_candidate'
@@ -135,21 +140,26 @@ def analyze_live_snapshot(dao, meta: dict, selections: list[tuple], now=None) ->
     away = meta.get('away_score')
     if home is None or away is None:
         return {'result': None, 'error': 'no_score'}
+    if result.score_space_incomplete(home, away):
+        return {'result': None, 'error': 'score_near_model_cap'}
 
-    ht = None
-    if minute is not None and minute > 45:
-        ht = result.half_time_score(dao.live_history_for_half_time(
-            meta['match_id']))
+    # 半场比分由采集侧随快照一起传入，分析不再另读可变流水。
+    ht_home = meta.get('ht_home')
+    ht_away = meta.get('ht_away')
+    ht = ((ht_home, ht_away)
+          if ht_home is not None and ht_away is not None else None)
     meta = dict(meta)
-    meta['ht_home'] = ht[0] if ht else None
-    meta['ht_away'] = ht[1] if ht else None
+    meta['ht_home'] = ht_home
+    meta['ht_away'] = ht_away
 
     r = result.check_match(
         selections, home, away, minute=minute,
-        ht_home=ht[0] if ht else None,
-        ht_away=ht[1] if ht else None,
+        ht_home=ht_home,
+        ht_away=ht_away,
     )
     if r is None:
+        # 新快照没有覆盖结果时也要把当前状态写下来，覆盖旧机会。
+        _persist_status(dao, meta, 'no_cover', now)
         return {'result': None, 'error': 'no_cover_or_no_candidate', 'ht': ht}
 
     _persist_cost(dao, meta, r, ht, now)
@@ -157,20 +167,35 @@ def analyze_live_snapshot(dao, meta: dict, selections: list[tuple], now=None) ->
         log.warning('LIVE ARBITRAGE(snapshot) %s 第%s分钟 %s:%s Σ=%.4f 收益 %.2f%%',
                     meta['match_id'], minute, home, away,
                     r['cost'], r['profit_pct'])
-        if _persist_hit(dao, meta, r, now):
-            _shoot_async(meta, r)
+        snap_id = _persist_hit(dao, meta, r, now)
+        if snap_id:
+            _shoot_async(meta, r, snap_id)
     return {'result': r, 'error': None, 'ht': ht}
 
 
 def analyze_live_once(dao, window_min: int | None = None,
                       write_hits: bool = True,
                       write_costs: bool = True,
-                      force: bool = False) -> dict:
+                      force: bool = False,
+                      diagnostic: bool = False) -> dict:
     """扫一轮滚球比赛。
 
     force=False: 只算赔率比上次计算新的（live_analyze_pending）。
     force=True:  全量扫（主循环每秒轮询后的兜底）。
+
+    diagnostic=True 只在判定关闭时使用：允许计算，但强制不写正式结果
+    和命中。所有正式写库入口都必须先通过 LIVE_ANALYZE_ENABLED。
     """
+    if not getattr(config, 'LIVE_ANALYZE_ENABLED', True):
+        if not diagnostic:
+            log.info('滚球判定已关闭（LIVE_ANALYZE_ENABLED=False），'
+                     '跳过分析；诊断请用 diagnostic/--no-write')
+            return {'disabled': True, 'matches': 0, 'evaluated': 0,
+                    'hits': 0, 'errors': 0, 'no_data': 0, 'no_score': 0,
+                    'no_cover': 0, 'min_cost': None}
+        # 诊断模式：只算不写。
+        write_hits = False
+        write_costs = False
     from datetime import datetime, timedelta, timezone
     BJ = timezone(timedelta(hours=8))
     now = datetime.now(timezone.utc).astimezone(BJ).replace(tzinfo=None)
@@ -197,21 +222,41 @@ def analyze_live_once(dao, window_min: int | None = None,
         err = a['error']
         if err == 'no_data':
             stats['no_data'] += 1
+            if write_costs:
+                _persist_status(dao, meta, 'no_data', now, a)
             continue
         if err == 'no_score':
             stats['no_score'] += 1
+            if write_costs:
+                _persist_status(dao, meta, 'no_score', now, a)
             continue
         if err == 'score_newer_than_odds':
             stats['odds_behind_score'] = stats.get('odds_behind_score', 0) + 1
             continue
+        if err == 'score_near_model_cap':
+            stats['model_cap'] = stats.get('model_cap', 0) + 1
+            if write_costs:
+                _persist_status(dao, meta, 'incomplete_model', now, a)
+            continue
         if err == 'no_cover_or_no_candidate':
             stats['no_cover'] += 1
+            if write_costs:
+                _persist_status(dao, meta, 'no_cover', now, a)
             continue
         if err:
             stats['errors'] += 1
             continue
 
         r = a['result']
+        # 结果/命中使用的比分、分钟、半场、阶段全部来自同一快照，
+        # 不能用 live_analyze_targets 里的当前值。
+        snap_meta = dict(meta)
+        for k in ('minute', 'home_score', 'away_score',
+                  'ht_home', 'ht_away', 'match_status', 'match_clock',
+                  'snapshot_id', 'generation', 'odds_updated'):
+            if a.get(k) is not None:
+                snap_meta[k] = a[k]
+
         stats['evaluated'] += 1
         if a.get('is_stale'):
             stats['stale_odds'] += 1
@@ -222,7 +267,7 @@ def analyze_live_once(dao, window_min: int | None = None,
         # 赔率过期只影响「要不要告警」，不影响「算出来的成本是真是假」。
         if write_costs:
             try:
-                _persist_cost(dao, meta, r, a['ht'], now)
+                _persist_cost(dao, snap_meta, r, a.get('ht'), now)
             except Exception as e:
                 log.exception('写滚球结果成本失败 %s: %s', meta['match_id'], e)
 
@@ -232,21 +277,33 @@ def analyze_live_once(dao, window_min: int | None = None,
             stats['hits'] += 1
             log.warning('LIVE ARBITRAGE %s %s vs %s  第%s分钟 %s:%s  '
                         'Σ=%.4f  收益 %.2f%%',
-                        meta['match_id'], meta.get('home_team'),
-                        meta.get('away_team'), meta.get('minute'),
-                        meta.get('home_score'), meta.get('away_score'),
+                        snap_meta['match_id'], snap_meta.get('home_team'),
+                        snap_meta.get('away_team'), snap_meta.get('minute'),
+                        snap_meta.get('home_score'),
+                        snap_meta.get('away_score'),
                         r['cost'], r['profit_pct'])
             for d, o, w in result.stakes(r['chosen'], r['cost']):
                 log.warning('    %-34s @ %.2f  下注 %.1f%%', d, o, w * 100)
             if write_hits:
                 try:
-                    evidence_meta = dict(meta)
-                    evidence_meta['ht_home'] = a['ht'][0] if a['ht'] else None
-                    evidence_meta['ht_away'] = a['ht'][1] if a['ht'] else None
+                    evidence_meta = dict(snap_meta)
                     evidence_meta['snapshot_selections'] = a.get('selections') or []
-                    if _persist_hit(dao, evidence_meta, r, now):
+                    # D01：证据必须绑定输入快照，不能用「当前」或时间猜。
+                    evidence_meta['snapshot_id'] = (
+                        a.get('snapshot_id') or meta.get('current_snapshot_id'))
+                    evidence_meta['generation'] = (
+                        a.get('generation') or meta.get('generation') or 0)
+                    evidence_meta['odds_updated'] = (
+                        a.get('odds_updated') or meta.get('odds_updated'))
+                    raw = a.get('raw') or {}
+                    if raw.get('payload'):
+                        evidence_meta['raw_payload'] = raw['payload']
+                        evidence_meta['raw_fetched_time'] = str(
+                            raw.get('fetched_time') or '')
+                    snap_id = _persist_hit(dao, evidence_meta, r, now)
+                    if snap_id:
                         # 只有首次持久化成功的路径截图，避免即时分析和兜底扫描重复留证。
-                        _shoot_async(meta, r)
+                        _shoot_async(meta, r, snap_id)
                 except Exception as e:
                     log.exception('写滚球命中快照失败 %s: %s',
                                   meta['match_id'], e)
@@ -254,63 +311,41 @@ def analyze_live_once(dao, window_min: int | None = None,
     return stats
 
 
-def _shoot_async(meta: dict, r: dict) -> None:
+def _shoot_async(meta: dict, r: dict, snap_id: int) -> None:
     """命中时异步截图留证。
 
-    截**平台官网**的比赛页 —— 这是判断「这个套利到底真不真」的第一手证据：
-    我们库里的赔率是采来的，平台页面才是最终事实。
+    证据分两层，按可靠性排序：
 
-        https://www.kessbet.com/match/<matchId>
+    1) **本地证据页** `/evidence/<snapshot_id>`：只读命中快照和同一次请求的
+       原始 `mari` 响应，不可变。这是主证据，先截它。
+    2) **平台官网**：截图天然滞后 20 秒以上，只能作辅助，必须记录实际拍摄
+       时间和「命中后 N 秒」，不能当成命中时刻的页面。
 
-    顺带也截一张本地详情页（能看到我们算出的下注组合），两张同名不同后缀。
-
-    为什么要异步：每次截图要起一个 Chrome，启动 + 渲染 15~20 秒，
-    而分析线程每 2 秒一轮。同步截图会把判定流程整个堵死。
-
-    为什么要截图：滚球赔率秒级变动，命中那一刻的价格组合事后无法复现。
+    为什么要异步：起 Chrome 要 15~20 秒，分析线程每 2 秒一轮，
+    同步截图会把判定流程整个堵死。
     """
     if not getattr(config, 'LIVE_SHOT_ENABLED', False):
         return
 
     import os
-    import threading
+    from common import shot_queue
 
     out_dir = getattr(config, 'LIVE_SHOT_DIR', '')
     mid = meta['match_id']
     stamp = now_beijing().strftime('%Y%m%d-%H%M%S')
-    base_name = f'{stamp}_{mid}'
-
-    def work():
-        # 1) 平台官网
-        try:
-            from common import platform_shot
-            ok, msg = platform_shot.capture_match(
-                mid, os.path.join(out_dir, base_name + '_kessbet.png'))
-            if ok:
-                log.warning('平台截图已保存 %s', msg)
-            else:
-                log.warning('平台截图失败 %s: %s', mid, msg)
-        except Exception as e:
-            log.warning('平台截图异常 %s: %s', mid, e)
-
-        # 2) 本地详情页（含我们算出的下注组合）
-        try:
-            from common import screenshot
-            url = '%s/live/%s' % (
-                getattr(config, 'LIVE_SHOT_BASE_URL', 'http://127.0.0.1:8080'),
-                mid)
-            ok, msg = screenshot.capture(
-                url, os.path.join(out_dir, base_name + '_local.png'))
-            if ok:
-                log.warning('本地截图已保存 %s', msg)
-        except Exception as e:
-            log.warning('本地截图异常 %s: %s', mid, e)
-
-    try:
-        threading.Thread(target=work, daemon=True,
-                         name='arb-shot').start()
-    except Exception as e:
-        log.warning('启动截图线程失败: %s', e)
+    # 文件名带上 snapshot_id：秒级时间戳不足以代表证据身份。
+    base_name = f'{stamp}_{mid}_{snap_id}'
+    base_url = getattr(config, 'LIVE_SHOT_BASE_URL', 'http://127.0.0.1:8080')
+    ok = shot_queue.submit({
+        'snapshot_id': snap_id,
+        'match_id': mid,
+        'local_url': f'{base_url}/evidence/{snap_id}',
+        'local_path': os.path.join(out_dir, base_name + '_local.png'),
+        'official_path': os.path.join(out_dir, base_name + '_kessbet.png'),
+        'submitted_at': now_beijing().isoformat(sep=' '),
+    })
+    if not ok:
+        log.warning('截图任务未入队 snapshot=%s（队列满）', snap_id)
 
 
 def _persist_cost(dao, meta: dict, r: dict, ht, now) -> None:
@@ -332,19 +367,80 @@ def _persist_cost(dao, meta: dict, r: dict, ht, now) -> None:
         ht_away=ht[1] if ht else None,
         odds_updated=meta.get('odds_updated'),
         computed_time=now,
+        snapshot_id=meta.get('snapshot_id') or meta.get('current_snapshot_id'),
+        generation=meta.get('generation') or 0,
+        verification_status=(r.get('verification') or {}).get('status'),
+        verification_detail=(json.dumps(r.get('verification'),
+                                        ensure_ascii=False)
+                             if r.get('verification') else None),
+        analysis_status='valid',
+        input_fingerprint=meta.get('input_fingerprint'),
     )
 
 
-def _persist_hit(dao, meta: dict, r: dict, now) -> bool:
+def _persist_status(dao, meta: dict, status: str, now,
+                    a: dict | None = None) -> None:
+    """把“当前快照没有判定结果”写成当前状态。
+
+    不能只在有成本时才写结果：新快照 no_cover/no_data 时必须覆盖旧成本，
+    否则页面会一直显示上一份赔率算出来的旧机会。
+    """
+    a = a or {}
+    snapshot_id = a.get('snapshot_id') or meta.get('current_snapshot_id')
+    if not snapshot_id:
+        return
+    try:
+        dao.write_live_result_cost(
+            match_id=meta['match_id'],
+            kickoff_time=meta['kickoff_time'],
+            cost=None, profit_pct=None, chosen='[]', reach_states=0,
+            n_candidates=0,
+            minute=a.get('minute', meta.get('minute')),
+            home_score=a.get('home_score', meta.get('home_score')),
+            away_score=a.get('away_score', meta.get('away_score')),
+            ht_home=a.get('ht_home', meta.get('ht_home')),
+            ht_away=a.get('ht_away', meta.get('ht_away')),
+            odds_updated=(a.get('odds_updated')
+                          or meta.get('odds_updated')),
+            computed_time=now,
+            snapshot_id=snapshot_id,
+            generation=(a.get('generation')
+                        or meta.get('generation') or 0),
+            analysis_status=status,
+            input_fingerprint=meta.get('input_fingerprint'),
+        )
+    except Exception as e:
+        log.warning('写滚球判定状态失败 %s/%s: %s',
+                    meta.get('match_id'), status, e)
+
+
+def _persist_hit(dao, meta: dict, r: dict, now) -> int | None:
     """把命中写进 kessbet_arbitrage_snapshot（is_live=1）。
 
     和赛前命中共用一张表：事后要从一个地方回溯「都命中过什么」。
+    返回新快照 id；同一份赔率已经记过时返回 None。
     """
     from common.markets import describe_pick
 
     mid = meta['match_id']
+    # 同一输入指纹已经写过正式命中时幂等返回，不重复落库。
+    fp = meta.get('input_fingerprint')
+    if fp and dao.has_arbitrage_fingerprint(mid, fp):
+        log.info('同一输入指纹已命中过，跳过 %s %s', mid, fp[:12])
+        return None
     chosen = result.stakes(r['chosen'], r['cost'])
     home, away = meta.get('home_team') or '', meta.get('away_team') or ''
+
+    # 同一次 HTTP 请求的原始 mari 响应 —— 命中取证的主证据。
+    # 解析器会丢掉锁定项，原始串保留完整盘面，才能解释 other 之类的语义。
+    raw_payload = meta.get('raw_payload')
+    raw_obj = None
+    if raw_payload:
+        try:
+            raw_obj = (json.loads(raw_payload)
+                       if isinstance(raw_payload, str) else raw_payload)
+        except (TypeError, ValueError):
+            raw_obj = {'payload_unparsed': str(raw_payload)[:2000]}
 
     detail = [{
         'name': '比赛结果（滚球）',
@@ -364,7 +460,14 @@ def _persist_hit(dao, meta: dict, r: dict, now) -> bool:
     replay_context = {
         'schema_version': LIVE_REPLAY_SCHEMA_VERSION,
         'analyzer_version': LIVE_ANALYZER_VERSION,
+        'state_space_version': LIVE_STATE_SPACE_VERSION,
+        'candidate_policy_version': LIVE_CANDIDATE_POLICY_VERSION,
         'snapshot_id': meta.get('snapshot_id'),
+        'generation': meta.get('generation'),
+        'input_fingerprint': fp,
+        'phase': meta.get('phase'),
+        'phase_source': meta.get('phase_source'),
+        'ht_source': meta.get('ht_source'),
         'minute': meta.get('minute'),
         'home_score': meta.get('home_score'),
         'away_score': meta.get('away_score'),
@@ -383,11 +486,17 @@ def _persist_hit(dao, meta: dict, r: dict, now) -> bool:
             'chosen': r.get('chosen'),
             'n_candidates': r.get('n_candidates'),
             'is_arbitrage': r.get('is_arbitrage'),
+            'is_candidate': r.get('is_candidate'),
         },
+        'verification': r.get('verification'),
         'selections': [list(x) for x in meta.get('snapshot_selections', [])],
+        # 同一次请求的平台原始响应。证据页直接渲染这份数据；
+        # 解析器丢弃的锁定项、当前比分是否在盘面上，都能在这里核对。
+        'raw_fetched_time': meta.get('raw_fetched_time'),
+        'raw': raw_obj,
     }
 
-    inserted = dao.write_arbitrage_snapshot(
+    snap_id = dao.write_arbitrage_snapshot(
         match_id=mid,
         sport=meta.get('sport') or 'sr:sport:1',
         home=home, away=away,
@@ -410,11 +519,12 @@ def _persist_hit(dao, meta: dict, r: dict, now) -> bool:
         odds_updated=meta.get('odds_updated'),
         alert_time=now,
         is_live=1,
+        input_fingerprint=fp,
     )
-    if inserted:
-        log.warning('滚球命中已保存 %s  (Σ=%.4f, 可达终局 %d)',
-                    mid, r['cost'], r['reach'])
-    return inserted
+    if snap_id:
+        log.warning('滚球命中已保存 %s snapshot=%s  (Σ=%.4f, 可达终局 %d)',
+                    mid, snap_id, r['cost'], r['reach'])
+    return snap_id
 
 
 def replay_live_evidence(replay_context) -> dict:
@@ -423,6 +533,20 @@ def replay_live_evidence(replay_context) -> dict:
         replay_context = json.loads(replay_context)
     if not replay_context:
         return {'ok': False, 'error': 'no_replay_context'}
+
+    # D05：算法版本不一致时不能假装能复现。
+    # 新算法（other 隔离、guard、ghost 成本）重跑旧输入会得到不同结论；
+    # 必须明确返回 unsupported_version，而不是说“同版本不可复现”。
+    saved_ver = replay_context.get('analyzer_version')
+    if saved_ver != LIVE_ANALYZER_VERSION:
+        return {
+            'ok': False,
+            'error': 'unsupported_version',
+            'saved_analyzer_version': saved_ver,
+            'current_analyzer_version': LIVE_ANALYZER_VERSION,
+            'schema_version': replay_context.get('schema_version'),
+            'expected': replay_context.get('expected'),
+        }
 
     selections = [tuple(x) for x in replay_context.get('selections', [])]
     replayed = result.check_match(
@@ -515,7 +639,8 @@ def main() -> int:
         if args.once:
             stats = analyze_live_once(dao, window_min=args.window,
                                       write_hits=not args.no_write,
-                                      write_costs=not args.no_write)
+                                      write_costs=not args.no_write,
+                                      diagnostic=args.no_write)
             log.info('single round: %s', stats)
         else:
             run_loop(dao, args.interval, args.window)

@@ -15,6 +15,8 @@
 
 状态（比分/角球/牌）始终是轮询 —— 推送里没有比分。
 """
+import hashlib
+import json
 import logging
 import threading
 import time
@@ -24,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor
 import pymysql
 
 from collect import config
+from common.fingerprint import input_fingerprint
+from common.scores import half_time_score
 from common.timeutil import now_beijing
 
 log = logging.getLogger(__name__)
@@ -122,8 +126,15 @@ class LiveCollector:
 
         state = self.adapter.fetch_state(match_id)
 
-        # 比赛结束了。接口返回 None 或状态码属于「终态」。
-        #
+        # ★ 状态接口返回 None 是**请求失败/未知**，不是“比赛结束”。
+        # 把它当结束会误删比赛、让旧机会继续挂着。正确做法：
+        # 撤销当前机会，计数失败，并排队重试；只有明确的终态码才结束。
+        if state is None:
+            dao.invalidate_live_snapshot(match_id)
+            self.stats['state_failed'] = self.stats.get('state_failed', 0) + 1
+            self.mark_dirty(match_id)
+            return
+
         # 实测到的终态（足球，2026-11-10/11）：
         #   100  常规时间结束
         #   120  点球大战（比分会出现 6:5、7:5 这种）
@@ -131,29 +142,74 @@ class LiveCollector:
         #
         # 注意 ms=0 不是终态 —— 它是「未开始」，而延期/取消的比赛
         # 也会一直停在 0。那种情况靠 LIVE_WINDOW_MIN 让它自然出窗口。
-        if state is None or state.get('ms') in FINISHED_STATUS:
+        if state.get('ms') in FINISHED_STATUS:
             dao.mark_live_finished(match_id)
             self.stats['finished'] += 1
             return
 
         if not fetch_odds:
-            dao.save_live_state(match_id, state, kickoff)
+            changed = dao.save_live_state(match_id, state, kickoff)
             self.stats['state_ok'] += 1
+            if changed:
+                # 比分/阶段变化：旧快照已被 save_live_state 置空，
+                # 这里排队拉一次完整赔率，形成新快照后才会重新判定。
+                self.stats['state_changed_refetch'] = (
+                    self.stats.get('state_changed_refetch', 0) + 1)
+                self.mark_dirty(match_id)
             return
 
-        odds = self.adapter.fetch_odds(
-            match_id, meta.get('home_team') or '', meta.get('away_team') or '')
+        # 同一次请求同时拿解析结果和原始盘口列表 —— 原始串是命中取证的
+        # 第一手证据，不能在命中后重新请求（赔率早就变了）。
+        request_started = now_beijing()
+        home_name = meta.get('home_team') or ''
+        away_name = meta.get('away_team') or ''
+        fetch_result = getattr(self.adapter, 'fetch_odds_result', None)
+        fetch_res = None
+        identity = None
+        raw_markets = None
+        if fetch_result:
+            odds, fetch_res, identity = fetch_result(
+                match_id, home_name, away_name)
+            raw_markets = (fetch_res or {}).get('markets') or []
+        else:
+            fetch_with_raw = getattr(self.adapter, 'fetch_odds_with_raw', None)
+            if fetch_with_raw:
+                odds, raw_markets = fetch_with_raw(
+                    match_id, home_name, away_name)
+            else:
+                odds = self.adapter.fetch_odds(
+                    match_id, home_name, away_name)
+        response_received = ((fetch_res or {}).get('received_at')
+                             or now_beijing())
 
-        # 空响应多半是接口故障，不是「盘口全撤了」——
-        # 跳过，不覆盖库里的数据。
+        # F03：失败/空市场/结构错误必须区分，不能都当“跳过”。
+        fstatus = (fetch_res or {}).get('status')
+        if fstatus in ('transport_error', 'protocol_error'):
+            dao.invalidate_live_snapshot(match_id)
+            self.stats['fetch_error'] = (
+                self.stats.get('fetch_error', 0) + 1)
+            self.mark_dirty(match_id)
+            return
+        if fstatus in ('ok_empty', 'parsed_empty'):
+            # v1 尚未确认 ok_empty 的服务端语义；保守地当作“当前无可认证
+            # 报价”，保留历史但撤销当前机会，不发布空快照。
+            dao.save_live_state(match_id, state, kickoff)
+            dao.invalidate_live_snapshot(match_id)
+            self.stats['skipped_empty'] += 1
+            return
+
         if not odds:
             dao.save_live_state(match_id, state, kickoff)
+            # 空响应不能继续认证旧快照：旧赔率留作历史，当前指针清空。
+            dao.invalidate_live_snapshot(match_id)
             self.stats['state_ok'] += 1
             self.stats['skipped_empty'] += 1
             return
 
         state_after = self.adapter.fetch_state(match_id)
         if state_after is None:
+            # 状态接口失败 ≠ 确认比赛结束；旧机会先失效，再排队重试。
+            dao.invalidate_live_snapshot(match_id)
             self.stats['inconsistent_snapshot'] += 1
             self.mark_dirty(match_id)
             return
@@ -162,31 +218,31 @@ class LiveCollector:
             self.stats['finished'] += 1
             return
 
-        dao.save_live_state(match_id, state_after, kickoff)
-        self.stats['state_ok'] += 1
-        if not _same_snapshot_state(state, state_after):
+        state_before = state
+        state = state_after
+        if not _same_snapshot_state(state_before, state_after):
+            dao.save_live_state(match_id, state_after, kickoff)
+            dao.invalidate_live_snapshot(match_id)
+            self.stats['state_ok'] += 1
             self.stats['inconsistent_snapshot'] += 1
             self.mark_dirty(match_id)
             return
 
-        state = state_after
-
         minute = _parse_minute(state.get('mt'))
         rows = [(s.market, s.side, s.line, s.label, float(s.odds)) for s in odds]
 
+        # 半场比分在采集时冻结进快照；分析和回放都用这份值，
+        # 不再在分析时另读可变的历史流水（D01 输入一致性）。
+        ht = None
+        if minute is not None and minute > 45:
+            try:
+                ht = half_time_score(dao.live_history_for_half_time(match_id))
+            except Exception as e:
+                log.warning('半场比分读取失败 %s: %s', match_id, e)
+        ht_home = ht[0] if ht else None
+        ht_away = ht[1] if ht else None
+
         # ★ 写入前剔除「内部和不可能」的盘口。
-        #
-        # 平台在停盘/占位时会返回垃圾赔率，但标记仍是可投注（`,1,`），
-        # 所以解析层拦不住。实测（2026-11-13）：
-        #   1st Half - Handicap 0:2    1@75.0  2@100.0  X@13.0
-        #   Σ(1/赔率) = 0.013 + 0.010 + 0.077 = 0.10
-        # 单一博彩公司内部必然有抽水，同一个盘口的 Σ 不可能 < 1。
-        # 这种数据留在表里，套利判定会拿它和正常盘口组合，
-        # 算出 Σ=0.05 那种根本不存在的机会。
-        #
-        # 在这里剔除而不是只在分析层过滤，是因为：
-        #   1. 库内数据保持干净，任何读取方都不会被误导
-        #   2. 流水表也不会记下这些假价格，事后回溯不受污染
         if getattr(config, 'LIVE_DROP_BROKEN_MARKETS', False):
             before = len(rows)
             rows = _drop_broken_markets(rows)
@@ -195,30 +251,148 @@ class LiveCollector:
                     self.stats.get('broken_markets', 0) + 1)
 
         if not rows:
+            dao.save_live_state(match_id, state, kickoff)
+            dao.invalidate_live_snapshot(match_id)
+            self.stats['state_ok'] += 1
             self.stats['skipped_empty'] += 1
             return
 
-        res = dao.replace_live_odds(
-            match_id, kickoff, rows,
-            minute=minute,
-            home_score=_to_int(state.get('hmp')),
-            away_score=_to_int(state.get('amp')),
-        )
+        # ★ D01：状态、赔率、输入快照、当前指针在**同一个事务**里提交。
+        # 任何一步失败都整体回滚，绝不出现「新赔率配旧 raw」。
+        snapshot_id = uuid.uuid4().hex
+        state_json = json.dumps(state, ensure_ascii=False)
+        state_before_json = json.dumps(state_before, ensure_ascii=False)
+        rows_json = json.dumps(rows, ensure_ascii=False)
+        if raw_markets is not None:
+            raw_payload = json.dumps({
+                'match_id': match_id,
+                'request_started_at': request_started.isoformat(sep=' '),
+                'response_received_at': response_received.isoformat(sep=' '),
+                'state_before': state_before,
+                'state_after': state,
+                'markets': raw_markets,
+            }, ensure_ascii=False)
+        else:
+            raw_payload = ''
+        filter_policy = 'drop_broken=%s' % bool(
+            getattr(config, 'LIVE_DROP_BROKEN_MARKETS', False))
+
+        # 请求/响应信封 + 输入指纹（Task 2）。指纹不含接收时间；
+        # 平台身份暂由原始 mari 串承担（v1 尚未拆平台 ID 字段）。
+        request_json = (json.dumps(fetch_res.get('request'),
+                                   ensure_ascii=False)
+                        if fetch_res else None)
+        if fetch_res:
+            raw_body = fetch_res.get('raw_body') or ''
+            response_json = json.dumps({
+                'status': fetch_res.get('status'),
+                'response_status': fetch_res.get('response_status'),
+                'response_headers': fetch_res.get('response_headers'),
+                'raw_body': raw_body,
+                'markets': raw_markets,
+            }, ensure_ascii=False)
+            response_hash = hashlib.sha256(
+                raw_body.encode('utf-8')).hexdigest()
+        else:
+            response_json = None
+            response_hash = None
+        # Task 3 会替换为 classify_phase；先保留可追溯的占位值。
+        phase, phase_source = 'unknown', 'inferred'
+        ht_source = 'inferred_history' if ht else 'unknown'
+        home_i = _to_int(state.get('hmp'))
+        away_i = _to_int(state.get('amp'))
+        fp = input_fingerprint(
+            identity if identity is not None else rows,
+            home_i if home_i is not None else -1,
+            away_i if away_i is not None else -1,
+            phase, ht, filter_policy, config.LIVE_RULES_VERSION)
+
+        try:
+            dao.save_live_state(match_id, state, kickoff, commit=False)
+            generation = dao.bump_live_generation(match_id)
+            res = dao.replace_live_odds(
+                match_id, kickoff, rows,
+                minute=minute,
+                home_score=_to_int(state.get('hmp')),
+                away_score=_to_int(state.get('amp')),
+                commit=False,
+            )
+            dao.save_live_snapshot(
+                snapshot_id=snapshot_id,
+                match_id=match_id,
+                generation=generation,
+                request_started_at=request_started,
+                response_received_at=response_received,
+                state_before=state_before_json,
+                state_after=state_json,
+                minute=minute,
+                home_score=_to_int(state.get('hmp')),
+                away_score=_to_int(state.get('amp')),
+                ht_home=ht_home,
+                ht_away=ht_away,
+                request_json=request_json,
+                response_json=response_json,
+                response_hash=response_hash,
+                parser_version=config.LIVE_PARSER_VERSION,
+                input_fingerprint=fp,
+                phase=phase,
+                phase_source=phase_source,
+                ht_source=ht_source,
+                raw_payload=raw_payload,
+                rows_json=rows_json,
+                filter_policy=filter_policy,
+                commit=False,
+            )
+            dao.set_current_snapshot(match_id, snapshot_id, commit=False)
+            dao.conn.commit()
+        except Exception as e:
+            try:
+                dao.conn.rollback()
+            except Exception:
+                pass
+            # 事务回滚后旧指针仍在；单独清掉，避免旧机会继续展示。
+            try:
+                dao.invalidate_live_snapshot(match_id)
+            except Exception:
+                pass
+            self.stats['snapshot_write_failed'] = (
+                self.stats.get('snapshot_write_failed', 0) + 1)
+            log.exception('写入滚球输入快照失败 %s: %s', match_id, e)
+            self.mark_dirty(match_id)
+            return
+
+        self.stats['state_ok'] += 1
         self.stats['odds_ok'] += 1
         self.stats['history_rows'] += res.get('changed', 0)
 
         if self._on_snapshot:
             snapshot = dict(meta)
             snapshot.update({
-                'snapshot_id': uuid.uuid4().hex,
+                'snapshot_id': snapshot_id,
+                'generation': generation,
                 'minute': minute,
                 'home_score': _to_int(state.get('hmp')),
                 'away_score': _to_int(state.get('amp')),
+                'ht_home': ht_home,
+                'ht_away': ht_away,
+                'input_fingerprint': fp,
+                'phase': phase,
+                'phase_source': phase_source,
+                'ht_source': ht_source,
                 'match_status': state.get('ms'),
                 'match_clock': state.get('mt'),
-                'odds_updated': dao.live_odds_updated_at(match_id),
+                # 新鲜度基准 = 本地收到赔率响应的时刻，不是 DB 的 NOW()
+                'odds_updated': response_received,
+                'request_started_at': request_started.isoformat(sep=' '),
+                'response_received_at': response_received.isoformat(sep=' '),
+                'state_before': state_before,
+                'state_after': state,
                 'snapshot_selections': rows,
             })
+            if raw_payload:
+                snapshot['raw_payload'] = raw_payload
+                snapshot['raw_fetched_time'] = response_received.isoformat(
+                    sep=' ')
             try:
                 self._on_snapshot(dao, snapshot, rows)
             except Exception as e:
@@ -311,6 +485,14 @@ class LiveCollector:
                 dao.conn.rollback()
             except Exception:
                 pass
+            # 请求异常时无法确认当前报价：撤销当前机会并排队重试。
+            mid = meta.get('match_id')
+            if mid:
+                try:
+                    dao.invalidate_live_snapshot(mid)
+                except Exception:
+                    pass
+                self.mark_dirty(mid)
 
     # ---------- 主循环 ----------
 

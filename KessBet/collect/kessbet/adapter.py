@@ -39,6 +39,11 @@ class KessbetAdapter(Adapter):
         """同一次请求的解析结果 + 原始盘口列表，供取证存档。"""
         return self._http.fetch_odds_with_raw(match_id, home, away)
 
+    def fetch_odds_result(self, match_id: str, home: str = '',
+                          away: str = '') -> tuple[list[Selection], dict, list]:
+        """同一次请求的解析结果 + 结构化 fetch_result + 身份列表。"""
+        return self._http.fetch_odds_result(match_id, home, away)
+
     def fetch_raw(self, match_id: str) -> list[dict]:
         """原始盘口列表（未解析的 mari 串）。
 

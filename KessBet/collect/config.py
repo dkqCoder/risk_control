@@ -77,7 +77,31 @@ LIVE_ENABLED = True
 # 覆盖全部比赛结果），但采集数据本身没问题。
 #
 # 关掉后：滚球赔率/状态照常采集，只是不再算覆盖成本、不写 arbitrage_snapshot。
+#
+# 2026-11-15 重新打开：假信号的根因（缺腿盘口、赔率滞后于比分、混合新旧行）
+# 已由 LIVE_DROP_INCOMPLETE_MARKETS / score_newer_than_odds / LIVE_ROW_MAX_LAG_SEC
+# 三道防线覆盖。观察期若再出现成本 < 0.9 的命中，先查原始数据再决定是否再关。
+# 2026-11-17 暂停：比分域截断及 Correct Score other 补集错误已复现。
+# 修复并通过无界结果验证后再恢复；继续保留采集。
 LIVE_ANALYZE_ENABLED = False
+
+# 是否允许 Correct Score 的 `other`（其他比分）参与认证。
+#
+# 默认 False，且**不要轻易打开**。
+#
+# `other` 的覆盖范围是“具名比分之外的补集”，但平台在临近结束时会锁定
+# 或撤下当前比分（例如 3:0）。我们的解析器只保留可售选项，锁定项被丢弃，
+# 补集就会把 3:0 算进去。实测（2026-11-17 Switzerland vs Scotland）：
+#   3:0 在 05:24:58 还有 1.50，05:26:23 被锁/撤；
+#   other 当时是 24/40/100 —— 如果它包含 3:0（1.50 ≈ 67%），赔率不可能这么高。
+#   程序把 3:0 补回 other，和 Total 3.5 over 拼出 Σ=0.33 的假套利。
+#
+# 只有拿到平台明确的结算规则（“其他”到底覆盖哪些比分）后才允许恢复。
+LIVE_CERTIFY_CORRECT_SCORE_OTHER = False
+
+# 输入快照的解析/规则版本。影响输入指纹和证据回放；改动解析语义时要升。
+LIVE_PARSER_VERSION = 'kessbet-parse-v1'
+LIVE_RULES_VERSION = 'live-rules-v1'
 
 # 比赛开赛后继续采多久。足球 90 分钟 + 中场 15 分 + 补时 ≈ 110 分钟，
 # 150 留了 40 分钟余量（延误、伤停、加时）。

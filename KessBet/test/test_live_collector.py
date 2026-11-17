@@ -13,6 +13,7 @@ sys.path.insert(0, BASE)
 
 import pytest
 
+from analyze.live import run as L
 from collect.live import (LiveCollector, _drop_broken_markets,
                           _parse_minute, _same_snapshot_state, _to_int)
 from common.models import Selection
@@ -80,6 +81,8 @@ def dao():
 def _purge(d):
     with d.conn.cursor() as c:
         for t in ('kessbet_odds_live', 'kessbet_odds_live_history',
+                  'kessbet_odds_live_raw', 'kessbet_live_snapshot',
+                  'kessbet_live_result_cost',
                   'kessbet_match_live', 'kessbet_match'):
             c.execute(f"DELETE FROM {t} WHERE platform=%s AND match_id=%s",
                       (PLATFORM, MID))
@@ -116,6 +119,33 @@ class FakeAdapter:
     def fetch_odds(self, match_id, home='', away=''):
         self.odds_calls += 1
         return self._odds
+
+
+class RawAdapter(FakeAdapter):
+    """同时返回原始 mari 串的 adapter（对应 KessbetAdapter 的新接口）。"""
+
+    def fetch_odds_with_raw(self, match_id, home='', away=''):
+        self.odds_calls += 1
+        return self._odds, [{'mari': '1|m,1|1,2.5,1,1|1x2'}]
+
+
+class ResultAdapter(FakeAdapter):
+    """返回结构化 fetch_result + 身份列表，用于 Task 2 信封测试。"""
+
+    def fetch_odds_result(self, match_id, home='', away=''):
+        self.odds_calls += 1
+        mari = '1|m,1|1,2.5,1,1|1x2'
+        res = {
+            'status': 'ok_nonempty', 'markets': [{'mari': mari}],
+            'raw_body': '{"code":1,"data":[]}', 'response_status': 200,
+            'response_headers': {'content-type': 'application/json'},
+            'request': {'action': '0015', 'body': {'matchId': match_id}},
+            'error': None, 'received_at': now_beijing(),
+        }
+        identity = [{'mari': mari, 'market': '1x2', 'side': '',
+                     'line': '', 'label': '1', 'odds': 2.5,
+                     'market_id': '1', 'locked': False}]
+        return self._odds, res, identity
 
 
 class StateSequenceAdapter(FakeAdapter):
@@ -159,6 +189,232 @@ def test_writes_state_and_odds(dao):
                      FROM kessbet_match_live WHERE match_id=%s""", (MID,))
         r = c.fetchone()
     assert r[0] == 7 and r[1] == 30 and r[2] == 1 and r[3] == 3
+
+
+def test_saves_immutable_snapshot_and_passes_id(dao):
+    """D01：raw、rows、state、请求时间绑定成同一快照，并传给即时分析。"""
+    import json
+    kickoff = now_beijing() - timedelta(minutes=30)
+    ad = RawAdapter(
+        state={'ms': 7, 'mt': '30:15', 'hmp': '1', 'amp': '0',
+               'hck': 3, 'ack': 1, 'hyc': 0, 'ayc': 1, 'hrc': 0, 'arc': 0},
+        odds=_sels())
+    got = []
+    lc = LiveCollector(ad, dao,
+                       on_snapshot=lambda _d, meta, rows: got.append(meta))
+
+    lc._collect_one(dao, _meta(kickoff))
+
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT snapshot_id, generation, raw_payload, rows_json,
+                            state_after
+                     FROM kessbet_live_snapshot WHERE match_id=%s""", (MID,))
+        rows = c.fetchall()
+    assert len(rows) == 1
+    sid, gen, raw_json, rows_json, state_after = rows[0]
+    raw = json.loads(raw_json)
+    assert raw['markets'][0]['mari'].endswith('|1x2')
+    assert json.loads(state_after)['ms'] == 7
+    assert json.loads(rows_json)
+
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT current_snapshot_id, generation
+                     FROM kessbet_match_live WHERE match_id=%s""", (MID,))
+        current = c.fetchone()
+    assert current == (sid, gen), '当前指针必须指向这份快照'
+
+    assert got, '快照回调没有被调用'
+    assert got[0]['snapshot_id'] == sid
+    assert got[0]['generation'] == gen
+    assert got[0]['raw_payload']
+
+
+def _state():
+    return {'ms': 7, 'mt': '30:15', 'hmp': '1', 'amp': '0',
+            'hck': 3, 'ack': 1, 'hyc': 0, 'ayc': 1, 'hrc': 0, 'arc': 0}
+
+
+def test_snapshot_stores_envelope_and_fingerprint(dao):
+    """Task 2：请求/响应信封、哈希、指纹、解析版本都落快照。"""
+    kickoff = now_beijing() - timedelta(minutes=30)
+    lc = LiveCollector(ResultAdapter(state=_state(), odds=_sels()), dao)
+    lc._collect_one(dao, _meta(kickoff))
+
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT request_json, response_json, response_hash,
+                            input_fingerprint, parser_version
+                     FROM kessbet_live_snapshot WHERE match_id=%s""", (MID,))
+        req, resp, rhash, fp, pver = c.fetchone()
+    assert '0015' in (req or '')
+    assert 'ok_nonempty' in (resp or '')
+    assert len(rhash) == 64
+    assert len(fp) == 64
+    assert pver
+
+
+def test_state_change_invalidates_snapshot_and_requeues(dao):
+    """P0：比分变化时旧快照立即失效，并排队重新拉赔率。"""
+    kickoff = now_beijing() - timedelta(minutes=30)
+    st1 = _state()
+    lc = LiveCollector(RawAdapter(state=st1, odds=_sels()), dao)
+    lc._collect_one(dao, _meta(kickoff))
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT current_snapshot_id FROM kessbet_match_live
+                     WHERE match_id=%s""", (MID,))
+        assert c.fetchone()[0], '首次采集应有当前快照'
+
+    st2 = dict(st1, hmp='2')
+    lc2 = LiveCollector(FakeAdapter(state=st2), dao)
+    lc2._collect_one(dao, _meta(kickoff), fetch_odds=False)
+
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT current_snapshot_id FROM kessbet_match_live
+                     WHERE match_id=%s""", (MID,))
+        assert c.fetchone()[0] is None, '比分变化后旧快照必须失效'
+    assert MID in lc2._dirty, '变化后应排队重新拉赔率'
+
+
+def test_same_score_poll_keeps_snapshot(dao):
+    """比分没变的状态轮询不能把当前快照打空。"""
+    kickoff = now_beijing() - timedelta(minutes=30)
+    st = _state()
+    lc = LiveCollector(RawAdapter(state=st, odds=_sels()), dao)
+    lc._collect_one(dao, _meta(kickoff))
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT current_snapshot_id FROM kessbet_match_live
+                     WHERE match_id=%s""", (MID,))
+        sid = c.fetchone()[0]
+
+    lc2 = LiveCollector(FakeAdapter(state=dict(st)), dao)
+    lc2._collect_one(dao, _meta(kickoff), fetch_odds=False)
+
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT current_snapshot_id FROM kessbet_match_live
+                     WHERE match_id=%s""", (MID,))
+        assert c.fetchone()[0] == sid
+    assert MID not in lc2._dirty
+
+
+def test_empty_odds_invalidates_current_snapshot(dao):
+    """P0：空响应不能继续认证旧快照。"""
+    kickoff = now_beijing() - timedelta(minutes=30)
+    lc = LiveCollector(RawAdapter(state=_state(), odds=_sels()), dao)
+    lc._collect_one(dao, _meta(kickoff))
+
+    lc2 = LiveCollector(FakeAdapter(state=_state(), odds=[]), dao)
+    lc2._collect_one(dao, _meta(kickoff))
+
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT current_snapshot_id FROM kessbet_match_live
+                     WHERE match_id=%s""", (MID,))
+        assert c.fetchone()[0] is None
+
+
+def test_state_failure_invalidates_current_snapshot(dao):
+    """P0：状态接口失败不能当比赛结束，但旧机会必须失效。"""
+    kickoff = now_beijing() - timedelta(minutes=30)
+    lc = LiveCollector(RawAdapter(state=_state(), odds=_sels()), dao)
+    lc._collect_one(dao, _meta(kickoff))
+
+    ad = StateSequenceAdapter([_state(), None], _sels())
+    lc2 = LiveCollector(ad, dao)
+    lc2._collect_one(dao, _meta(kickoff))
+
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT current_snapshot_id FROM kessbet_match_live
+                     WHERE match_id=%s""", (MID,))
+        assert c.fetchone()[0] is None
+    assert MID in lc2._dirty
+
+
+def test_analyzer_uses_snapshot_id_not_current_pointer(dao):
+    """D01：即使当前指针已指向新快照，按旧 snapshot_id 分析仍得到旧输入。"""
+    kickoff = now_beijing() - timedelta(minutes=30)
+    lc = LiveCollector(
+        RawAdapter(state=_state(),
+                   odds=[Selection('1x2', '', '', '1', 2.5),
+                         Selection('1x2', '', '', 'X', 3.2)]),
+        dao)
+    lc._collect_one(dao, _meta(kickoff))
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT snapshot_id, generation FROM kessbet_live_snapshot
+                     WHERE match_id=%s ORDER BY generation""", (MID,))
+        sid1, gen1 = c.fetchone()
+
+    # 第二次采集把当前指针推进到新快照
+    lc2 = LiveCollector(
+        RawAdapter(state=_state(),
+                   odds=[Selection('1x2', '', '', '1', 2.6),
+                         Selection('1x2', '', '', 'X', 3.1)]),
+        dao)
+    lc2._collect_one(dao, _meta(kickoff))
+
+    meta = _meta(kickoff)
+    meta.update({'current_snapshot_id': sid1, 'generation': gen1})
+    out = L.evaluate_live_match(dao, meta, now_beijing())
+
+    assert out['snapshot_id'] == sid1
+    assert out['selections'][0][4] == 2.5, '必须使用快照 A 的赔率'
+
+
+def test_analyzer_without_snapshot_does_not_guess(dao):
+    """迁移前/无快照的场次必须降级，不能按时间猜输入。"""
+    out = L.evaluate_live_match(
+        dao, _meta(now_beijing() - timedelta(minutes=30)), now_beijing())
+    assert out['error'] == 'no_snapshot'
+    assert out['result'] is None
+
+
+def test_result_cost_older_generation_cannot_overwrite(dao):
+    """D01：旧 generation 的分析晚完成时，不能覆盖新结果。"""
+    kickoff = now_beijing() - timedelta(minutes=30)
+    _insert_match(dao, kickoff)
+    common = dict(
+        match_id=MID, kickoff_time=kickoff, profit_pct=0.0, chosen='[]',
+        reach_states=0, n_candidates=0, minute=30, home_score=0,
+        away_score=0, ht_home=None, ht_away=None,
+        odds_updated=now_beijing(), computed_time=now_beijing(),
+    )
+
+    dao.write_live_result_cost(cost=0.9, generation=2,
+                              snapshot_id='snap-2', **common)
+    dao.write_live_result_cost(cost=1.5, generation=1,
+                              snapshot_id='snap-1', **common)
+
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT cost, snapshot_id, generation
+                     FROM kessbet_live_result_cost WHERE match_id=%s""",
+                  (MID,))
+        cost, sid, gen = c.fetchone()
+    assert float(cost) == pytest.approx(0.9)
+    assert sid == 'snap-2'
+    assert gen == 2
+
+
+def test_no_cover_status_overwrites_old_opportunity(dao):
+    """P0：新快照没有覆盖结果时，旧成本必须被 NULL + 状态覆盖。"""
+    kickoff = now_beijing() - timedelta(minutes=30)
+    _insert_match(dao, kickoff)
+    base = dict(
+        match_id=MID, kickoff_time=kickoff, profit_pct=None, chosen='[]',
+        reach_states=0, n_candidates=0, minute=30, home_score=0,
+        away_score=0, ht_home=None, ht_away=None,
+        odds_updated=now_beijing(), computed_time=now_beijing(),
+    )
+    dao.write_live_result_cost(cost=0.9, generation=1, snapshot_id='snap-1',
+                              verification_status='verified',
+                              analysis_status='valid', **base)
+    dao.write_live_result_cost(cost=None, generation=2, snapshot_id='snap-2',
+                              analysis_status='no_cover', **base)
+
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT cost, snapshot_id, generation, analysis_status
+                     FROM kessbet_live_result_cost WHERE match_id=%s""",
+                  (MID,))
+        cost, sid, gen, status = c.fetchone()
+    assert cost is None, '旧成本必须被清掉'
+    assert sid == 'snap-2' and gen == 2
+    assert status == 'no_cover'
 
 
 def test_score_change_during_fetch_requeues_without_writing_odds(dao):
@@ -220,16 +476,39 @@ def test_history_carries_score_context(dao):
 
 # ---------------------------------------------------------------- 结束与异常
 
-def test_finished_when_state_is_none(dao):
-    """接口返回 None = 比赛结束。"""
+def test_state_none_is_failure_not_finished(dao):
+    """P0：state=None 是接口失败，不是比赛结束；要失效并重试。"""
     kickoff = now_beijing() - timedelta(minutes=120)
     ad = FakeAdapter(state=None)
     lc = LiveCollector(ad, dao)
 
     lc._collect_one(dao, _meta(kickoff))
 
-    assert lc.stats['finished'] == 1
-    assert ad.odds_calls == 0, '结束后不该再拉赔率'
+    assert lc.stats.get('state_failed') == 1
+    assert lc.stats['finished'] == 0
+    assert ad.odds_calls == 0
+    assert MID in lc._dirty, '状态失败后应排队重试'
+
+
+def test_safe_collect_failure_invalidates_current_snapshot(dao):
+    """P0：采集抛异常时也要撤销当前机会并重试。"""
+    kickoff = now_beijing() - timedelta(minutes=30)
+    lc = LiveCollector(RawAdapter(state=_state(), odds=_sels()), dao)
+    lc._collect_one(dao, _meta(kickoff))
+
+    class BoomAdapter(FakeAdapter):
+        def fetch_state(self, match_id):
+            raise RuntimeError('boom')
+
+    lc2 = LiveCollector(BoomAdapter(), dao)
+    lc2._safe_collect(dao, _meta(kickoff))
+
+    with dao.conn.cursor() as c:
+        c.execute("""SELECT current_snapshot_id FROM kessbet_match_live
+                     WHERE match_id=%s""", (MID,))
+        assert c.fetchone()[0] is None
+    assert lc2.stats['failed'] == 1
+    assert MID in lc2._dirty
 
 
 def test_finished_when_status_100(dao):

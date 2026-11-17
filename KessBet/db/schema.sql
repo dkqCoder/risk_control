@@ -514,6 +514,12 @@ CREATE TABLE IF NOT EXISTS kessbet_match_live (
     fetched_time  DATETIME    NOT NULL
         COMMENT '采集时刻（北京时间）',
 
+    current_snapshot_id VARCHAR(40) DEFAULT NULL
+        COMMENT '当前有效输入快照；NULL 表示迁移前/尚未采集',
+
+    generation    BIGINT      NOT NULL DEFAULT 0
+        COMMENT '每场递增，阻止旧分析覆盖新结果',
+
     PRIMARY KEY (platform, match_id),
     KEY idx_kickoff (kickoff_time)
         COMMENT '按开赛时间清理',
@@ -624,6 +630,83 @@ CREATE TABLE IF NOT EXISTS kessbet_odds_live_history (
 
 
 -- =============================================================================
+-- ⑬½ kessbet_odds_live_raw — 滚球赔率的原始响应（取证用）
+-- -----------------------------------------------------------------------------
+-- 每次拉单场滚球赔率时，把平台返回的原始 `mari` 列表整份存下来。
+-- 它和 `kessbet_odds_live` 的区别：
+--   odds_live       解析后的可售选项，会覆盖/删除，供实时查询
+--   odds_live_raw   平台原始响应，保留锁定项和完整盘面，供事后取证
+--
+-- 为什么需要：
+--   解析器会丢掉锁定的选项（`,0,`）。判定出错时（例如 Correct Score
+--   的 `other` 把被锁定的 3:0 补进覆盖），只看解析后的数据无法证明
+--   平台当时到底返回了什么。原始串才是第一手证据。
+--
+-- 保留策略：每场只保留最近 5 份（约 2.5 分钟），命中时整份复制进
+-- kessbet_arbitrage_snapshot.replay_context.raw 永久保存。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS kessbet_odds_live_raw (
+    id           BIGINT      NOT NULL AUTO_INCREMENT,
+    platform     VARCHAR(16) NOT NULL DEFAULT 'kessbet',
+    match_id     VARCHAR(32) NOT NULL,
+    fetched_time DATETIME    NOT NULL
+        COMMENT '本地收到响应的时刻（北京时间）',
+    payload      MEDIUMTEXT  NOT NULL
+        COMMENT '原始响应 JSON：state_before/after + markets[].mari',
+    PRIMARY KEY (id),
+    KEY idx_match_time (platform, match_id, fetched_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='滚球赔率原始响应：保留锁定项和完整盘面，仅用于取证';
+
+
+-- =============================================================================
+-- ⑬½ kessbet_live_snapshot — 滚球不可变输入快照
+-- -----------------------------------------------------------------------------
+-- D01 的核心：同一次 HTTP 请求的 raw + 解析 rows + 请求前后状态绑定成一个
+-- snapshot_id，分析只按 ID 读取，不再按“15 秒内最近的 raw”猜关联。
+-- kessbet_odds_live_raw 保留给诊断工具；正式证据链用本表。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS kessbet_live_snapshot (
+    snapshot_id        VARCHAR(40)  NOT NULL,
+    platform           VARCHAR(16)  NOT NULL DEFAULT 'kessbet',
+    match_id           VARCHAR(32)  NOT NULL,
+    generation         BIGINT       NOT NULL,
+    request_started_at DATETIME     DEFAULT NULL,
+    response_received_at DATETIME   NOT NULL
+        COMMENT '本地收到赔率响应的时刻；分析的新鲜度基准',
+    state_before       MEDIUMTEXT   DEFAULT NULL,
+    state_after        MEDIUMTEXT   NOT NULL,
+    minute             SMALLINT     DEFAULT NULL,
+    home_score         SMALLINT     DEFAULT NULL,
+    away_score         SMALLINT     DEFAULT NULL,
+    ht_home            SMALLINT     DEFAULT NULL
+        COMMENT '采集时冻结的半场比分；分析/回放都使用它',
+    ht_away            SMALLINT     DEFAULT NULL,
+    request_json       MEDIUMTEXT   DEFAULT NULL
+        COMMENT '平台请求信封：URL/action/body（脱敏）',
+    response_json      MEDIUMTEXT   DEFAULT NULL
+        COMMENT '平台响应信封：状态码/必要响应头/原始响应文本/分类',
+    response_hash      CHAR(64)     DEFAULT NULL
+        COMMENT '实际收到响应文本/字节的 SHA-256',
+    parser_version     VARCHAR(32)  DEFAULT NULL,
+    input_fingerprint  CHAR(64)     DEFAULT NULL
+        COMMENT '规范输入+比分+阶段+策略版本的 SHA-256；不含接收时间',
+    phase              VARCHAR(16)  DEFAULT NULL,
+    phase_source       VARCHAR(16)  DEFAULT NULL,
+    ht_source          VARCHAR(16)  DEFAULT NULL,
+    raw_payload        MEDIUMTEXT   NOT NULL,
+    rows_json          MEDIUMTEXT   NOT NULL,
+    filter_policy      VARCHAR(64)  NOT NULL DEFAULT '',
+    created_time       DATETIME     NOT NULL,
+    analyzed_time      DATETIME     DEFAULT NULL,
+    PRIMARY KEY (snapshot_id),
+    KEY idx_match_time (platform, match_id, response_received_at),
+    KEY idx_match_gen (platform, match_id, generation)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='滚球不可变输入快照：raw + rows + state 精确绑定';
+
+
+-- =============================================================================
 -- ⑬ kessbet_live_result_cost — 滚球「比赛结果」套利判定快照
 -- -----------------------------------------------------------------------------
 -- 一场比赛一行。存的是「把全部比赛结果盘组合起来，覆盖所有可达终局的
@@ -645,10 +728,10 @@ CREATE TABLE IF NOT EXISTS kessbet_live_result_cost (
     match_id      VARCHAR(32)  NOT NULL
         COMMENT '比赛 ID',
 
-    cost          DOUBLE       NOT NULL
-        COMMENT '覆盖全部可达终局的最小 Σ(1/赔率)。< 1.0 才是套利。
-                 存 DOUBLE 不存 DECIMAL：0.99996 会被 DECIMAL(8,4)
-                 舍入成 1.0000，与「严格 <1」的语义冲突',
+    cost          DOUBLE       DEFAULT NULL
+        COMMENT '覆盖全部可达终局的最小 Σ(1/赔率)。NULL = 当前快照没有判定结果
+                 （无覆盖/无数据/模型不完备），不是 0。存 DOUBLE 不存
+                 DECIMAL：0.99996 会被 DECIMAL(8,4) 舍入成 1.0000',
 
     profit_pct    DOUBLE       DEFAULT NULL
         COMMENT '套利收益率 (1/cost - 1) × 100。cost >= 1 时是负数，
@@ -690,6 +773,24 @@ CREATE TABLE IF NOT EXISTS kessbet_live_result_cost (
 
     computed_time DATETIME     NOT NULL
         COMMENT '本次计算的时刻（北京时间）',
+
+    snapshot_id   VARCHAR(40)  DEFAULT NULL
+        COMMENT '本次判定使用的输入快照',
+
+    generation    BIGINT       NOT NULL DEFAULT 0
+        COMMENT '输入快照的 generation；旧分析不得覆盖新结果',
+
+    verification_status VARCHAR(32) DEFAULT NULL
+        COMMENT 'verified / counterexample_found / unsupported_rules / incomplete_model',
+
+    verification_detail MEDIUMTEXT DEFAULT NULL
+        COMMENT '验证器结果：反例比分、各腿返还等',
+
+    analysis_status VARCHAR(32) DEFAULT NULL
+        COMMENT 'valid / no_cover / no_data / incomplete_model / invalidated',
+
+    input_fingerprint CHAR(64) DEFAULT NULL
+        COMMENT '本次分析输入指纹；用于命中幂等和重复检测',
 
     PRIMARY KEY (platform, match_id),
     KEY idx_cost (cost)
@@ -835,6 +936,9 @@ CREATE TABLE IF NOT EXISTS kessbet_arbitrage_snapshot (
         COMMENT '滚球命中的可重放证据包：比分、分钟、半场比分、比赛阶段、
                  可达状态 mask、算法版本、原始赔率与预期求解结果。赛前命中为空',
 
+    input_fingerprint CHAR(64) DEFAULT NULL
+        COMMENT '输入指纹；同一输入不重复写正式命中',
+
     odds_updated   DATETIME     DEFAULT NULL
         COMMENT '这份快照对应的赔率版本（odds_prematch 的 MAX(updated_time)）。
                  与 match_id 一起做唯一键，保证同一份赔率只记一次',
@@ -850,6 +954,8 @@ CREATE TABLE IF NOT EXISTS kessbet_arbitrage_snapshot (
     KEY idx_alert (alert_time)
         COMMENT '按告警时间倒序查看',
     KEY idx_match (platform, match_id),
+    KEY idx_input_fp (platform, match_id, input_fingerprint)
+        COMMENT '同一输入的命中幂等',
     KEY idx_canonical (canonical_id)
         COMMENT '同一场比赛的多次命中'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
