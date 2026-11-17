@@ -374,6 +374,60 @@ def _live_row(r: dict) -> dict:
     }
 
 
+_STATUS_TEXT = {
+    'waiting': '等待数据',
+    'invalid_input': '输入无效',
+    'no_candidate': '未发现候选',
+    'unverifiable': '无法认证',
+    'verified_candidate': '已验证候选',
+    'expired': '已过期',
+    'invalidated': '已失效',
+    'shadow_candidate': '影子候选（未发布）',
+}
+
+
+def _status_text(status: str | None) -> str:
+    return _STATUS_TEXT.get(status or '', status or '等待数据')
+
+
+def _live_result_state(rc: dict, cur_sid) -> tuple[str | None, float | None]:
+    """把存储状态映射成当前机会状态，并检查报价年龄。
+
+    存储值（analysis_status）描述“分析结果是什么”；当前机会状态还要
+    叠加当前快照指针、报价年龄和验证结论。
+    """
+    if not rc:
+        return None, None
+    age = None
+    ts = rc.get('odds_updated')
+    if ts is not None:
+        age = max(0.0, (beijing_now() - ts).total_seconds())
+
+    if rc.get('snapshot_id') != cur_sid:
+        return 'invalidated', age
+    if age is not None and age > config.LIVE_ODDS_MAX_AGE_SEC:
+        return 'expired', age
+
+    raw = rc.get('analysis_status')
+    ver = rc.get('verification_status')
+    cost = rc.get('cost')
+    if raw in ('no_data', 'no_score'):
+        return 'invalid_input', age
+    if raw == 'no_cover':
+        return 'no_candidate', age
+    if raw == 'incomplete_model':
+        return 'unverifiable', age
+    if raw == 'valid':
+        if (ver == 'verified' and cost is not None and cost < 1.0):
+            return 'verified_candidate', age
+        if ver in ('counterexample_found', 'unsupported_rules'):
+            return 'unverifiable', age
+        return 'no_candidate', age
+    if raw in ('expired', 'invalidated'):
+        return raw, age
+    return 'waiting', age
+
+
 @app.get('/api/live')
 def list_live(
     sport: str = Query('sr:sport:1'),
@@ -413,7 +467,7 @@ def list_live(
                l.home_corner, l.away_corner,
                l.home_yellow, l.away_yellow,
                l.home_red, l.away_red,
-               l.kickoff_time, l.fetched_time,
+               l.kickoff_time, l.fetched_time, l.current_snapshot_id,
                m.home_team, m.away_team, m.league, m.sport,
                (SELECT COUNT(DISTINCT CONCAT_WS('|', o.market, o.side))
                 FROM kessbet_odds_live o
@@ -442,16 +496,38 @@ def list_live(
         for r in rows:
             item = _live_row(r)
             rc = costs.get(r['match_id'])
-            item['result'] = ({
-                'cost': rc['cost'],
-                'profit_pct': rc['profit_pct'],
-                'is_arbitrage': (rc['cost'] is not None and rc['cost'] < 1.0),
-                'reach_states': rc['reach_states'],
-                'n_candidates': rc['n_candidates'],
-                'minute': rc['minute'],
-            } if rc else None)
+            cur_sid = r.get('current_snapshot_id')
+            if rc:
+                status, age = _live_result_state(rc, cur_sid)
+                item['result'] = {
+                    'cost': rc['cost'],
+                    'profit_pct': rc['profit_pct'],
+                    'is_arbitrage': status == 'verified_candidate',
+                    'is_candidate': status == 'verified_candidate',
+                    'verification_status': rc.get('verification_status'),
+                    'analysis_status': status,
+                    'status_text': _status_text(status),
+                    'status_reason': rc.get('status_reason'),
+                    'is_stale': bool(
+                        age is not None
+                        and age > config.LIVE_ODDS_MAX_AGE_SEC),
+                    'quote_age_sec': (round(age, 1)
+                                      if age is not None else None),
+                    'odds_updated': _iso(rc.get('odds_updated')),
+                    'reach_states': rc['reach_states'],
+                    'n_candidates': rc['n_candidates'],
+                    'minute': rc['minute'],
+                    'computed_time': _iso(rc.get('computed_time')),
+                }
+            else:
+                item['result'] = None
             out.append(item)
-        return {'total': len(rows), 'matches': out}
+        return {
+            'total': len(rows),
+            'matches': out,
+            'live_analyze_enabled': bool(
+                getattr(config, 'LIVE_ANALYZE_ENABLED', False)),
+        }
     finally:
         dao.close()
 
@@ -481,12 +557,17 @@ def live_result_costs(
             SELECT r.match_id, r.cost, r.profit_pct, r.reach_states,
                    r.n_candidates, r.minute, r.home_score, r.away_score,
                    r.ht_home, r.ht_away, r.kickoff_time, r.computed_time,
+                   r.verification_status, r.analysis_status, r.snapshot_id,
+                   r.odds_updated, r.status_reason, r.input_fingerprint,
+                   l.current_snapshot_id,
                    m.home_team, m.away_team, m.league
             FROM kessbet_live_result_cost r
             JOIN kessbet_match m
               ON m.platform = r.platform AND m.match_id = r.match_id
+            LEFT JOIN kessbet_match_live l
+              ON l.platform = r.platform AND l.match_id = r.match_id
             WHERE {' AND '.join(where)}
-            ORDER BY r.cost ASC
+            ORDER BY r.cost IS NULL, r.cost ASC
             LIMIT %s
             """, args + [limit])
             rows = c.fetchall()
@@ -497,20 +578,31 @@ def live_result_costs(
             """)
             st = c.fetchone()
 
-        return {
-            'total': int(st['n'] or 0),
-            'min_cost': (float(st['lo']) if st['lo'] is not None else None),
-            'avg_cost': (float(st['avg_']) if st['avg_'] is not None else None),
-            'arbitrage': int(sum(1 for r in rows if float(r['cost']) < 1.0)),
-            'rows': [{
+        out_rows = []
+        verified = 0
+        for r in rows:
+            cost = float(r['cost']) if r['cost'] is not None else None
+            status, age = _live_result_state({
+                'analysis_status': r['analysis_status'],
+                'verification_status': r['verification_status'],
+                'snapshot_id': r['snapshot_id'],
+                'odds_updated': r['odds_updated'],
+                'cost': cost,
+            }, r['current_snapshot_id'])
+            is_arb = status == 'verified_candidate'
+            if is_arb:
+                verified += 1
+            out_rows.append({
                 'match_id': r['match_id'],
-                'cost': float(r['cost']),
+                'cost': cost,
                 'profit_pct': (float(r['profit_pct'])
                                if r['profit_pct'] is not None else None),
                 'reach_states': r['reach_states'],
                 'n_candidates': r['n_candidates'],
                 'minute': r['minute'],
-                'score': '%s:%s' % (r['home_score'], r['away_score']),
+                'score': ('%s:%s' % (r['home_score'], r['away_score'])
+                          if r['home_score'] is not None
+                          and r['away_score'] is not None else None),
                 'half_time': ('%s:%s' % (r['ht_home'], r['ht_away'])
                               if r['ht_home'] is not None else None),
                 'home_team': r['home_team'],
@@ -518,7 +610,25 @@ def live_result_costs(
                 'league': r['league'],
                 'kickoff_time': _iso(r['kickoff_time']),
                 'computed_time': _iso(r['computed_time']),
-            } for r in rows],
+                'verification_status': r['verification_status'],
+                'analysis_status': status,
+                'status_text': _status_text(status),
+                'status_reason': r['status_reason'],
+                'is_arbitrage': is_arb,
+                'is_stale': bool(age is not None
+                                 and age > config.LIVE_ODDS_MAX_AGE_SEC),
+                'quote_age_sec': round(age, 1) if age is not None else None,
+                'odds_updated': _iso(r['odds_updated']),
+                'snapshot_id': r['snapshot_id'],
+                'input_fingerprint': r['input_fingerprint'],
+            })
+
+        return {
+            'total': int(st['n'] or 0),
+            'min_cost': (float(st['lo']) if st['lo'] is not None else None),
+            'avg_cost': (float(st['avg_']) if st['avg_'] is not None else None),
+            'arbitrage': verified,
+            'rows': out_rows,
         }
     finally:
         dao.close()
@@ -706,21 +816,43 @@ def live_detail(match_id: str) -> dict:
 
         out = _live_row(row)
         out['markets'] = group_markets(rows, row['home_team'], row['away_team'])
+        # 判定是否在跑。关闭时 result 里是最后一次计算的历史值，
+        # 页面必须标成「历史结果」，不能继续显示为当前机会。
+        out['live_analyze_enabled'] = bool(
+            getattr(config, 'LIVE_ANALYZE_ENABLED', False))
 
         # 比赛结果套利判定（核心指标）
         rc = dao.get_live_result_cost(match_id)
-        if rc and rc.get('cost') is not None:
+        if rc:
+            status, age = _live_result_state(
+                rc, row.get('current_snapshot_id'))
+            cost = rc.get('cost')
             chosen = json.loads(rc.get('chosen') or '[]')
             out['result'] = {
-                'cost': rc['cost'],
-                'profit_pct': rc['profit_pct'],
-                'is_arbitrage': rc['cost'] < 1.0,
-                'reach_states': rc['reach_states'],
-                'n_candidates': rc['n_candidates'],
-                'minute': rc['minute'],
-                'score': '%s:%s' % (rc['home_score'], rc['away_score']),
+                'cost': cost,
+                'profit_pct': rc.get('profit_pct'),
+                'is_arbitrage': status == 'verified_candidate',
+                'is_candidate': status == 'verified_candidate',
+                'verification_status': rc.get('verification_status'),
+                'verification_detail': (
+                    json.loads(rc['verification_detail'])
+                    if rc.get('verification_detail') else None),
+                'analysis_status': status,
+                'status_text': _status_text(status),
+                'status_reason': rc.get('status_reason'),
+                'is_stale': bool(
+                    age is not None and age > config.LIVE_ODDS_MAX_AGE_SEC),
+                'quote_age_sec': (round(age, 1)
+                                  if age is not None else None),
+                'odds_updated': _iso(rc.get('odds_updated')),
+                'reach_states': rc.get('reach_states'),
+                'n_candidates': rc.get('n_candidates'),
+                'minute': rc.get('minute'),
+                'score': ('%s:%s' % (rc['home_score'], rc['away_score'])
+                          if rc.get('home_score') is not None
+                          and rc.get('away_score') is not None else None),
                 'half_time': ('%s:%s' % (rc['ht_home'], rc['ht_away'])
-                              if rc['ht_home'] is not None else None),
+                              if rc.get('ht_home') is not None else None),
                 'chosen': [{
                     'desc': c['desc'],
                     'text': describe_pick(c['desc'], row['home_team'],
@@ -728,7 +860,7 @@ def live_detail(match_id: str) -> dict:
                     'odds': float(c['odds']) if c.get('odds') else None,
                     'weight': c.get('weight'),
                 } for c in chosen],
-                'computed_time': _iso(rc['computed_time']),
+                'computed_time': _iso(rc.get('computed_time')),
             }
         else:
             out['result'] = None
@@ -917,6 +1049,66 @@ def arbitrage_detail(snap_id: int) -> dict:
         dao.close()
 
 
+@app.get('/api/evidence/{snap_id}')
+def evidence_detail(snap_id: int) -> dict:
+    """不可变证据页的数据：命中快照 + 同一次请求的原始平台响应。
+
+    和 `/api/arbitrage/{id}` 的区别：这里返回完整 `replay_context`
+    （含原始 `mari` 响应），页面只读快照，不读实时赔率表。
+    """
+    dao = _dao()
+    try:
+        r = dao.get_arbitrage(snap_id)
+        if not r:
+            raise HTTPException(404, 'snapshot not found')
+        out = _arb_row(r)
+        detail = json.loads(r.get('market_detail') or '[]')
+        _annotate_detail(detail, r.get('home_team') or '',
+                         r.get('away_team') or '')
+        out['market_detail'] = detail
+        try:
+            replay = (json.loads(r['replay_context'])
+                      if r.get('replay_context') else None)
+        except (TypeError, ValueError):
+            replay = None
+        out['replay'] = replay
+        raw = (replay or {}).get('raw')
+        ver = (replay or {}).get('verification') or {}
+        vstatus = ver.get('status')
+        if vstatus == 'verified':
+            analysis_status = 'verified'
+            analysis_text = '白名单无界验证通过；仍需官网共同观察核验'
+        elif vstatus == 'counterexample_found':
+            ce = ver.get('counterexample') or {}
+            analysis_status = 'counterexample_found'
+            analysis_text = (
+                '发现亏损反例：%s:%s 返还 %.4f'
+                % (ce.get('home_score'), ce.get('away_score'),
+                   ce.get('payout') or 0.0))
+        elif vstatus == 'unsupported_rules':
+            analysis_status = 'unsupported_rules'
+            analysis_text = '包含非白名单市场，不能认证'
+        else:
+            analysis_status = 'internal_candidate'
+            analysis_text = '内部候选，尚未通过完备性/官网核验'
+        out['evidence'] = {
+            'raw_available': bool(raw),
+            'raw_fetched_time': (replay or {}).get('raw_fetched_time'),
+            'level': 'E1' if raw else 'E0',
+            'level_label': '原始接口已存' if raw else '仅内部记录',
+            'level_text': ('已保存同一次请求的原始接口响应；'
+                           '尚未完成官网共同观察核验'
+                           if raw else
+                           '仅内部计算记录：没有保存同一次请求的原始接口响应'),
+            'analysis_status': analysis_status,
+            'analysis_status_text': analysis_text,
+            'verification': ver,
+        }
+        return out
+    finally:
+        dao.close()
+
+
 @app.get('/api/arbitrage/{snap_id}/replay')
 def replay_arbitrage(snap_id: int) -> dict:
     """用命中时保存的证据包重新计算滚球套利，验证结果能否复现。"""
@@ -1034,3 +1226,12 @@ def live_detail_page(match_id: str = ''):
     if os.path.isfile(p):
         return _page(p)
     raise HTTPException(404, 'web/live_detail.html not found')
+
+
+@app.get('/evidence/{snap_id}')
+def evidence_page(snap_id: int):
+    """不可变的命中证据页。只读快照，不读实时赔率表。"""
+    p = os.path.join(WEB_DIR, 'evidence.html')
+    if os.path.isfile(p):
+        return _page(p)
+    raise HTTPException(404, 'web/evidence.html not found')

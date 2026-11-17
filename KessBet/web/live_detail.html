@@ -96,6 +96,9 @@ td.cost.near{color:var(--warning)}
 .rs-badge.crit{color:var(--good); border-color:rgba(10,125,10,.5);
   background:rgba(10,125,10,.14); font-weight:600}
 .rs-badge.crit i{background:var(--good)}
+.rs-badge.mute{color:var(--warning); border-color:rgba(138,90,0,.4);
+  background:rgba(138,90,0,.08)}
+.rs-badge.mute i{background:var(--warning)}
 .rs-note{font-size:12px; color:var(--muted)}
 .rs-note b{color:var(--fg); font-weight:600; font-variant-numeric:tabular-nums}
 .rs-tip{font-size:12px; color:var(--muted); margin:10px 0 0; line-height:1.7}
@@ -152,6 +155,17 @@ td.cost.arb{color:var(--good); font-weight:700}
 .sel .up{color:var(--critical); font-size:11px}
 .sel .down{color:var(--good); font-size:11px}
 
+/* 参与上方「比赛结果套利」组合的选项：绿色标记。
+   .sel.on（用户选中看走势）是蓝色底 + 蓝色外圈，这里用绿色底 + 绿色边，
+   两者同时出现时靠外圈区分，不会互相盖掉。 */
+.sel.arb{border-color:rgba(10,110,10,.55); background:rgba(10,110,10,.09)}
+.sel.arb .o{color:var(--good)}
+.sel .w{font-size:10px; font-weight:700; color:var(--good);
+  background:rgba(10,110,10,.12); border-radius:3px; padding:0 5px;
+  white-space:nowrap; align-self:center}
+.mkt-tag.arb{color:var(--good); border-color:rgba(10,110,10,.35);
+  background:rgba(10,110,10,.07)}
+
 @media (max-width:720px){
   .mkt{grid-template-columns:1fr}
   .mkt-head{border-right:none; border-bottom:1px solid rgba(201,207,214,.4);
@@ -188,7 +202,8 @@ footer{color:var(--dim); font-size:12px; margin-top:14px; line-height:1.8}
     <p class="hint">
       把全部比赛结果盘（1x2 / 大小球 / 让球 / 正确比分 / 半场盘）组合起来，
       覆盖当前比分下所有<b>可达终局</b>所需的最小 Σ(1/赔率)。
-      <b>&lt; 1 才是套利</b>；正常 1.05–1.15，就是平台抽水。<br>
+      <b>&lt; 1 是候选</b>；还要核对结算规则和官网原始报价，不能仅凭这个数字下注。
+      正常 1.05–1.15，就是平台抽水。<br>
       滚球时不是所有终局都可能：当前 1:0 时 <code>0:0</code> 已经不可能了，
       所以状态空间比开赛前小得多（下半场锁住半场比分后只剩 4% 左右）。
     </p>
@@ -207,6 +222,11 @@ footer{color:var(--dim); font-size:12px; margin-top:14px; line-height:1.8}
 
   <div class="card">
     <h2>全部盘口</h2>
+    <p class="hint">
+      这里只显示<b>当前报价</b>。历史命中组合与配资请打开对应的
+      <b>证据页</b>（<code>/evidence/&lt;snapshot_id&gt;</code>），动态页不把旧组合
+      贴到新价格上。
+    </p>
     <div id="mkts"></div>
   </div>
 
@@ -280,26 +300,59 @@ function renderBoard(d){
 // 这是本页的主角：把全部比赛结果盘（1x2/大小球/让球/正确比分/半场盘）
 // 组合起来，覆盖所有可达终局所需的最小 Σ(1/赔率)。< 1 才是套利。
 function renderResult(rc){
+  const status = rc && rc.analysis_status;
   if (!rc || rc.cost == null){
-    $('rsBody').innerHTML = `<div class="empty">
-      这场比赛还没有判定结果。需要比分和至少几个结果盘口，
-      且能构成完整覆盖 —— 采集到数据后会自动计算。</div>`;
+    const reason = {
+      waiting: '当前快照还没有判定结果',
+      no_candidate: '当前快照没有能覆盖全部结果的组合',
+      unverifiable: '当前快照无法完成认证（规则/边界/验证未通过）',
+      invalid_input: '当前快照输入无效或缺少数据',
+      expired: '结果已过期，正在等待新的报价',
+      invalidated: '结果已失效，正在等待新的赔率快照',
+    }[status] || '当前快照还没有判定结果';
+    $('rsBody').innerHTML = `<div class="empty">${esc(reason)}。
+      采集到新数据后会重新计算。</div>`;
     return;
   }
 
   const arb = rc.is_arbitrage;
   const pct = rc.profit_pct;
+  const statusText = rc.status_text || '';
+  const invalidated = status === 'invalidated';
+  const expired = status === 'expired';
+  const staleResult = invalidated || expired;
+  // 判定关闭时，result 是最后一次计算的历史值，不能继续显示为当前机会。
+  const paused = DATA && DATA.live_analyze_enabled === false;
+  const ver = rc.verification_status;
+  const vd = rc.verification_detail || {};
+  const ce = vd.counterexample || {};
+  let verNote = '';
+  if (ver === 'counterexample_found'){
+    verNote = `无界验证发现亏损反例：${ce.home_score}:${ce.away_score}`
+            + ` 返还 ${Number(ce.payout || 0).toFixed(4)} —— 不是套利。`;
+  }else if (ver === 'unsupported_rules'){
+    verNote = '组合包含非白名单市场，未通过认证。';
+  }else if (ver === 'verified'){
+    verNote = '白名单无界验证通过；仍需官网共同观察核验。';
+  }
   $('rsHead').innerHTML = `
-    <div class="rs-cost ${arb ? 'arb' : ''}">${rc.cost.toFixed(4)}</div>
+    <div class="rs-cost ${arb && !paused ? 'arb' : ''}">${rc.cost.toFixed(4)}</div>
     <div class="rs-meta">
-      <div class="rs-badge ${arb ? 'crit' : 'ok'}">
-        <i></i>${arb ? `套利 +${pct.toFixed(2)}%` : `无套利（抽水 ${(-pct).toFixed(2)}%）`}
+      <div class="rs-badge ${paused || staleResult ? 'mute'
+          : (arb ? 'crit' : (status === 'unverifiable'
+                             || status === 'invalid_input' ? 'mute' : 'ok'))}">
+        <i></i>${paused ? '判定已暂停 · 历史结果'
+          : (expired ? `${statusText || '已过期'} · 等待新报价`
+          : (invalidated ? `${statusText || '已失效'} · 等待新快照`
+          : (arb ? `已验证候选 +${pct.toFixed(2)}%`
+                 : (statusText || '等待数据'))))}
       </div>
       <div class="rs-note">
-        当前 ${esc(rc.score)}${rc.half_time ? ` · 半场 ${esc(rc.half_time)}` : ''}
+        <b>计算时</b> ${esc(rc.score)}${rc.half_time ? ` · 半场 ${esc(rc.half_time)}` : ''}
         ${rc.minute != null ? ` · 第 ${rc.minute} 分钟` : ''}
         · 可达终局 <b>${rc.reach_states}</b> 个
         · 参与求解 <b>${rc.n_candidates}</b> 个选项
+        · 成本/收益均为计算时结果
       </div>
     </div>`;
 
@@ -309,6 +362,20 @@ function renderResult(rc){
   }
 
   $('rsBody').innerHTML = `
+    ${paused ? `<p class="rs-tip" style="color:var(--warning);font-weight:600">
+      ⚠ 滚球判定已暂停。下面是最后一次计算的历史结果，不代表当前仍有这个机会。
+    </p>` : ''}
+    ${invalidated ? `<p class="rs-tip" style="color:var(--warning);font-weight:600">
+      ⚠ 这份结果对应的快照已不是当前快照，展示的是历史值；等待新赔率后重新判定。
+    </p>` : ''}
+    ${expired ? `<p class="rs-tip" style="color:var(--warning);font-weight:600">
+      ⚠ 报价已超过 90 秒没有更新，当前结果已过期${
+        rc.quote_age_sec != null ? `（约 ${Math.round(rc.quote_age_sec)} 秒）` : ''}；
+      等待平台新推送后重新判定。
+    </p>` : ''}
+    ${verNote ? `<p class="rs-tip" style="color:${
+      ver === 'verified' ? 'var(--good)' : 'var(--warning)'
+    };font-weight:600">${esc(verNote)}</p>` : ''}
     <table>
       <thead><tr>
         <th>选项</th>
@@ -326,9 +393,11 @@ function renderResult(rc){
       </tbody>
     </table>
     <p class="rs-tip">
-      按 <b>1/赔率 反比</b>分配，任何结果返还金额都相同。
-      ${arb ? '总投注额 = 返还额 × 成本，成本 &lt; 1 所以稳赚。' :
-              '成本 &gt; 1，无论怎么分配都会亏 —— 亏掉的正是平台抽水。'}
+      按 <b>1/赔率 反比</b>分配；覆盖不重叠时各结果返还相同，重叠时只会更高，
+      这里展示的是<b>最低返还</b>。
+      ${arb ? '成本 &lt; 1 时按此比例下注，理论最低返还高于总投注 —— 这是候选，不是已核验套利。' :
+              '成本 &gt; 1，按这个组合分配会亏损，亏掉的正是平台抽水。'}
+      历史组合与配资请在<b>证据页</b>查看；动态页不把旧组合贴到新价格上。
     </p>`;
 }
 

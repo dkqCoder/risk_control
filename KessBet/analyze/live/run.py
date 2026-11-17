@@ -386,6 +386,9 @@ def _persist_cost(dao, meta: dict, r: dict, ht, now) -> None:
                                         ensure_ascii=False)
                              if r.get('verification') else None),
         analysis_status='valid',
+        status_reason=((r.get('verification') or {}).get('status')
+                       or ('verified' if r.get('is_arbitrage')
+                           else 'no_candidate')),
         input_fingerprint=meta.get('input_fingerprint'),
     )
 
@@ -419,6 +422,7 @@ def _persist_status(dao, meta: dict, status: str, now,
             generation=(a.get('generation')
                         or meta.get('generation') or 0),
             analysis_status=status,
+            status_reason=status,
             input_fingerprint=meta.get('input_fingerprint'),
         )
     except Exception as e:

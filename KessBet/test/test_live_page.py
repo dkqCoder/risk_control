@@ -90,6 +90,7 @@ def seeded():
 def _purge(d):
     with d.conn.cursor() as c:
         for t in ('kessbet_odds_live', 'kessbet_odds_live_history',
+                  'kessbet_live_result_cost', 'kessbet_live_snapshot',
                   'kessbet_match_live',
                   'kessbet_match'):
             c.execute(f"DELETE FROM {t} WHERE platform=%s AND match_id=%s",
@@ -100,7 +101,7 @@ def _purge(d):
 @pytest.fixture()
 def clean(seeded):
     d = seeded
-    yield
+    yield d
     _purge(d)
     d.close()
 
@@ -202,3 +203,165 @@ def test_pages_render(client, path):
     r = client.get(path)
     assert r.status_code == 200
     assert b'<html' in r.content[:200].lower()
+
+
+# ---------------------------------------------------------------- 到期检查
+
+def test_live_result_state_expires_stale_quote():
+    """P0：当前指针没变，但报价超过 90 秒也必须判过期。"""
+    from datetime import timedelta
+    from web.api import _live_result_state
+
+    stale = {'analysis_status': 'valid', 'snapshot_id': 's1',
+             'odds_updated': beijing_now() - timedelta(seconds=120)}
+    status, age = _live_result_state(stale, 's1')
+    assert status == 'expired'
+    assert age >= 120
+
+    fresh = {'analysis_status': 'valid', 'snapshot_id': 's1',
+             'verification_status': 'verified', 'cost': 0.8,
+             'odds_updated': beijing_now() - timedelta(seconds=5)}
+    assert _live_result_state(fresh, 's1')[0] == 'verified_candidate'
+    assert _live_result_state(fresh, 's2')[0] == 'invalidated'
+
+
+def _seed_result(d, cost, analysis_status='valid',
+                 verification_status=None, age_sec=5, snapshot_id='s1'):
+    with d.conn.cursor() as c:
+        c.execute("DELETE FROM kessbet_live_result_cost WHERE match_id=%s",
+                  (MID,))
+        c.execute("""INSERT INTO kessbet_live_result_cost
+                     (platform, match_id, cost, profit_pct, chosen,
+                      reach_states, n_candidates, minute, home_score,
+                      away_score, kickoff_time, computed_time,
+                      odds_updated, snapshot_id, generation,
+                      verification_status, analysis_status)
+                     VALUES ('kessbet',%s,%s,28.0,'[]',0,0,55,1,0,
+                             NOW() - INTERVAL 1 HOUR, NOW(),
+                             NOW() - INTERVAL %s SECOND,%s,1,%s,%s)""",
+                  (MID, cost, age_sec, snapshot_id,
+                   verification_status, analysis_status))
+        c.execute("""UPDATE kessbet_match_live SET current_snapshot_id=%s
+                     WHERE match_id=%s""", (snapshot_id, MID))
+    d.conn.commit()
+
+
+def test_result_costs_null_cost_is_json_safe(client, clean):
+    _seed_result(clean, cost=None, analysis_status='no_cover')
+    r = client.get('/api/live/result-costs?limit=500')
+    assert r.status_code == 200
+    row = [x for x in r.json()['rows'] if x['match_id'] == MID][0]
+    assert row['cost'] is None
+    assert row['analysis_status'] == 'no_candidate'
+    assert r.json()['arbitrage'] == 0
+
+
+def test_detail_shows_expired_not_arbitrage(client, clean):
+    _seed_result(clean, cost=0.8, analysis_status='valid',
+                 verification_status='verified', age_sec=120)
+    d = client.get(f'/api/live/{MID}').json()
+    assert d['result']['analysis_status'] == 'expired'
+    assert d['result']['is_arbitrage'] is False
+    assert d['result']['status_text'] == '已过期'
+
+
+# ---------------------------------------------------------------- 证据页
+
+EVID_MID = '_test_evidence_'
+
+
+def _insert_evidence_snapshot(d):
+    import json
+    replay = {
+        'minute': 50,
+        'home_score': 0,
+        'away_score': 0,
+        'raw_fetched_time': '2026-11-17 13:00:00',
+        'raw': {
+            'fetched_time': '2026-11-17 13:00:00',
+            'state': {'ms': 7, 'mt': '50:00'},
+            'markets': [{'mari': '1|m,1|1,2.0,1,1|1x2'}],
+        },
+        'expected': {
+            'cost': 0.9,
+            'chosen': [['1x2|||1', 2.0]],
+            'n_candidates': 1,
+            'is_arbitrage': True,
+        },
+        'selections': [['1x2', '', '', '1', 2.0]],
+    }
+    with d.conn.cursor() as c:
+        c.execute("""INSERT INTO kessbet_arbitrage_snapshot
+                     (alert_time, platform, match_id, canonical_id, sport,
+                      home_team, away_team, league, kickoff_time,
+                      cost, cost_scope, ilp_chosen, lp_chosen,
+                      n_markets, n_selections, n_candidates,
+                      market_detail, replay_context, odds_updated, is_live)
+                     VALUES (NOW(),'kessbet',%s,%s,'sr:sport:1','H','A','L',
+                      NOW() - INTERVAL 1 HOUR, 0.9, 'single',
+                      '["1x2|||1"]',
+                      '[{"desc":"1x2|||1","weight":1.0}]',
+                      1, 1, 1, '[]', %s, NOW() - INTERVAL 1 MINUTE, 1)""",
+                  (EVID_MID, f'local:kessbet:{EVID_MID}',
+                   json.dumps(replay, ensure_ascii=False)))
+        sid = c.lastrowid
+    d.conn.commit()
+    return sid
+
+
+def _purge_evidence(d):
+    with d.conn.cursor() as c:
+        c.execute("DELETE FROM kessbet_arbitrage_snapshot WHERE match_id=%s",
+                  (EVID_MID,))
+    d.conn.commit()
+
+
+def test_evidence_api_exposes_raw_payload(client):
+    d = Dao()
+    _purge_evidence(d)
+    try:
+        sid = _insert_evidence_snapshot(d)
+        r = client.get(f'/api/evidence/{sid}')
+        assert r.status_code == 200
+        data = r.json()
+        assert data['evidence']['raw_available'] is True
+        assert data['evidence']['level'] == 'E1'
+        assert data['replay']['raw']['markets'][0]['mari']
+        assert data['lp_chosen'][0]['weight'] == 1.0
+    finally:
+        _purge_evidence(d)
+        d.close()
+
+
+def test_evidence_page_renders(client):
+    d = Dao()
+    _purge_evidence(d)
+    try:
+        sid = _insert_evidence_snapshot(d)
+        r = client.get(f'/evidence/{sid}')
+        assert r.status_code == 200
+        assert b'<html' in r.content[:200].lower()
+    finally:
+        _purge_evidence(d)
+        d.close()
+
+
+def test_live_raw_keeps_recent_and_finds_nearest():
+    d = Dao()
+    mid = '_test_live_raw_'
+    try:
+        base = beijing_now()
+        for i in range(7):
+            d.save_live_raw(mid, base, f'{{"i":{i}}}')
+        with d.conn.cursor() as c:
+            c.execute("SELECT COUNT(*) FROM kessbet_odds_live_raw "
+                      "WHERE match_id=%s", (mid,))
+            assert c.fetchone()[0] == 5
+        row = d.get_live_raw_near(mid, base)
+        assert row is not None and row['payload']
+    finally:
+        with d.conn.cursor() as c:
+            c.execute("DELETE FROM kessbet_odds_live_raw WHERE match_id=%s",
+                      (mid,))
+        d.conn.commit()
+        d.close()

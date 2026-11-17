@@ -685,6 +685,7 @@ class Dao:
                                verification_status: str | None = None,
                                verification_detail: str | None = None,
                                analysis_status: str = 'valid',
+                               status_reason: str | None = None,
                                input_fingerprint: str | None = None) -> None:
         """写一场比赛的「比赛结果」套利判定（一场一行，覆盖）。
 
@@ -700,8 +701,8 @@ class Dao:
            n_candidates, minute, home_score, away_score, ht_home, ht_away,
            kickoff_time, odds_updated, computed_time,
            snapshot_id, generation, verification_status, verification_detail,
-           analysis_status, input_fingerprint)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           analysis_status, status_reason, input_fingerprint)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON DUPLICATE KEY UPDATE
           cost = IF(VALUES(generation) >= generation, VALUES(cost), cost),
           profit_pct = IF(VALUES(generation) >= generation,
@@ -738,6 +739,8 @@ class Dao:
                                    verification_detail),
           analysis_status = IF(VALUES(generation) >= generation,
                                VALUES(analysis_status), analysis_status),
+          status_reason = IF(VALUES(generation) >= generation,
+                             VALUES(status_reason), status_reason),
           input_fingerprint = IF(VALUES(generation) >= generation,
                                  VALUES(input_fingerprint),
                                  input_fingerprint),
@@ -749,7 +752,8 @@ class Dao:
                 n_candidates, minute, home_score, away_score, ht_home, ht_away,
                 kickoff_time, odds_updated, computed_time,
                 snapshot_id, generation, verification_status,
-                verification_detail, analysis_status, input_fingerprint,
+                verification_detail, analysis_status, status_reason,
+                input_fingerprint,
             ))
         self.conn.commit()
 
@@ -764,7 +768,7 @@ class Dao:
                n_candidates, minute, home_score, away_score,
                ht_home, ht_away, computed_time, verification_status,
                verification_detail, analysis_status, snapshot_id, generation,
-               odds_updated, input_fingerprint
+               odds_updated, input_fingerprint, status_reason
         FROM kessbet_live_result_cost
         WHERE platform=%s AND match_id IN ({ph})
         """
@@ -787,6 +791,7 @@ class Dao:
                     'generation': r[16],
                     'odds_updated': r[17],
                     'input_fingerprint': r[18],
+                    'status_reason': r[19],
                 }
             return out
 

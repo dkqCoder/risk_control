@@ -789,6 +789,9 @@ CREATE TABLE IF NOT EXISTS kessbet_live_result_cost (
     analysis_status VARCHAR(32) DEFAULT NULL
         COMMENT 'valid / no_cover / no_data / incomplete_model / invalidated',
 
+    status_reason VARCHAR(64) DEFAULT NULL
+        COMMENT 'no_cover/no_data/no_score/incomplete_model/verified/...',
+
     input_fingerprint CHAR(64) DEFAULT NULL
         COMMENT '本次分析输入指纹；用于命中幂等和重复检测',
 

@@ -130,6 +130,8 @@ td.cost.near{color:var(--warning)}
 <script>
 const $ = id => document.getElementById(id);
 const state = { onlyInPlay: true, loading: false, timer: null };
+// 判定关闭时，成本/套利徽章都是历史计算结果，不能显示为当前机会。
+let PAUSED = true;
 
 function esc(s){ return String(s == null ? '' : s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -142,23 +144,32 @@ function minuteLabel(m){
   return `<span class="${cls}">${min}'</span>`;
 }
 
-// 成本 < 1 才是套利。正常区间 1.05~1.15，就是平台抽水。
+// 成本 < 1 是候选。正常区间 1.05~1.15，就是平台抽水。
+// 判定关闭时不对旧成本着色，避免看起来像当前机会。
 function costClass(v){
-  if (v == null) return '';
+  if (PAUSED || v == null) return '';
   if (v < 1.0) return 'arb';
   if (v < 1.05) return 'near';
   return '';
 }
 
-// 套利徽章：<1 才显示。平时应该是空的 —— 一旦出现就是要立刻处理的事。
+// 套利徽章：<1 才显示。判定暂停时只显示历史状态，不显示「套利」。
 function arbBadge(rc){
+  if (PAUSED){
+    return '<span class="badge mute"><i></i>判定暂停</span>';
+  }
+  const st = rc && rc.analysis_status;
+  const text = (rc && rc.status_text) || '';
+  if (st === 'expired' || st === 'invalidated'){
+    return `<span class="badge mute"><i></i>${text || st}</span>`;
+  }
   if (!rc || rc.cost == null){
-    return '<span class="badge mute"><i></i>待算</span>';
+    return `<span class="badge mute"><i></i>${text || '待算'}</span>`;
   }
-  if (rc.cost < 1.0){
-    return `<span class="badge crit"><i></i>套利 +${rc.profit_pct.toFixed(2)}%</span>`;
+  if (st === 'verified_candidate'){
+    return `<span class="badge crit"><i></i>${text || '已验证候选'}</span>`;
   }
-  return '<span class="badge ok"><i></i>无</span>';
+  return `<span class="badge mute"><i></i>${text || '无'}</span>`;
 }
 
 function scoreCell(m){
@@ -179,6 +190,7 @@ async function load(){
     const r = await fetch('/api/live?' + p);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
+    PAUSED = d.live_analyze_enabled === false;
     render(d.matches);
     $('stCount').textContent = `${d.total} 场`;
     $('stSync').textContent = '更新于 ' + new Date().toLocaleTimeString();
@@ -202,6 +214,12 @@ function render(matches){
   }
 
   $('content').innerHTML = `
+    ${PAUSED ? `<div style="margin:0 0 12px; padding:10px 14px;
+        border-left:3px solid var(--warning); background:rgba(138,90,0,.08);
+        color:var(--warning); font-size:13px">
+      ⚠ 滚球判定已暂停。下面的成本/收益是<b>历史计算结果</b>，不代表当前机会；
+      命中组合请看对应的证据页。
+    </div>` : ''}
     <table>
       <thead><tr>
         <th>状态</th>
@@ -221,7 +239,8 @@ function render(matches){
           <td class="teams">${esc(m.home_team)}
             <small>vs ${esc(m.away_team)} · ${esc(m.league || '—')}</small></td>
           <td class="num">${scoreCell(m)}</td>
-          <td class="num cost ${costClass(rc && rc.cost)}">${
+          <td class="num cost ${costClass(rc && rc.cost)}"
+              title="${PAUSED ? '计算时历史结果，不代表当前机会' : ''}">${
             rc && rc.cost != null ? rc.cost.toFixed(4) : '<span style="color:var(--muted)">—</span>'}</td>
           <td>${arbBadge(rc)}</td>
           <td class="num">${m.n_markets || '—'}</td>

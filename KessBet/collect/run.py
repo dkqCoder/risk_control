@@ -304,10 +304,25 @@ class Collector:
         if self.live:
             self.live.mark_dirty(match_id)
 
+    def _on_remove(self, match_id: str) -> None:
+        """WS 删盘：保守地让整场当前机会失效并排队全量重取。
+
+        v1 尚未把删除事件精确映射到市场 ID；按设计，无法映射时整场
+        失效比继续沿用旧机会安全。
+        """
+        self.refresher.mark_removed(match_id)
+        if self.live:
+            try:
+                self.live.dao.invalidate_live_snapshot(match_id)
+            except Exception:
+                log.exception('live invalidation on remove failed: %s',
+                              match_id)
+            self.live.mark_dirty(match_id)
+
     def _start_ws(self) -> None:
         try:
             self.adapter.on_push(self._on_push)
-            self.adapter.on_remove(self.refresher.mark_removed)
+            self.adapter.on_remove(self._on_remove)
             self.ws = self.adapter.start_ws(
                 initial_ids=self.upcoming_ids() + self.live_ids())
             log.info('ws subscribed to %d matches', self.ws.subscribed_count)
