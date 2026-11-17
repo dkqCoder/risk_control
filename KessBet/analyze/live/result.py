@@ -467,6 +467,9 @@ def check_match(selections, home: int, away: int,
         from analyze.live import verify
         verification = verify.verify_chosen(
             chosen, home, away, ht_home=ht_home, ht_away=ht_away,
+            total_stake=getattr(config, 'LIVE_CERT_TOTAL_STAKE', 10000),
+            stake_unit=getattr(config, 'LIVE_CERT_STAKE_UNIT', 1),
+            min_profit=getattr(config, 'LIVE_CERT_MIN_PROFIT', 0.0),
         )
         if verification['status'] == 'counterexample_found':
             ce = verification.get('counterexample') or {}

@@ -103,6 +103,11 @@ LIVE_CERTIFY_CORRECT_SCORE_OTHER = False
 LIVE_PARSER_VERSION = 'kessbet-parse-v1'
 LIVE_RULES_VERSION = 'live-rules-v1'
 
+# 认证配资：预算必须能被最小下注单位整除；金额按单位取整后复算最坏返还。
+LIVE_CERT_TOTAL_STAKE = 10000
+LIVE_CERT_STAKE_UNIT = 1
+LIVE_CERT_MIN_PROFIT = 0.0      # 最低净收益率门槛；即使 0 也要求严格正收益
+
 # 比赛开赛后继续采多久。足球 90 分钟 + 中场 15 分 + 补时 ≈ 110 分钟，
 # 150 留了 40 分钟余量（延误、伤停、加时）。
 # ⚠️ 这个值没有实测依据（实测样本里最晚一场 ms=7 是开赛后 70 分钟），
