@@ -935,6 +935,52 @@ class Dao:
             row = cur.fetchone()
         return int(row[0]) if row else 0
 
+    def save_live_scope_analysis(self, snapshot_id: str, match_id: str,
+                                 scope_key: str, report: dict,
+                                 platform: str = 'kessbet') -> None:
+        """按不可变输入快照保存独立时段/事件影子结果。"""
+        import json
+        with self.conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO kessbet_live_scope_analysis
+              (snapshot_id, platform, match_id, scope_key,
+               status, reason, result_json, created_time)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())
+            ON DUPLICATE KEY UPDATE
+              status=VALUES(status), reason=VALUES(reason),
+              result_json=VALUES(result_json)
+            """, (snapshot_id, platform, match_id, scope_key,
+                  report.get('status') or 'unverifiable',
+                  report.get('reason'),
+                  json.dumps(report, ensure_ascii=False, default=str)))
+        self.conn.commit()
+
+    def list_live_scope_analysis(self, match_id: str,
+                                 snapshot_id: str | None = None,
+                                 platform: str = 'kessbet') -> list[dict]:
+        """读取某场按快照保存的独立时段/事件判定。"""
+        import json
+        with self.conn.cursor() as cur:
+            if snapshot_id is None:
+                cur.execute("""SELECT current_snapshot_id
+                               FROM kessbet_match_live
+                               WHERE platform=%s AND match_id=%s""",
+                            (platform, match_id))
+                row = cur.fetchone()
+                snapshot_id = row[0] if row else None
+            if not snapshot_id:
+                return []
+            cur.execute("""SELECT scope_key, status, reason, result_json,
+                                  created_time
+                           FROM kessbet_live_scope_analysis
+                           WHERE platform=%s AND match_id=%s
+                             AND snapshot_id=%s ORDER BY scope_key""",
+                        (platform, match_id, snapshot_id))
+            rows = cur.fetchall()
+        return [{'scope_key': scope, 'status': status, 'reason': reason,
+                 'report': json.loads(payload), 'created_time': str(created)}
+                for scope, status, reason, payload, created in rows]
+
     def save_live_snapshot(self, *, snapshot_id: str, match_id: str,
                            generation: int, request_started_at,
                            response_received_at, state_before, state_after,
@@ -1305,7 +1351,8 @@ class Dao:
                                  evidence_status: str | None = None,
                                  evidence_path: str | None = None,
                                  manifest_hash: str | None = None,
-                                 analysis_id: str | None = None) -> int | None:
+                                 analysis_id: str | None = None,
+                                 is_shadow: int = 0) -> int | None:
         """写一条命中快照。返回新快照 id；重复赔率已记过时返回 None。
 
         唯一键 (platform, match_id, odds_updated) 负责去重：
@@ -1322,8 +1369,8 @@ class Dao:
            ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
             market_detail, replay_context, odds_updated, is_live,
            input_fingerprint, evidence_id, evidence_status, evidence_path,
-           manifest_hash, analysis_id)
-        VALUES (%s,'kessbet',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           manifest_hash, analysis_id, is_shadow)
+        VALUES (%s,'kessbet',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON DUPLICATE KEY UPDATE id = id
         """
         with self.conn.cursor() as cur:
@@ -1334,7 +1381,7 @@ class Dao:
                 ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
                 market_detail, replay_context, odds_updated, is_live,
                 input_fingerprint, evidence_id, evidence_status, evidence_path,
-                manifest_hash, analysis_id,
+                manifest_hash, analysis_id, 1 if is_shadow else 0,
             ))
             new_id = cur.lastrowid if n == 1 else None
         self.conn.commit()
@@ -1342,15 +1389,22 @@ class Dao:
         return new_id
 
     def has_arbitrage_fingerprint(self, match_id: str, fingerprint: str,
-                                  platform: str = 'kessbet') -> bool:
-        """同一输入指纹是否已经写过正式命中（幂等）。"""
+                                  platform: str = 'kessbet',
+                                  is_shadow: int = 0) -> bool:
+        """同一输入指纹是否已经写过同类型命中（幂等）。
+
+        is_shadow=0 查正式命中，1 查影子候选 —— 影子记录不能阻止
+        验收后同一输入以正式命中重新发布。
+        """
         if not fingerprint:
             return False
         with self.conn.cursor() as cur:
             cur.execute("""SELECT 1 FROM kessbet_arbitrage_snapshot
                            WHERE platform=%s AND match_id=%s
-                             AND input_fingerprint=%s LIMIT 1""",
-                        (platform, match_id, fingerprint))
+                             AND input_fingerprint=%s
+                             AND is_shadow=%s LIMIT 1""",
+                        (platform, match_id, fingerprint,
+                         1 if is_shadow else 0))
             return cur.fetchone() is not None
 
     def list_arbitrage(self, limit: int = 100, offset: int = 0,
@@ -1373,7 +1427,7 @@ class Dao:
                home_team, away_team, league, kickoff_time,
                cost, cost_scope, lp_worst_profit, cross_gap,
                ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
-               odds_updated, is_live
+               odds_updated, is_live, is_shadow
         FROM kessbet_arbitrage_snapshot
         WHERE {' AND '.join(where)}
         ORDER BY alert_time DESC, id DESC
@@ -1407,7 +1461,7 @@ class Dao:
                ilp_chosen, lp_chosen, n_markets, n_selections, n_candidates,
                 market_detail, replay_context, odds_updated, is_live,
                 input_fingerprint, evidence_id, evidence_status,
-                evidence_path, manifest_hash, analysis_id
+                evidence_path, manifest_hash, analysis_id, is_shadow
         FROM kessbet_arbitrage_snapshot
         WHERE platform='kessbet' AND id=%s
         """

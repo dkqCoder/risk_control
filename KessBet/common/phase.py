@@ -40,7 +40,9 @@ def classify_phase(state: dict) -> tuple[str, str]:
 
 
 def ht_source(phase: str) -> str:
-    """半场比分来源。v1 没有权威字段，只可能是启发式或未知。"""
-    if phase in ('second_half', 'halftime', 'finished'):
+    """中场状态码下的当前比分是半场比分；其他阶段仍需谨慎。"""
+    if phase == 'halftime':
+        return 'official_state'
+    if phase in ('second_half', 'finished'):
         return 'inferred_history'
     return 'unknown'

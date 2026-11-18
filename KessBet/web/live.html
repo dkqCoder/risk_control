@@ -160,6 +160,9 @@ function arbBadge(rc){
   }
   const st = rc && rc.analysis_status;
   const text = (rc && rc.status_text) || '';
+  if (st === 'analyzing'){
+    return `<span class="badge mute"><i></i>${text || '分析中'}</span>`;
+  }
   if (st === 'expired' || st === 'invalidated'){
     return `<span class="badge mute"><i></i>${text || st}</span>`;
   }
@@ -269,7 +272,7 @@ $('refresh').addEventListener('click', load);
 
 state.timer = setInterval(() => {
   if (!document.hidden) load();
-}, 15000);
+}, 5000);
 
 load();
 </script>

@@ -371,18 +371,20 @@ def _live_row(r: dict) -> dict:
         'n_selections': int(r.get('n_selections') or 0),
         'fetched_time': _iso(r.get('fetched_time')),
         'odds_updated': _iso(r.get('odds_updated')),
+        'snapshot_id': r.get('current_snapshot_id'),
     }
 
 
 _STATUS_TEXT = {
     'waiting': '等待数据',
+    'analyzing': '分析中（新快照已收到）',
     'invalid_input': '输入无效',
     'no_candidate': '未发现候选',
     'unverifiable': '无法认证',
     'verified_candidate': '已验证候选',
     'expired': '已过期',
     'invalidated': '已失效',
-    'shadow_candidate': '影子候选（未发布）',
+    'shadow_candidate': '试算候选（未发布）',
 }
 
 
@@ -404,6 +406,12 @@ def _live_result_state(rc: dict, cur_sid) -> tuple[str | None, float | None]:
         age = max(0.0, (beijing_now() - ts).total_seconds())
 
     if rc.get('snapshot_id') != cur_sid:
+        # 指针为空 = 当前机会已撤销（比分/空响应/删盘）；
+        # 指针非空、只是结果还停在上一版 = 新快照已发布、分析尚未写回。
+        # 结果本身已经过期时按 expired/invalidated 处理，避免永久“分析中”。
+        if cur_sid and (age is None
+                        or age <= config.LIVE_ODDS_MAX_AGE_SEC):
+            return 'analyzing', age
         return 'invalidated', age
     if age is not None and age > config.LIVE_ODDS_MAX_AGE_SEC:
         return 'expired', age
@@ -430,6 +438,43 @@ def _live_result_state(rc: dict, cur_sid) -> tuple[str | None, float | None]:
     if raw in ('expired', 'invalidated'):
         return raw, age
     return 'waiting', age
+
+
+def _solver_market_status(m: dict) -> tuple[bool, str]:
+    """该盘口是否进入比赛结果求解池，以及未进入的原因。
+
+    只用于页面分层展示；真正的认证仍由 analyze/live/verify.py 完成。
+    """
+    from analyze.live.result import is_result_market, expected_labels
+    from analyze.live.verify import is_whitelisted
+
+    base, side = m.get('base') or '', m.get('side') or ''
+    if not is_result_market(base):
+        return False, 'not_result_market'
+    if base.startswith(('1st Half - ', '2nd Half - ')):
+        return False, 'half_market'
+
+    by_line: dict[str, set] = {}
+    for s in m.get('selections') or []:
+        by_line.setdefault(s.get('line') or '', set()).add(s.get('label'))
+    white_lines = [
+        ln for ln, labels in by_line.items()
+        if any(is_whitelisted(base, side, ln, lab) for lab in labels)
+    ]
+    if not white_lines:
+        return False, 'not_whitelisted'
+    exp = expected_labels(base)
+    for ln in white_lines:
+        if exp is None or exp.issubset(by_line[ln]):
+            return True, 'in_solver'
+    return False, 'incomplete'
+
+
+def _annotate_solver(markets: list) -> None:
+    for m in markets:
+        ok, reason = _solver_market_status(m)
+        m['in_solver'] = ok
+        m['solver_reason'] = reason
 
 
 @app.get('/api/live')
@@ -820,6 +865,7 @@ def live_detail(match_id: str) -> dict:
 
         out = _live_row(row)
         out['markets'] = group_markets(rows, row['home_team'], row['away_team'])
+        _annotate_solver(out['markets'])
         # 判定是否在跑。关闭时 result 里是最后一次计算的历史值，
         # 页面必须标成「历史结果」，不能继续显示为当前机会。
         out['live_analyze_enabled'] = bool(
@@ -869,6 +915,19 @@ def live_detail(match_id: str) -> dict:
         else:
             out['result'] = None
         return out
+    finally:
+        dao.close()
+
+
+@app.get('/api/live/{match_id}/scopes')
+def live_scope_analyses(match_id: str,
+                        snapshot_id: str | None = Query(None)) -> dict:
+    """读取与滚球输入快照绑定的半场、分钟窗口和事件盘分范围试算结果。"""
+    dao = _dao()
+    try:
+        reports = dao.list_live_scope_analysis(match_id, snapshot_id)
+        return {'match_id': match_id, 'snapshot_id': snapshot_id,
+                'reports': reports}
     finally:
         dao.close()
 
@@ -984,6 +1043,7 @@ def _arb_row(r: dict) -> dict:
                       for x in json.loads(r.get('lp_chosen') or '[]')],
         'odds_updated': _iso(r.get('odds_updated')),
         'is_live': bool(r.get('is_live')),
+        'is_shadow': bool(r.get('is_shadow')),
         'evidence_id': r.get('evidence_id'),
         'evidence_status': r.get('evidence_status'),
         'evidence_path': r.get('evidence_path'),

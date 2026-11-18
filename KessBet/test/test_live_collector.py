@@ -229,6 +229,20 @@ def test_saves_immutable_snapshot_and_passes_id(dao):
     assert got[0]['raw_payload']
 
 
+def test_halftime_snapshot_freezes_official_score(dao):
+    kickoff = now_beijing() - timedelta(minutes=45)
+    ad = RawAdapter(
+        state={'ms': 31, 'mt': '45:00', 'hmp': '2', 'amp': '1'},
+        odds=_sels())
+    got = []
+    lc = LiveCollector(ad, dao,
+                       on_snapshot=lambda _d, meta, rows: got.append(meta))
+    lc._collect_one(dao, _meta(kickoff))
+    assert got
+    assert (got[0]['ht_home'], got[0]['ht_away']) == (2, 1)
+    assert got[0]['ht_source'] == 'official_state'
+
+
 def _state():
     return {'ms': 7, 'mt': '30:15', 'hmp': '1', 'amp': '0',
             'hck': 3, 'ack': 1, 'hyc': 0, 'ayc': 1, 'hrc': 0, 'arc': 0}
@@ -252,26 +266,29 @@ def test_snapshot_stores_envelope_and_fingerprint(dao):
     assert pver
 
 
-def test_state_change_invalidates_snapshot_and_requeues(dao):
-    """P0：比分变化时旧快照立即失效，并排队重新拉赔率。"""
+def test_state_change_invalidates_and_refetches_immediately(dao):
+    """P0：比分变化时旧快照失效，并在同一轮直接重取形成新快照。"""
     kickoff = now_beijing() - timedelta(minutes=30)
     st1 = _state()
     lc = LiveCollector(RawAdapter(state=st1, odds=_sels()), dao)
     lc._collect_one(dao, _meta(kickoff))
     with dao.conn.cursor() as c:
-        c.execute("""SELECT current_snapshot_id FROM kessbet_match_live
-                     WHERE match_id=%s""", (MID,))
-        assert c.fetchone()[0], '首次采集应有当前快照'
+        c.execute("""SELECT current_snapshot_id, generation
+                     FROM kessbet_match_live WHERE match_id=%s""", (MID,))
+        sid1, gen1 = c.fetchone()
+    assert sid1, '首次采集应有当前快照'
 
     st2 = dict(st1, hmp='2')
-    lc2 = LiveCollector(FakeAdapter(state=st2), dao)
+    lc2 = LiveCollector(ResultAdapter(state=st2, odds=_sels()), dao)
     lc2._collect_one(dao, _meta(kickoff), fetch_odds=False)
 
     with dao.conn.cursor() as c:
-        c.execute("""SELECT current_snapshot_id FROM kessbet_match_live
-                     WHERE match_id=%s""", (MID,))
-        assert c.fetchone()[0] is None, '比分变化后旧快照必须失效'
-    assert MID in lc2._dirty, '变化后应排队重新拉赔率'
+        c.execute("""SELECT current_snapshot_id, generation
+                     FROM kessbet_match_live WHERE match_id=%s""", (MID,))
+        sid2, gen2 = c.fetchone()
+    assert sid2 and sid2 != sid1, '状态变化后应立即发布新快照'
+    assert gen2 > gen1
+    assert lc2.stats.get('state_changed_refetch') == 1
 
 
 def test_same_score_poll_keeps_snapshot(dao):

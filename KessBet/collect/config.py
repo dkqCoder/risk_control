@@ -81,9 +81,10 @@ LIVE_ENABLED = True
 # 2026-11-15 重新打开：假信号的根因（缺腿盘口、赔率滞后于比分、混合新旧行）
 # 已由 LIVE_DROP_INCOMPLETE_MARKETS / score_newer_than_odds / LIVE_ROW_MAX_LAG_SEC
 # 三道防线覆盖。观察期若再出现成本 < 0.9 的命中，先查原始数据再决定是否再关。
-# 2026-11-17 暂停：比分域截断及 Correct Score other 补集错误已复现。
-# 修复并通过无界结果验证后再恢复；继续保留采集。
-LIVE_ANALYZE_ENABLED = False
+# 2026-11-17 影子验收：开启分析，但 LIVE_SHADOW_MODE=True 只写影子状态/
+# 证据包，不写正式命中、不发正式机会告警。正式发布保持关闭，直到官网
+# 取证和真实样本验收完成。
+LIVE_ANALYZE_ENABLED = True
 
 # 影子模式：独立于“是否运行分析”。开启时照常计算、写影子状态和证据包，
 # 但不写正式套利命中、不发正式机会告警。正式发布需同时设为 False。
@@ -105,7 +106,7 @@ LIVE_CERTIFY_CORRECT_SCORE_OTHER = False
 
 # 输入快照的解析/规则版本。影响输入指纹和证据回放；改动解析语义时要升。
 LIVE_PARSER_VERSION = 'kessbet-parse-v1'
-LIVE_RULES_VERSION = 'live-rules-v1'
+LIVE_RULES_VERSION = 'live-rules-v10'
 
 # 认证配资：预算必须能被最小下注单位整除；金额按单位取整后复算最坏返还。
 LIVE_CERT_TOTAL_STAKE = 10000
@@ -119,7 +120,7 @@ LIVE_CERT_MIN_PROFIT = 0.0      # 最低净收益率门槛；即使 0 也要求�
 LIVE_WINDOW_MIN = 150
 
 # 状态轮询间隔（比分/角球/红黄牌）。比分变化不频繁，10 秒够用。
-LIVE_POLL_STATE_SEC = 10
+LIVE_POLL_STATE_SEC = 5
 
 # 赔率轮询间隔。
 # ⚠️ 这个值是**临时的**：如果验证确认平台会通过 WS 推送滚球赔率，

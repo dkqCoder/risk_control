@@ -77,6 +77,13 @@ FULL_TIME_MARKETS = frozenset({
     'Exact Goals', 'Clean Sheet', 'Halftime/Fulltime',
     'Highest Scoring Half', 'Odd/Even', 'Correct Score', 'Handicap',
     '1x2 & Both Teams To Score',
+    '1x2 & Total', 'Win To Nil', 'To Win', 'Which Team To Score',
+    'Multigoals', 'Goal Range', 'Winning Margin',
+    'Total & Both Teams To Score', 'Double Chance & Total',
+    'Double Chance & Both Teams To Score',
+    'Or Over 2.5', 'Or Under 2.5', 'Or Both Teams To Score',
+    'Or Any Clean Sheet', 'Draw Or Over 2.5', 'Draw Or Under 2.5',
+    'Draw Or Both Teams To Score', 'Draw Or Any Clean Sheet',
 })
 
 # 半场盘。两条都靠 prefix 识别，时段由 half_of() 决定。
@@ -305,6 +312,18 @@ _EXPECTED_LABELS = {
     '1x2': {'1', 'X', '2'},
     'Double Chance': {'1X', '12', 'X2'},
     'Both Teams To Score': {'yes', 'no'},
+    'Clean Sheet': {'yes', 'no'},
+    'Win To Nil': {'yes', 'no'},
+    'To Win': {'yes', 'no'},
+    'Which Team To Score': {'none', 'only 1', 'only 2', 'both teams'},
+    'Or Over 2.5': {'yes', 'no'},
+    'Or Under 2.5': {'yes', 'no'},
+    'Or Both Teams To Score': {'yes', 'no'},
+    'Or Any Clean Sheet': {'yes', 'no'},
+    'Draw Or Over 2.5': {'yes', 'no'},
+    'Draw Or Under 2.5': {'yes', 'no'},
+    'Draw Or Both Teams To Score': {'yes', 'no'},
+    'Draw Or Any Clean Sheet': {'yes', 'no'},
     'Handicap': {'1', 'X', '2'},
     'Odd/Even': {'odd', 'even'},
     'Highest Scoring Half': {'1st half', '2nd half', 'equal'},
@@ -430,7 +449,22 @@ def check_match(selections, home: int, away: int,
         p = str(desc).split('|')
         if len(p) == 4 and is_whitelisted(p[0], p[1], p[2], p[3]):
             certified.append((mask, odds, desc))
-    cands = certified
+    # 同一规范选项可能由多个平台市场 ID 返回。求解器只返回 desc，
+    # 无法证明哪个 ID 的报价被选中。赔率冲突时整项隔离，避免把较高
+    # 报价与另一个 ID 混用；相同赔率的重复项才合并。
+    by_desc = {}
+    conflicting = set()
+    for mask, odds, desc in certified:
+        previous = by_desc.get(desc)
+        if previous is None:
+            by_desc[desc] = (mask, odds, desc)
+        elif previous[0] != mask or previous[1] != odds:
+            conflicting.add(desc)
+    if conflicting:
+        log.warning('同名选项报价冲突，隔离 %d 项：%s',
+                    len(conflicting), ','.join(sorted(conflicting)))
+    cands = [candidate for desc, candidate in by_desc.items()
+             if desc not in conflicting]
     if not cands:
         return None
 

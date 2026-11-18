@@ -125,5 +125,11 @@ def test_persist_hit_requires_complete_package(monkeypatch, tmp_path):
     assert got == 42
     assert d.kw['evidence_status'] == 'complete'
     assert d.kw['evidence_id'] == 's1'
+    assert d.kw['is_shadow'] == 0
     assert os.path.isfile(os.path.join(
         d.kw['evidence_path'], 'manifest.json'))
+
+    d2 = _FakeDao(_snapshot())
+    got2 = L._persist_hit(d2, meta, r, now_beijing(), shadow=True)
+    assert got2 == 42
+    assert d2.kw['is_shadow'] == 1

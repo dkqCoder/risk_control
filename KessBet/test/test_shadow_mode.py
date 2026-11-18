@@ -49,7 +49,7 @@ class _Dao:
         self.cost_kw = kw
 
 
-def test_shadow_computes_but_does_not_write_hit(monkeypatch):
+def test_shadow_persists_shadow_hit(monkeypatch):
     monkeypatch.setattr(L.config, 'LIVE_ANALYZE_ENABLED', True)
     monkeypatch.setattr(L.config, 'LIVE_SHADOW_MODE', True)
     monkeypatch.setattr(L, 'evaluate_live_match', lambda *a, **k: {
@@ -61,18 +61,18 @@ def test_shadow_computes_but_does_not_write_hit(monkeypatch):
         'ht_source': 'unknown', 'snapshot_id': 's1', 'generation': 1,
         'input_fingerprint': 'f' * 64, 'odds_updated': now_beijing(),
     })
-    hits, evidence = [], []
+    calls, shots = [], []
     monkeypatch.setattr(L, '_persist_hit',
-                        lambda *a, **k: hits.append(1))
-    monkeypatch.setattr(L, '_write_evidence',
-                        lambda *a, **k: evidence.append(1) or {
-                            'evidence_status': 'complete'})
+                        lambda *a, **k: calls.append(k) or 1)
+    monkeypatch.setattr(L, '_shoot_async',
+                        lambda *a, **k: shots.append(1))
 
     d = _Dao()
     L.analyze_live_once(d)
 
-    assert hits == [], '影子模式不能写正式命中'
-    assert evidence == [1]
+    assert len(calls) == 1
+    assert calls[0].get('shadow') is True
+    assert shots == [], '影子记录不截正式命中图'
     assert d.cost_kw['analysis_status'] == 'shadow_candidate'
 
 
@@ -90,28 +90,24 @@ def test_formal_mode_writes_hit(monkeypatch):
     })
     hits = []
     monkeypatch.setattr(L, '_persist_hit',
-                        lambda *a, **k: hits.append(1) or 1)
+                        lambda *a, **k: hits.append(k.get('shadow')) or 1)
     monkeypatch.setattr(L, '_shoot_async', lambda *a, **k: None)
 
     L.analyze_live_once(_Dao())
 
-    assert hits == [1]
+    assert hits == [False]
 
 
-def test_shadow_snapshot_callback_does_not_write_hit(monkeypatch):
+def test_shadow_snapshot_callback_persists_shadow_hit(monkeypatch):
     monkeypatch.setattr(L.config, 'LIVE_ANALYZE_ENABLED', True)
     monkeypatch.setattr(L.config, 'LIVE_SHADOW_MODE', True)
     monkeypatch.setattr(L.result, 'check_match',
                         lambda *a, **k: _result())
-    hits, evidence = [], []
+    hits = []
     monkeypatch.setattr(L, '_persist_hit',
-                        lambda *a, **k: hits.append(1))
-    monkeypatch.setattr(L, '_write_evidence',
-                        lambda *a, **k: evidence.append(1) or {
-                            'evidence_status': 'complete'})
+                        lambda *a, **k: hits.append(k.get('shadow')) or 1)
     monkeypatch.setattr(L, '_persist_cost', lambda *a, **k: None)
 
     L.analyze_live_snapshot(_Dao(), _meta(), [])
 
-    assert hits == []
-    assert evidence == [1]
+    assert hits == [True]

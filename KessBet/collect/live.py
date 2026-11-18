@@ -150,14 +150,14 @@ class LiveCollector:
 
         if not fetch_odds:
             changed = dao.save_live_state(match_id, state, kickoff)
-            self.stats['state_ok'] += 1
-            if changed:
-                # 比分/阶段变化：旧快照已被 save_live_state 置空，
-                # 这里排队拉一次完整赔率，形成新快照后才会重新判定。
-                self.stats['state_changed_refetch'] = (
-                    self.stats.get('state_changed_refetch', 0) + 1)
-                self.mark_dirty(match_id)
-            return
+            if not changed:
+                self.stats['state_ok'] += 1
+                return
+            # 比分/阶段变化：旧快照已被 save_live_state 置空。
+            # 不排队等下一个 tick，直接用这份状态继续拉赔率，形成新快照。
+            self.stats['state_changed_refetch'] = (
+                self.stats.get('state_changed_refetch', 0) + 1)
+            fetch_odds = True
 
         # 同一次请求同时拿解析结果和原始盘口列表 —— 原始串是命中取证的
         # 第一手证据，不能在命中后重新请求（赔率早就变了）。
@@ -239,7 +239,14 @@ class LiveCollector:
         # 半场比分在采集时冻结进快照；分析和回放都用这份值，
         # 不再在分析时另读可变的历史流水（D01 输入一致性）。
         ht = None
-        if hts == 'inferred_history' and minute is not None and minute > 45:
+        if hts == 'official_state':
+            hh = _to_int(state.get('hmp'))
+            aa = _to_int(state.get('amp'))
+            if hh is not None and aa is not None:
+                ht = (hh, aa)
+            else:
+                hts = 'unknown'
+        elif hts == 'inferred_history' and minute is not None and minute > 45:
             try:
                 ht = half_time_score(dao.live_history_for_half_time(match_id))
             except Exception as e:

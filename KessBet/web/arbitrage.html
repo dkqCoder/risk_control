@@ -255,8 +255,8 @@ async function loadList(){
 
   $('content').innerHTML = `
     <div class="banner warn">
-      ⚠ 滚球命中是<b>内部候选</b>：尚未通过无界覆盖和官网核验，判定已暂停。
-      点击行内「证据」查看原始接口响应；赛前命中不受此提示影响。
+      ⚠ 滚球命中是<b>内部候选</b>：演练模式（试算）记录仅用于复核，<b>未正式发布</b>；
+      官网取证尚未完成。点击行内「证据」查看原始接口响应；赛前命中不受此提示影响。
     </div>
     <table>
       <thead><tr>
@@ -271,7 +271,8 @@ async function loadList(){
           <td class="teams">${h.home_team}
             <small>vs ${h.away_team} · ${h.league||'—'} ·
               <span class="mid">${h.match_id}</span>${
-                h.is_live ? ' · <b style="color:var(--warning)">滚球·未核验</b>' : ''}</small></td>
+                h.is_live ? ` · <b style="color:var(--warning)">${
+                  h.is_shadow ? '试算候选·未发布' : '滚球·未核验'}</b>` : ''}</small></td>
           <td class="num cost">${h.cost.toFixed(4)}</td>
           <td class="num profit ${pctClass(h.profit_pct)}">${pct(h.profit_pct, 2)}</td>
           <td class="num" style="color:var(--dim)">${h.n_markets}/${h.n_selections}</td>
@@ -321,11 +322,12 @@ async function openDetail(id){
   const STAKES = 1000;
   const backPerState = h.cost > 0 ? STAKES / h.cost : null;
   const isLive = !!h.is_live;
+  const isShadow = !!h.is_shadow;
 
   $('dwBody').innerHTML = `
     <div class="meta-bar">
       <span>matchId <b>${esc(h.match_id)}</b></span>
-      <span>${isLive ? '滚球 · 内部候选' : '赛前'}</span>
+      <span>${isLive ? (isShadow ? '滚球 · 试算候选' : '滚球 · 正式候选') : '赛前'}</span>
       <span>开赛 <b>${esc(h.kickoff_time || '—')}</b></span>
       <span>赔率版本 <b>${esc(h.odds_updated || '—')}</b></span>
       <span>快照时间 <b>${esc(h.alert_time || '—')}</b></span>
@@ -333,11 +335,15 @@ async function openDetail(id){
         rel="noopener">打开证据页</a></span>` : ''}
     </div>
 
-    ${isLive ? `<div class="banner warn">滚球命中尚未通过无界覆盖与官网核验，
-      只能作为<b>内部候选</b>查看；证据页保存了同一次请求的原始接口响应。</div>` : ''}
+    ${isLive ? `<div class="banner warn">${isShadow
+      ? '试算候选：模型无界验证与证据包已保存，但<b>未正式发布</b>。'
+      : '滚球命中尚未通过官网核验，只能作为<b>内部候选</b>查看。'}
+      证据页保存了同一次请求的原始接口响应。</div>` : ''}
 
     <div class="verdict ${isLive ? '' : (isArb ? 'ok' : 'no')}">
-      <div class="big">${isLive ? '内部候选（未核验）' : (isArb ? '✓ 套利' : '✗ 无套利')}</div>
+      <div class="big">${isLive
+        ? (isShadow ? '试算候选（未发布）' : '内部候选（未核验）')
+        : (isArb ? '✓ 套利' : '✗ 无套利')}</div>
       <div class="cost">成本 <b>${h.cost.toFixed(6)}</b></div>
       <div class="profit">${isLive ? '计算时' : ''}${profitFrom}
         <b>${profitPct == null ? '—' : (profitPct >= 0 ? '+' : '') + profitPct.toFixed(2) + '%'}</b>

@@ -32,9 +32,9 @@ log = logging.getLogger(__name__)
 
 LIVE_REPLAY_SCHEMA_VERSION = 2
 # D05：other 隔离、比分 guard、ghost 成本剔除都改变了结果，必须升级版本。
-LIVE_ANALYZER_VERSION = 'live-result-b3-v3'
+LIVE_ANALYZER_VERSION = 'live-result-b3-v12'
 LIVE_STATE_SPACE_VERSION = 'soccer-h6-g10'
-LIVE_CANDIDATE_POLICY_VERSION = 'no-correct-score-other/v1'
+LIVE_CANDIDATE_POLICY_VERSION = 'expanded-final-score-no-other/v2'
 
 
 def _effective_ht(obj: dict) -> tuple[int | None, int | None]:
@@ -45,6 +45,52 @@ def _effective_ht(obj: dict) -> tuple[int | None, int | None]:
     if (obj or {}).get('ht_source') != 'official_state':
         return None, None
     return (obj or {}).get('ht_home'), (obj or {}).get('ht_away')
+
+
+def _persist_scope_reports(dao, meta: dict, period: dict,
+                           windows: list[dict], events: list[dict],
+                           first_half: dict | None = None,
+                           independent: list[dict] | None = None,
+                           corners: dict | None = None,
+                           count_windows: list[dict] | None = None,
+                           first_half_events: list[dict] | None = None,
+                           first_half_joint: list[dict] | None = None) -> None:
+    """独立分析只写影子记录，按输入快照绑定可回溯结果。"""
+    snapshot_id = meta.get('snapshot_id')
+    if not snapshot_id or not hasattr(dao, 'save_live_scope_analysis'):
+        return
+    reports = []
+    if first_half and first_half.get('source_selections'):
+        reports.append(('first_half', first_half))
+    if corners and corners.get('source_selections'):
+        reports.append(('full_time_corners', corners))
+    if period.get('source_selections') or meta.get('phase') == 'halftime':
+        reports.append(('second_half', period))
+    for report in windows:
+        start, end = report['window']
+        reports.append((f'window_{start}_{end}', report))
+    for report in count_windows or []:
+        start, end = report['window']
+        reports.append((f"{report['domain']}_window_{start}_{end}", report))
+    for report in events:
+        reports.append((f"goal_{report['scope'].split()[0]}", report))
+    for report in first_half_events or []:
+        reports.append((f"first_half_goal_{report['ordinal']}", report))
+    for report in first_half_joint or []:
+        reports.append((f"first_half_1x2_goal_{report['ordinal']}", report))
+    for report in independent or []:
+        scope_key = {
+            'Which Team Wins The Rest Of The Match': 'rest_of_match',
+            'Booking 1x2': 'booking_1x2',
+        }[report['scope']]
+        reports.append((scope_key, report))
+    for scope_key, report in reports:
+        try:
+            dao.save_live_scope_analysis(snapshot_id, meta['match_id'],
+                                         scope_key, report)
+        except Exception as exc:
+            log.warning('时段影子结果落表失败 %s/%s: %s',
+                        meta['match_id'], scope_key, exc)
 
 
 def evaluate_live_match(dao, meta: dict, now) -> dict:
@@ -87,6 +133,27 @@ def evaluate_live_match(dao, meta: dict, now) -> dict:
         out['error'] = 'no_data'
         return out
     out['selections'] = sels
+    from analyze.live.period import (check_first_half_live,
+                                     check_first_half_nth_goals,
+                                     check_first_half_result_goal_joint,
+                                     check_corner_full_time,
+                                     check_future_count_windows,
+                                     check_independent_three_way,
+                                     check_second_half_at_halftime,
+                                     check_future_windows,
+                                     check_future_nth_goals)
+    out['scope_reports'] = (
+        check_second_half_at_halftime(snap),
+        check_future_windows(snap),
+        check_future_nth_goals(snap),
+        check_first_half_live(snap),
+        check_independent_three_way(snap),
+        check_corner_full_time(snap),
+        check_future_count_windows(snap),
+        check_first_half_nth_goals(snap),
+        check_first_half_result_goal_joint(snap),
+    )
+    out['phase'] = snap.get('phase')
     out['raw'] = {
         'payload': snap.get('raw_payload'),
         'fetched_time': odds_updated,
@@ -153,8 +220,42 @@ def analyze_live_snapshot(dao, meta: dict, selections: list[tuple], now=None) ->
     away = meta.get('away_score')
     if home is None or away is None:
         return {'result': None, 'error': 'no_score'}
+    from analyze.live.period import (check_first_half_live,
+                                     check_first_half_nth_goals,
+                                     check_first_half_result_goal_joint,
+                                     check_corner_full_time,
+                                     check_future_count_windows,
+                                     check_independent_three_way,
+                                     check_second_half_at_halftime,
+                                     check_future_windows,
+                                     check_future_nth_goals)
+    period_shadow = check_second_half_at_halftime(
+        dict(meta, rows=selections))
+    window_shadow = check_future_windows(dict(meta, rows=selections))
+    event_shadow = check_future_nth_goals(dict(meta, rows=selections))
+    first_half_shadow = check_first_half_live(dict(meta, rows=selections))
+    independent_shadow = check_independent_three_way(
+        dict(meta, rows=selections))
+    corner_shadow = check_corner_full_time(dict(meta, rows=selections))
+    count_window_shadow = check_future_count_windows(
+        dict(meta, rows=selections))
+    first_half_events = check_first_half_nth_goals(
+        dict(meta, rows=selections))
+    first_half_joint = check_first_half_result_goal_joint(
+        dict(meta, rows=selections))
+    _persist_scope_reports(dao, meta, period_shadow, window_shadow,
+                           event_shadow, first_half_shadow,
+                           independent_shadow, corner_shadow,
+                           count_window_shadow, first_half_events,
+                           first_half_joint)
+    if period_shadow['status'] == 'shadow_candidate':
+        log.info('下半场独立影子候选 %s snapshot=%s',
+                 meta['match_id'], meta.get('snapshot_id'))
     if result.score_space_incomplete(home, away):
-        return {'result': None, 'error': 'score_near_model_cap'}
+        return {'result': None, 'error': 'score_near_model_cap',
+                'period_shadow': period_shadow,
+                'window_shadow': window_shadow,
+                'event_shadow': event_shadow}
 
     # 半场比分由采集侧随快照一起传入；仅权威来源才用于缩小结果域。
     ht_home, ht_away = _effective_ht(meta)
@@ -163,7 +264,6 @@ def analyze_live_snapshot(dao, meta: dict, selections: list[tuple], now=None) ->
     meta = dict(meta)
     meta['ht_home'] = ht_home
     meta['ht_away'] = ht_away
-
     r = result.check_match(
         selections, home, away, minute=minute,
         ht_home=ht_home,
@@ -172,7 +272,10 @@ def analyze_live_snapshot(dao, meta: dict, selections: list[tuple], now=None) ->
     if r is None:
         # 新快照没有覆盖结果时也要把当前状态写下来，覆盖旧机会。
         _persist_status(dao, meta, 'no_cover', now)
-        return {'result': None, 'error': 'no_cover_or_no_candidate', 'ht': ht}
+        return {'result': None, 'error': 'no_cover_or_no_candidate',
+                'ht': ht, 'period_shadow': period_shadow,
+                'window_shadow': window_shadow,
+                'event_shadow': event_shadow}
 
     shadow = bool(getattr(config, 'LIVE_SHADOW_MODE', True))
     _persist_cost(dao, meta, r, ht, now, shadow=shadow)
@@ -182,9 +285,10 @@ def analyze_live_snapshot(dao, meta: dict, selections: list[tuple], now=None) ->
                     tag, meta['match_id'], minute, home, away,
                     r['cost'], r['profit_pct'])
         if shadow:
-            ev = _write_evidence(dao, meta, r)
-            if ev['evidence_status'] != 'complete':
-                log.warning('影子证据包未完成 %s', meta['match_id'])
+            snap_id = _persist_hit(dao, meta, r, now, shadow=True)
+            if not snap_id:
+                log.warning('影子候选落表失败（证据包不完整或重复）%s',
+                            meta['match_id'])
         else:
             snap_id = _persist_hit(dao, meta, r, now)
             if snap_id:
@@ -192,7 +296,10 @@ def analyze_live_snapshot(dao, meta: dict, selections: list[tuple], now=None) ->
             else:
                 # 证据包失败：撤销 verified_candidate，保留可重试原因。
                 _persist_status(dao, meta, 'evidence_failed', now)
-    return {'result': r, 'error': None, 'ht': ht}
+    return {'result': r, 'error': None, 'ht': ht,
+            'period_shadow': period_shadow,
+            'window_shadow': window_shadow,
+            'event_shadow': event_shadow}
 
 
 def analyze_live_once(dao, window_min: int | None = None,
@@ -242,6 +349,22 @@ def analyze_live_once(dao, window_min: int | None = None,
             log.exception('live analyze %s failed: %s', meta['match_id'], e)
             stats['errors'] += 1
             continue
+
+        if write_costs and a.get('scope_reports'):
+            (period_report, window_reports, event_reports,
+             first_half_report, independent_reports,
+             corner_report, count_window_reports,
+             first_half_event_reports,
+             first_half_joint_reports) = a['scope_reports']
+            _persist_scope_reports(
+                dao, {'snapshot_id': a.get('snapshot_id'),
+                      'match_id': meta['match_id'],
+                      'phase': a.get('phase')},
+                period_report, window_reports, event_reports,
+                first_half_report, independent_reports,
+                corner_report, count_window_reports,
+                first_half_event_reports,
+                first_half_joint_reports)
 
         err = a['error']
         if err == 'no_data':
@@ -315,10 +438,7 @@ def analyze_live_once(dao, window_min: int | None = None,
                 log.warning('    %-34s @ %.2f  下注 %.1f%%', d, o, w * 100)
             if shadow:
                 stats['shadow_hits'] = stats.get('shadow_hits', 0) + 1
-                ev = _write_evidence(dao, snap_meta, r)
-                if ev['evidence_status'] != 'complete':
-                    log.warning('影子证据包未完成 %s', meta['match_id'])
-            elif write_hits:
+            if write_hits:
                 try:
                     evidence_meta = dict(snap_meta)
                     evidence_meta['snapshot_selections'] = a.get('selections') or []
@@ -334,13 +454,19 @@ def analyze_live_once(dao, window_min: int | None = None,
                         evidence_meta['raw_payload'] = raw['payload']
                         evidence_meta['raw_fetched_time'] = str(
                             raw.get('fetched_time') or '')
-                    snap_id = _persist_hit(dao, evidence_meta, r, now)
+                    snap_id = _persist_hit(dao, evidence_meta, r, now,
+                                           shadow=shadow)
                     if snap_id:
-                        # 只有首次持久化成功的路径截图，避免即时分析和兜底扫描重复留证。
-                        _shoot_async(meta, r, snap_id)
+                        # 只有正式命中截图；影子记录用证据页复核。
+                        if not shadow:
+                            _shoot_async(meta, r, snap_id)
                     else:
-                        _persist_status(dao, snap_meta,
-                                        'evidence_failed', now, a)
+                        if shadow:
+                            log.warning('影子候选落表失败（证据包不完整或重复）'
+                                        ' %s', meta['match_id'])
+                        else:
+                            _persist_status(dao, snap_meta,
+                                            'evidence_failed', now, a)
                 except Exception as e:
                     log.exception('写滚球命中快照失败 %s: %s',
                                   meta['match_id'], e)
@@ -521,18 +647,22 @@ def _write_evidence(dao, meta: dict, r: dict) -> dict:
     return out
 
 
-def _persist_hit(dao, meta: dict, r: dict, now) -> int | None:
+def _persist_hit(dao, meta: dict, r: dict, now,
+                 shadow: bool = False) -> int | None:
     """把命中写进 kessbet_arbitrage_snapshot（is_live=1）。
 
-    和赛前命中共用一张表：事后要从一个地方回溯「都命中过什么」。
+    shadow=True 时写 is_shadow=1 的影子候选记录：可在命中页查看/复核，
+    但不计入正式发布。两种记录用不同 is_shadow 做指纹去重。
     返回新快照 id；同一份赔率已经记过时返回 None。
     """
     from common.markets import describe_pick
 
     mid = meta['match_id']
-    # 同一输入指纹已经写过正式命中时幂等返回，不重复落库。
+    shadow_flag = 1 if shadow else 0
+    # 同一输入指纹已经写过同类型命中时幂等返回，不重复落库。
     fp = meta.get('input_fingerprint')
-    if fp and dao.has_arbitrage_fingerprint(mid, fp):
+    if fp and dao.has_arbitrage_fingerprint(
+            mid, fp, is_shadow=shadow_flag):
         log.info('同一输入指纹已命中过，跳过 %s %s', mid, fp[:12])
         return None
     chosen = result.stakes(r['chosen'], r['cost'])
@@ -643,9 +773,11 @@ def _persist_hit(dao, meta: dict, r: dict, now) -> int | None:
         evidence_path=evidence_path,
         manifest_hash=manifest_hash,
         analysis_id=snapshot_id,
+        is_shadow=shadow_flag,
     )
     if snap_id:
-        log.warning('滚球命中已保存 %s snapshot=%s  (Σ=%.4f, 可达终局 %d)',
+        log.warning('%s %s snapshot=%s  (Σ=%.4f, 可达终局 %d)',
+                    '影子候选已保存' if shadow else '滚球命中已保存',
                     mid, snap_id, r['cost'], r['reach'])
     return snap_id
 

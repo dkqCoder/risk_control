@@ -705,6 +705,20 @@ CREATE TABLE IF NOT EXISTS kessbet_live_snapshot (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='滚球不可变输入快照：raw + rows + state 精确绑定';
 
+CREATE TABLE IF NOT EXISTS kessbet_live_scope_analysis (
+    snapshot_id VARCHAR(40) NOT NULL,
+    platform VARCHAR(16) NOT NULL DEFAULT 'kessbet',
+    match_id VARCHAR(32) NOT NULL,
+    scope_key VARCHAR(64) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    reason VARCHAR(64) DEFAULT NULL,
+    result_json MEDIUMTEXT NOT NULL,
+    created_time DATETIME NOT NULL,
+    PRIMARY KEY (snapshot_id, scope_key),
+    KEY idx_match_time (platform, match_id, created_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='时段与事件盘口影子判定；按输入快照和结算范围保存';
+
 
 -- =============================================================================
 -- ⑬ kessbet_live_result_cost — 滚球「比赛结果」套利判定快照
@@ -957,6 +971,9 @@ CREATE TABLE IF NOT EXISTS kessbet_arbitrage_snapshot (
         COMMENT '1=滚球盘套利（窗口盘内部 Σ(1/赔率) < 1），0=赛前完整覆盖套利。
                  两类命中的证据形态不同：赛前存的是整场盘口快照，
                  滚球存的是单个窗口盘的选项 —— 页面要能分开看',
+
+    is_shadow      TINYINT      NOT NULL DEFAULT 0
+        COMMENT '1=影子模式候选，未正式发布；0=正式命中/赛前命中',
 
     PRIMARY KEY (id),
     UNIQUE KEY uk_odds (platform, match_id, odds_updated)

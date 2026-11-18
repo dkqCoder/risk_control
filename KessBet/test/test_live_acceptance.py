@@ -116,8 +116,9 @@ def test_state_mapping_and_expiry():
     assert _live_result_state(fresh, 's1')[0] == 'verified_candidate'
     stale = dict(fresh, odds_updated=now_beijing() - timedelta(seconds=120))
     assert _live_result_state(stale, 's1')[0] == 'expired'
-    assert _live_result_state(fresh, 's2')[0] == 'invalidated'
-    assert _STATUS_TEXT['shadow_candidate'] == '影子候选（未发布）'
+    assert _live_result_state(fresh, 's2')[0] == 'analyzing'
+    assert _live_result_state(fresh, None)[0] == 'invalidated'
+    assert _STATUS_TEXT['shadow_candidate'] == '试算候选（未发布）'
 
 
 # 8/9. 证据包与离线读取

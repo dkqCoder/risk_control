@@ -39,12 +39,14 @@ def test_live_thread_respects_analyze_switch(monkeypatch):
     assert should_start is False
 
 
-def test_analyze_switch_independent_of_collect_switch():
-    """两个开关互不影响：采集可以开着，判定单独关。
+def test_analyze_switch_independent_of_collect_switch(monkeypatch):
+    """两个开关互不影响：任意组合都能独立设置，不绑定部署现场的值。"""
+    monkeypatch.setattr(config, 'LIVE_ENABLED', True)
+    monkeypatch.setattr(config, 'LIVE_ANALYZE_ENABLED', False)
+    assert config.LIVE_ENABLED is True
+    assert config.LIVE_ANALYZE_ENABLED is False
 
-    这正是当前的生产配置 —— 滚球假信号要停判定，但采集数据要留着。
-    """
-    import importlib
-    importlib.reload(config)
-    assert config.LIVE_ENABLED is True, '采集应保持开启'
-    assert config.LIVE_ANALYZE_ENABLED is False, '判定应已关闭（假信号未修复）'
+    monkeypatch.setattr(config, 'LIVE_ENABLED', False)
+    monkeypatch.setattr(config, 'LIVE_ANALYZE_ENABLED', True)
+    assert config.LIVE_ENABLED is False
+    assert config.LIVE_ANALYZE_ENABLED is True

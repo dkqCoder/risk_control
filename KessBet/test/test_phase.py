@@ -24,8 +24,9 @@ def test_first_half_clock_is_inferred():
         'first_half', 'inferred')
 
 
-def test_ht_source_never_official_in_v1():
+def test_ht_source_uses_official_halftime_checkpoint():
     assert ht_source('first_half') == 'unknown'
+    assert ht_source('halftime') == 'official_state'
     assert ht_source('second_half') == 'inferred_history'
     assert ht_source('unknown') == 'unknown'
 

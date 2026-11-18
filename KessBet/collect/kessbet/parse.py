@@ -170,7 +170,7 @@ def split_team(name: str, home: str, away: str) -> tuple[str, str]:
     ('H', '1st Half - Total')
 
     半场前缀必须保留在基础名里，否则下游既认不出队名，也认不出是半场盘。
-    队名匹配失败时返回 ('', 原名)——宁可当作未建模盘口跳过，也不要错拆成全场盘。
+    仅允许大小写差异；若两队前缀无法唯一确定，保留原名并跳过建模。
     """
     prefix = ''
     rest = name
@@ -179,10 +179,17 @@ def split_team(name: str, home: str, away: str) -> tuple[str, str]:
             prefix, rest = p, rest[len(p):]
             break
 
-    if home and rest.startswith(home + ' '):
-        return 'H', prefix + rest[len(home) + 1:]
-    if away and rest.startswith(away + ' '):
-        return 'A', prefix + rest[len(away) + 1:]
+    matches = []
+    for side, team in (('H', home), ('A', away)):
+        if (team and rest[:len(team)].casefold() == team.casefold()
+                and rest[len(team):].startswith(' ')
+                and rest[len(team) + 1:]):
+            matches.append((len(team), side, rest[len(team) + 1:]))
+    if matches:
+        matches.sort(reverse=True)
+        if len(matches) == 1 or matches[0][0] > matches[1][0]:
+            _length, side, base = matches[0]
+            return side, prefix + base
     return '', prefix + rest
 
 

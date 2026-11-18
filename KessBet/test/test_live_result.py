@@ -345,7 +345,7 @@ def test_unbounded_counterexample_at_7_0():
 def test_non_whitelisted_market_is_not_certified():
     """比分盘不在白名单，不能认证。"""
     from analyze.live import verify
-    v = verify.verify_chosen([('Correct Score|||4:0', 5.0)], 3, 0)
+    v = verify.verify_chosen([('Correct Score|||other', 5.0)], 3, 0)
     assert v['status'] == 'unsupported_rules'
 
 
@@ -598,11 +598,65 @@ def test_solver_pool_is_restricted_to_whitelist():
         ('1x2', '', '', '1', 3.2),
         ('1x2', '', '', 'X', 3.2),
         ('1x2', '', '', '2', 3.2),
-        ('Handicap', '', '0:0', '1', 3.4),
-        ('Handicap', '', '0:0', 'X', 3.4),
-        ('Handicap', '', '0:0', '2', 3.4),
+        ('Highest Scoring Half', '', '', '1st half', 3.4),
+        ('Highest Scoring Half', '', '', '2nd half', 3.4),
+        ('Highest Scoring Half', '', '', 'equal', 3.4),
     ])
     r = R.check_match(sels, 0, 0, minute=10)
     assert r is not None
     assert r['verification']['status'] == 'verified'
     assert all(d.startswith('1x2') for d, _ in r['chosen'])
+
+
+def test_duplicate_selection_with_conflicting_odds_is_rejected():
+    sels = _sels([
+        ('1x2', '', '', '1', 3.0),
+        ('1x2', '', '', 'X', 10.0),
+        ('1x2', '', '', 'X', 3.0),
+        ('1x2', '', '', '2', 3.0),
+    ])
+    r = R.check_match(sels, 0, 0, minute=15)
+    assert r is None
+
+
+def test_full_time_expansion_enters_solver_pool():
+    sels = _sels([
+        ('1x2', '', '', '1', 3.2),
+        ('1x2', '', '', 'X', 3.2),
+        ('1x2', '', '', '2', 3.2),
+        ('Clean Sheet', 'H', '', 'yes', 2.0),
+        ('Clean Sheet', 'H', '', 'no', 2.0),
+        ('Exact Goals', 'H', '', '2', 5.0),
+        ('Correct Score', '', '', '1:0', 9.0),
+    ])
+    r = R.check_match(sels, 0, 0, minute=15)
+    assert r is not None
+    assert r['n_candidates'] == 7
+    assert r['verification']['status'] == 'verified'
+
+
+def test_three_way_handicap_enters_certified_solver():
+    sels = _sels([
+        ('Handicap', '', '0:0', '1', 3.2),
+        ('Handicap', '', '0:0', 'X', 3.2),
+        ('Handicap', '', '0:0', '2', 3.2),
+    ])
+    r = R.check_match(sels, 0, 0, minute=10)
+    assert r is not None
+    assert r['is_arbitrage']
+    assert r['verification']['status'] == 'verified'
+
+
+def test_handicap_9_0_rejects_away_10():
+    """回归：0:3 时 Handicap 9:0 的 1+X 成本 0.8211，但 0:10 两腿全输。"""
+    sels = _sels([
+        ('Handicap', '', '9:0', '1', 1.60),
+        ('Handicap', '', '9:0', 'X', 5.10),
+        ('Handicap', '', '9:0', '2', 2.60),
+    ])
+    r = R.check_match(sels, 0, 3, minute=24)
+    assert r is not None
+    assert r['is_arbitrage'] is False
+    assert r['verification']['status'] == 'counterexample_found'
+    ce = r['verification']['counterexample']
+    assert (ce['home_score'], ce['away_score']) == (0, 10)

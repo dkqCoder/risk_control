@@ -166,6 +166,28 @@ td.cost.arb{color:var(--good); font-weight:700}
 .mkt-tag.arb{color:var(--good); border-color:rgba(10,110,10,.35);
   background:rgba(10,110,10,.07)}
 
+/* 全部盘口分组：组合参与盘口置顶，其余盘口在后 */
+.mkt-group-label{font-size:11px; font-weight:600; letter-spacing:.03em;
+  color:var(--accent); padding:10px 4px 5px;
+  border-bottom:1px solid rgba(201,207,214,.5)}
+.mkt-group-label.rest{color:var(--muted); margin-top:2px}
+
+/* 求解池筛选：方便专门查看被模型排除的盘口 */
+.mk-filter{display:flex; gap:6px; align-items:center; flex-wrap:wrap;
+  margin:0 0 8px}
+.mk-filter button{font:inherit; font-size:11px; padding:4px 10px;
+  border-radius:999px; border:1px solid var(--line); background:var(--panel2);
+  color:var(--dim); cursor:pointer}
+.mk-filter button:hover{border-color:var(--accent); color:var(--accent)}
+.mk-filter button.on{border-color:var(--accent);
+  background:rgba(31,111,208,.08); color:var(--accent); font-weight:600}
+.mk-count{font-size:11px; color:var(--muted); margin-left:auto;
+  font-variant-numeric:tabular-nums}
+.mkt.excluded .mkt-name{color:var(--dim); font-weight:500}
+.mkt.excluded .mkt-sub{color:var(--muted)}
+.mkt-tag.mute{color:var(--muted); border-color:var(--line);
+  background:var(--panel2)}
+
 @media (max-width:720px){
   .mkt{grid-template-columns:1fr}
   .mkt-head{border-right:none; border-bottom:1px solid rgba(201,207,214,.4);
@@ -223,10 +245,22 @@ footer{color:var(--dim); font-size:12px; margin-top:14px; line-height:1.8}
   <div class="card">
     <h2>全部盘口</h2>
     <p class="hint">
-      这里只显示<b>当前报价</b>。历史命中组合与配资请打开对应的
-      <b>证据页</b>（<code>/evidence/&lt;snapshot_id&gt;</code>），动态页不把旧组合
-      贴到新价格上。
+      组合用到的盘口会<b>置顶</b>并标出参与选项（内部计算，未经官网核验）。
+      只有当前有效结果才置顶；暂停、过期、失效或分析中时按普通盘口显示，
+      不把历史组合贴到新价格上。历史证据请看
+      <b>证据页</b>（<code>/evidence/&lt;snapshot_id&gt;</code>）。<br>
+      上方「参与求解 N 个候选选项」是<b>计算时</b>口径；下面分组按<b>当前盘口</b>
+      统计，单位是盘口。「分范围试算」另按半场、事件或角球等结算范围计算，
+      只留结果供复核、不并入全场组合、不发布，因此不计入上方的全场候选数，
+      也不代表官网已接受下注。
     </p>
+    <div class="mk-filter" id="mkFilter">
+      <button data-filter="all" class="on">全部</button>
+      <button data-filter="solver">全场求解</button>
+      <button data-filter="shadow">分范围试算</button>
+      <button data-filter="excluded">未分析</button>
+      <span class="mk-count" id="mkCount"></span>
+    </div>
     <div id="mkts"></div>
   </div>
 
@@ -245,6 +279,10 @@ const MID = new URLSearchParams(location.search).get('id')
          || location.pathname.split('/').filter(Boolean).pop();
 let DATA = null;
 let PICKED = null;      // 当前选中要画走势的选项
+let MK_FILTER = 'all';
+let SCOPE_KEYS = new Set();
+let SCOPE_SNAPSHOT = null;
+let SCOPE_REFRESHED_AT = 0;
 
 function esc(s){ return String(s == null ? '' : s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -304,6 +342,7 @@ function renderResult(rc){
   if (!rc || rc.cost == null){
     const reason = {
       waiting: '当前快照还没有判定结果',
+      analyzing: '新快照已收到，正在重新判定',
       no_candidate: '当前快照没有能覆盖全部结果的组合',
       unverifiable: '当前快照无法完成认证（规则/边界/验证未通过）',
       invalid_input: '当前快照输入无效或缺少数据',
@@ -320,7 +359,8 @@ function renderResult(rc){
   const statusText = rc.status_text || '';
   const invalidated = status === 'invalidated';
   const expired = status === 'expired';
-  const staleResult = invalidated || expired;
+  const analyzing = status === 'analyzing';
+  const staleResult = invalidated || expired || analyzing;
   // 判定关闭时，result 是最后一次计算的历史值，不能继续显示为当前机会。
   const paused = DATA && DATA.live_analyze_enabled === false;
   const ver = rc.verification_status;
@@ -344,14 +384,15 @@ function renderResult(rc){
         <i></i>${paused ? '判定已暂停 · 历史结果'
           : (expired ? `${statusText || '已过期'} · 等待新报价`
           : (invalidated ? `${statusText || '已失效'} · 等待新快照`
+          : (analyzing ? `${statusText || '分析中'} · 正在重新判定`
           : (arb ? `已验证候选 +${pct.toFixed(2)}%`
-                 : (statusText || '等待数据'))))}
+                 : (statusText || '等待数据')))))}
       </div>
       <div class="rs-note">
         <b>计算时</b> ${esc(rc.score)}${rc.half_time ? ` · 半场 ${esc(rc.half_time)}` : ''}
         ${rc.minute != null ? ` · 第 ${rc.minute} 分钟` : ''}
         · 可达终局 <b>${rc.reach_states}</b> 个
-        · 参与求解 <b>${rc.n_candidates}</b> 个选项
+        · 参与求解 <b>${rc.n_candidates}</b> 个候选选项
         · 成本/收益均为计算时结果
       </div>
     </div>`;
@@ -372,6 +413,9 @@ function renderResult(rc){
       ⚠ 报价已超过 90 秒没有更新，当前结果已过期${
         rc.quote_age_sec != null ? `（约 ${Math.round(rc.quote_age_sec)} 秒）` : ''}；
       等待平台新推送后重新判定。
+    </p>` : ''}
+    ${analyzing ? `<p class="rs-tip" style="color:var(--warning);font-weight:600">
+      ⓘ 新快照已收到，正在重新判定；上方是上一版历史值，通常几秒内更新。
     </p>` : ''}
     ${verNote ? `<p class="rs-tip" style="color:${
       ver === 'verified' ? 'var(--good)' : 'var(--warning)'
@@ -396,44 +440,153 @@ function renderResult(rc){
       按 <b>1/赔率 反比</b>分配；覆盖不重叠时各结果返还相同，重叠时只会更高，
       这里展示的是<b>最低返还</b>。
       ${arb ? '成本 &lt; 1 时按此比例下注，理论最低返还高于总投注 —— 这是候选，不是已核验套利。' :
-              '成本 &gt; 1，按这个组合分配会亏损，亏掉的正是平台抽水。'}
-      历史组合与配资请在<b>证据页</b>查看；动态页不把旧组合贴到新价格上。
+              (rc.cost < 1
+                ? '模型成本 &lt; 1，但无界验证未通过（见上方反例），不能当作套利。'
+                : '成本 &gt; 1，按这个组合分配会亏损，亏掉的正是平台抽水。')}
+      当前组合只在下方<b>全部盘口</b>置顶显示；历史证据请看证据页。
     </p>`;
 }
 
 // ---------- 盘口列表 ----------
+// 组合内部键归一：result.chosen.desc 是 `market|side|line|label`，
+// 或 `market|other` / `nm|line|lab`。
+function selKey(market, side, line, label){
+  return [market || '', side || '', line || '', label || ''].join('|');
+}
+
+function chosenBySelection(){
+  const out = new Map();
+  const rc = DATA && DATA.result;
+  if (!rc || !rc.chosen) return out;
+  for (const c of rc.chosen){
+    const p = String(c.desc || '').split('|');
+    let key = null;
+    if (p.length === 4) key = selKey(p[0], p[1], p[2], p[3]);
+    else if (p.length === 2 && p[1] === 'other') {
+      key = selKey(p[0], '', '', 'other');
+    } else if (p.length === 3) key = selKey(p[0], '', p[1], p[2]);
+    if (key) out.set(key, c);
+  }
+  return out;
+}
+
+// 只有当前有效结果才做组合置顶；暂停/过期/失效/分析中时按普通盘口显示，
+// 避免把历史组合贴到新价格上。
+function comboVisible(){
+  const rc = DATA && DATA.result;
+  if (!rc || !rc.chosen || !rc.chosen.length) return false;
+  if (DATA.live_analyze_enabled === false) return false;
+  return !['expired', 'invalidated', 'analyzing'].includes(
+    rc.analysis_status);
+}
+
+const SOLVER_REASON = {
+  not_result_market: '非比赛结果盘',
+  half_market: '半场盘隔离',
+  not_whitelisted: '非白名单',
+  incomplete: '选项不完整',
+};
+
 function renderMarkets(markets){
+  const count = $('mkCount');
   if (!markets || !markets.length){
     $('mkts').innerHTML = `<div class="empty">这场比赛当前没有盘口报价。</div>`;
+    if (count) count.textContent = '';
     return;
   }
-  $('mkts').innerHTML = markets.map(m => {
+  const chosen = chosenBySelection();
+  const showCombo = comboVisible();
+  const hasCombo = m => showCombo && m.selections.some(
+    s => chosen.has(selKey(m.base, m.side, s.line, s.label)));
+  const comboMarkets = showCombo ? markets.filter(hasCombo) : [];
+  const solverMarkets = markets.filter(m => m.in_solver && !hasCombo(m));
+  const inShadow = m => SCOPE_KEYS.has(`${m.base || ''}|${m.side || ''}`);
+  const shadowMarkets = markets.filter(m => !m.in_solver && inShadow(m));
+  const excludedMarkets = markets.filter(m => !m.in_solver && !inShadow(m));
+  const nSolver = markets.filter(m => m.in_solver).length;
+  if (count) {
+    count.textContent = `当前盘口：全场求解 ${nSolver} · 分范围试算 ${shadowMarkets.length} · 未分析 ${excludedMarkets.length}`;
+    count.title = '这里是盘口数；上方结果的“候选选项”数是另一个口径';
+  }
+
+  const renderMkt = (m, inCombo, excluded, shadow = false) => {
     const isWin = m.base === 'Which Team Wins The Rest Of The Match';
     const n = m.selections.length;
     // 只列了 1 个选项的盘口多半是残缺（平台只挂了一条腿），
     // 标出来便于判断「这个盘口看起来便宜是不是因为数据不全」。
     const partial = n === 1;
-    return `<div class="mkt">
+    // 组合盘口里，参与组合的选项排到最前面。
+    const sels = inCombo
+      ? [...m.selections].sort((a, b) => {
+          const wa = chosen.has(selKey(m.base, m.side, a.line, a.label)) ? 0 : 1;
+          const wb = chosen.has(selKey(m.base, m.side, b.line, b.label)) ? 0 : 1;
+          return wa - wb;
+        })
+      : m.selections;
+    const reason = excluded
+      ? (SOLVER_REASON[m.solver_reason] || '未参与') : '';
+    return `<div class="mkt${excluded ? ' excluded' : ''}">
       <div class="mkt-head">
         <span class="mkt-name">${esc(m.name)}</span>
         <span class="mkt-sub ${partial ? 'warn' : ''}">${
           partial ? '只有 1 个选项' : n + ' 个选项'}</span>
         ${isWin ? '<span class="mkt-tag">剩余时间</span>' : ''}
+        ${inCombo ? '<span class="mkt-tag arb">参与组合</span>' : ''}
+        ${shadow ? '<span class="mkt-tag">分范围试算（未发布）</span>' : ''}
+        ${excluded ? `<span class="mkt-tag mute">未分析：${esc(reason)}</span>` : ''}
       </div>
-      <div class="sels">${m.selections.map(s => {
+      <div class="sels">${sels.map(s => {
         const picked = PICKED && PICKED.market === m.base
                     && PICKED.side === m.side && PICKED.line === s.line
                     && PICKED.label === s.label;
+        const hit = chosen.get(selKey(m.base, m.side, s.line, s.label));
         const tail = s.line ? `${s.line} ` : '';
-        return `<span class="sel ${picked ? 'on' : ''}"
+        const w = hit && hit.weight != null
+          ? `<span class="w">组合 ${(hit.weight * 100).toFixed(1)}%</span>`
+          : (hit ? '<span class="w">组合</span>' : '');
+        return `<span class="sel ${picked ? 'on' : ''} ${hit ? 'arb' : ''}"
           data-market="${esc(m.base)}" data-side="${esc(m.side)}"
           data-line="${esc(s.line || '')}" data-label="${esc(s.label)}">
           <span class="lab">${esc(tail + s.label)}</span>
           <span class="o">${s.odds.toFixed(2)}</span>
+          ${w}
         </span>`;
       }).join('')}</div>
     </div>`;
-  }).join('');
+  };
+
+  const showSolver = MK_FILTER === 'all' || MK_FILTER === 'solver';
+  const showShadow = MK_FILTER === 'all' || MK_FILTER === 'shadow';
+  const showExcluded = MK_FILTER === 'all' || MK_FILTER === 'excluded';
+  const parts = [];
+  if (showSolver && showCombo && comboMarkets.length){
+    parts.push('<div class="mkt-group-label">组合参与盘口 · 已置顶（内部计算）</div>');
+    parts.push(...comboMarkets.map(m => renderMkt(m, true, false)));
+  }
+  if (showSolver && solverMarkets.length){
+    const comboShown = showCombo && comboMarkets.length > 0;
+    const cls = comboShown ? 'mkt-group-label rest' : 'mkt-group-label';
+    const label = comboShown
+      ? `参与求解 · 未入选（${solverMarkets.length} 个盘口）`
+      : `参与求解（${solverMarkets.length} 个盘口）`;
+    parts.push(`<div class="${cls}">${label}</div>`);
+    parts.push(...solverMarkets.map(m => renderMkt(m, false, false)));
+  }
+  if (showShadow && shadowMarkets.length){
+    parts.push(`<div class="mkt-group-label rest">分范围试算（${shadowMarkets.length} 个盘口，未发布）</div>`);
+    parts.push(...shadowMarkets.map(m => renderMkt(m, false, false, true)));
+  }
+  if (showExcluded && excludedMarkets.length){
+    parts.push(`<div class="mkt-group-label rest">未分析（${excludedMarkets.length} 个盘口）</div>`);
+    parts.push(...excludedMarkets.map(m => renderMkt(m, false, true)));
+  }
+  if (!parts.length){
+    const msg = MK_FILTER === 'excluded'
+      ? '没有未分析的盘口。' : '这个分组当前没有盘口。';
+    $('mkts').innerHTML = `<div class="empty">${msg}</div>`;
+    return;
+  }
+  $('mkts').innerHTML = parts.join('');
 
   $('mkts').querySelectorAll('.sel').forEach(el => {
     el.addEventListener('click', () => {
@@ -500,13 +653,70 @@ async function loadHistory(){
     const r = await fetch(`/api/live/${encodeURIComponent(MID)}/history?` + p);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
-    const head = PICKED.line
+    const isCombo = chosenBySelection().has(
+      selKey(PICKED.market, PICKED.side, PICKED.line, PICKED.label));
+    const head = (PICKED.line
       ? `${PICKED.market} · ${PICKED.line} ${PICKED.label}`
-      : `${PICKED.market} · ${PICKED.label}`;
+      : `${PICKED.market} · ${PICKED.label}`) + (isCombo ? ' · 组合' : '');
     drawSpark(d.points, head);
   }catch(e){
     $('chart').innerHTML = `<div class="empty">走势加载失败：${esc(e.message)}</div>`;
   }
+}
+
+// 从 result.chosen 的内部 desc 找到对应盘口/选项，用于默认走势选择。
+function pickFromDesc(desc, markets){
+  const p = String(desc || '').split('|');
+  for (const m of markets){
+    for (const s of m.selections){
+      let ok = false;
+      if (p.length === 4){
+        ok = m.base === p[0] && (m.side || '') === p[1]
+          && (s.line || '') === p[2] && s.label === p[3];
+      } else if (p.length === 2 && p[1] === 'other'){
+        ok = m.base === p[0] && s.label === 'other';
+      } else if (p.length === 3){
+        ok = m.base === p[0] && (s.line || '') === p[1]
+          && s.label === p[2];
+      }
+      if (ok){
+        return { market: m.base, side: m.side,
+                 line: s.line || '', label: s.label };
+      }
+    }
+  }
+  return null;
+}
+
+async function refreshScopeMarkers(snapshotId){
+  if (snapshotId !== SCOPE_SNAPSHOT){
+    SCOPE_SNAPSHOT = snapshotId || null;
+    SCOPE_KEYS = new Set();
+    SCOPE_REFRESHED_AT = 0;
+    if (DATA) renderMarkets(DATA.markets);
+  }
+  if (!snapshotId || Date.now() - SCOPE_REFRESHED_AT < 5000) return;
+  SCOPE_REFRESHED_AT = Date.now();
+  try{
+    const url = `/api/live/${encodeURIComponent(MID)}/scopes?snapshot_id=${encodeURIComponent(snapshotId)}`;
+    const response = await fetch(url);
+    if (!response.ok) return;
+    const body = await response.json();
+    if (!DATA || DATA.snapshot_id !== snapshotId) return;
+    const keys = new Set();
+    for (const entry of body.reports || []){
+      if (!['no_candidate', 'shadow_candidate'].includes(entry.status)) continue;
+      const report = entry.report || {};
+      const analyzed = report.analyzed_selections || report.source_selections || [];
+      for (const row of analyzed){
+        if (Array.isArray(row) && row.length >= 2){
+          keys.add(`${row[0] || ''}|${row[1] || ''}`);
+        }
+      }
+    }
+    SCOPE_KEYS = keys;
+    renderMarkets(DATA.markets);
+  }catch(e){}
 }
 
 // ---------- 加载 ----------
@@ -528,13 +738,23 @@ async function load(){
   renderBoard(DATA);
   renderResult(DATA.result);
   renderMarkets(DATA.markets);
+  refreshScopeMarkers(DATA.snapshot_id);
 
-  // 默认选第一个选项画走势（多半是 1x2 的「1」，最直观）
+  // 默认画组合里的第一个选项；没有当前组合时退回第一个盘口，
+  // 保证走势图不为空。
   if (!PICKED && DATA.markets.length){
-    const m = DATA.markets[0];
-    const s = m.selections[0];
-    PICKED = { market: m.base, side: m.side,
+    let pick = null;
+    if (comboVisible() && DATA.result && DATA.result.chosen
+        && DATA.result.chosen.length){
+      pick = pickFromDesc(DATA.result.chosen[0].desc, DATA.markets);
+    }
+    if (!pick){
+      const m = DATA.markets[0];
+      const s = m.selections[0];
+      pick = { market: m.base, side: m.side,
                line: s.line || '', label: s.label };
+    }
+    PICKED = pick;
     renderMarkets(DATA.markets);
   }
   loadHistory();
@@ -554,11 +774,24 @@ async function loadLight(){
     // renderMarkets 会按 PICKED 恢复选中态，不会把用户选中的
     // 走势图弄丢。
     renderMarkets(d.markets);
+    refreshScopeMarkers(d.snapshot_id);
+    // 结果变化后 PICKED 可能已不在组合里；刷新历史以更新
+    // “· 组合”标注和曲线，避免图表标题与当前组合不一致。
+    if (PICKED) loadHistory();
   }catch(e){}
 }
 
+document.querySelectorAll('#mkFilter button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    MK_FILTER = btn.dataset.filter;
+    document.querySelectorAll('#mkFilter button').forEach(b =>
+      b.classList.toggle('on', b === btn));
+    if (DATA) renderMarkets(DATA.markets);
+  });
+});
+
 load();
-setInterval(loadLight, 5000);
+setInterval(loadLight, 2000);
 </script>
 </body>
 </html>

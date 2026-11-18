@@ -143,12 +143,22 @@ def test_split_team_no_team_prefix():
     assert split_team('1st Half - Total', 'Arsenal', 'Everton') == ('', '1st Half - Total')
 
 
-def test_split_team_name_mismatch_keeps_whole_name():
-    """队名大小写不符时不应错拆——宁可返回原名，让下游当作未建模跳过。"""
+def test_split_team_case_only_difference():
+    """平台盘口与赛程队名仅大小写不同时仍能解析球队盘。"""
     side, base = split_team('Inter Club De Escaldes Total',
                             'Inter Club de Escaldes', 'Other')
-    assert side == ''
-    assert base == 'Inter Club De Escaldes Total'
+    assert (side, base) == ('H', 'Total')
+    assert split_team('Internacional De Bogota. Clean Sheet',
+                      'America de Cali', 'Internacional de Bogota.') == (
+                          'A', 'Clean Sheet')
+
+
+def test_split_team_rejects_non_case_mismatch_and_ambiguity():
+    assert split_team('Inter Club Escaldes Total',
+                      'Inter Club de Escaldes', 'Other') == (
+                          '', 'Inter Club Escaldes Total')
+    assert split_team('America Total', 'America', 'AMERICA') == (
+        '', 'America Total')
 
 
 # ---------- parse_market_id ----------

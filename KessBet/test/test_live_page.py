@@ -222,7 +222,10 @@ def test_live_result_state_expires_stale_quote():
              'verification_status': 'verified', 'cost': 0.8,
              'odds_updated': beijing_now() - timedelta(seconds=5)}
     assert _live_result_state(fresh, 's1')[0] == 'verified_candidate'
-    assert _live_result_state(fresh, 's2')[0] == 'invalidated'
+    # 新快照已发布、结果还停在上一版：分析中，不是已失效
+    assert _live_result_state(fresh, 's2')[0] == 'analyzing'
+    # 当前指针被清空（比分变化/空响应/删盘）：已失效
+    assert _live_result_state(fresh, None)[0] == 'invalidated'
 
 
 def _seed_result(d, cost, analysis_status='valid',
@@ -263,6 +266,7 @@ def test_detail_shows_expired_not_arbitrage(client, clean):
     assert d['result']['analysis_status'] == 'expired'
     assert d['result']['is_arbitrage'] is False
     assert d['result']['status_text'] == '已过期'
+    assert d['snapshot_id'] == 's1'
 
 
 # ---------------------------------------------------------------- 证据页
@@ -365,3 +369,30 @@ def test_live_raw_keeps_recent_and_finds_nearest():
                       (mid,))
         d.conn.commit()
         d.close()
+
+
+def test_solver_market_status_layers():
+    """页面分层：参与求解 / 非结果盘 / 半场盘 / 非白名单 / 缺腿。"""
+    from web.api import _solver_market_status
+
+    def m(base, side, sels):
+        return {'base': base, 'side': side,
+                'selections': [{'line': ln, 'label': lab}
+                               for ln, lab in sels]}
+
+    assert _solver_market_status(
+        m('1x2', '', [('', '1'), ('', 'X'), ('', '2')])) == (
+            True, 'in_solver')
+    assert _solver_market_status(
+        m('1x2', '', [('', 'X'), ('', '2')])) == (False, 'incomplete')
+    assert _solver_market_status(
+        m('5th Goal', '', [('', '1')])) == (
+            False, 'not_result_market')
+    assert _solver_market_status(
+        m('1st Half - 1x2', '', [('', '1'), ('', 'X'), ('', '2')])) == (
+            False, 'half_market')
+    assert _solver_market_status(
+        m('Correct Score', '', [('', 'other')])) == (
+            False, 'not_whitelisted')
+    assert _solver_market_status(
+        m('Correct Score', '', [('', '3:0')])) == (True, 'in_solver')
