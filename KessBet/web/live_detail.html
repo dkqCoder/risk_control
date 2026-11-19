@@ -251,14 +251,16 @@ footer{color:var(--dim); font-size:12px; margin-top:14px; line-height:1.8}
       <b>证据页</b>（<code>/evidence/&lt;snapshot_id&gt;</code>）。<br>
       上方「参与求解 N 个候选选项」是<b>计算时</b>口径；下面分组按<b>当前盘口</b>
       统计，单位是盘口。「分范围试算」另按半场、事件或角球等结算范围计算，
-      只留结果供复核、不并入全场组合、不发布，因此不计入上方的全场候选数，
-      也不代表官网已接受下注。
+      只留结果供复核、不并入全场组合、不发布，因此不计入上方的全场候选数。
+      「暂不可验证」列出缺腿、阶段或窗口起点等原因；「规则未覆盖」表示尚无结算模型。
+      这些标记都不代表官网已接受下注。
     </p>
     <div class="mk-filter" id="mkFilter">
       <button data-filter="all" class="on">全部</button>
       <button data-filter="solver">全场求解</button>
       <button data-filter="shadow">分范围试算</button>
-      <button data-filter="excluded">未分析</button>
+      <button data-filter="blocked">暂不可验证</button>
+      <button data-filter="excluded">规则未覆盖</button>
       <span class="mk-count" id="mkCount"></span>
     </div>
     <div id="mkts"></div>
@@ -281,6 +283,7 @@ let DATA = null;
 let PICKED = null;      // 当前选中要画走势的选项
 let MK_FILTER = 'all';
 let SCOPE_KEYS = new Set();
+let SCOPE_BLOCKS = new Map();
 let SCOPE_SNAPSHOT = null;
 let SCOPE_REFRESHED_AT = 0;
 
@@ -347,10 +350,10 @@ function renderResult(rc){
       unverifiable: '当前快照无法完成认证（规则/边界/验证未通过）',
       invalid_input: '当前快照输入无效或缺少数据',
       expired: '结果已过期，正在等待新的报价',
-      invalidated: '结果已失效，正在等待新的赔率快照',
+      invalidated: rc.invalidation_reason || '旧快照已撤销，具体原因未记录',
     }[status] || '当前快照还没有判定结果';
     $('rsBody').innerHTML = `<div class="empty">${esc(reason)}。
-      采集到新数据后会重新计算。</div>`;
+      有效快照就绪并完成判定后会更新。</div>`;
     return;
   }
 
@@ -383,7 +386,7 @@ function renderResult(rc){
                              || status === 'invalid_input' ? 'mute' : 'ok'))}">
         <i></i>${paused ? '判定已暂停 · 历史结果'
           : (expired ? `${statusText || '已过期'} · 等待新报价`
-          : (invalidated ? `${statusText || '已失效'} · 等待新快照`
+          : (invalidated ? `${statusText || '已失效'} · 旧结果仅供回溯`
           : (analyzing ? `${statusText || '分析中'} · 正在重新判定`
           : (arb ? `已验证候选 +${pct.toFixed(2)}%`
                  : (statusText || '等待数据')))))}
@@ -407,7 +410,8 @@ function renderResult(rc){
       ⚠ 滚球判定已暂停。下面是最后一次计算的历史结果，不代表当前仍有这个机会。
     </p>` : ''}
     ${invalidated ? `<p class="rs-tip" style="color:var(--warning);font-weight:600">
-      ⚠ 这份结果对应的快照已不是当前快照，展示的是历史值；等待新赔率后重新判定。
+      ⚠ ${esc(rc.invalidation_reason || '旧快照已撤销，具体原因未记录')}。
+      下方是历史值，不能视为当前机会；待有效快照就绪并完成判定后更新。
     </p>` : ''}
     ${expired ? `<p class="rs-tip" style="color:var(--warning);font-weight:600">
       ⚠ 报价已超过 90 秒没有更新，当前结果已过期${
@@ -481,11 +485,50 @@ function comboVisible(){
 }
 
 const SOLVER_REASON = {
-  not_result_market: '非比赛结果盘',
-  half_market: '半场盘隔离',
-  not_whitelisted: '非白名单',
-  incomplete: '选项不完整',
+  not_result_market: '该结算范围尚未建模',
+  half_market: '该半场规则尚未建模',
+  not_whitelisted: '结算规则尚未验证',
+  incomplete: '报价缺腿或已锁定',
 };
+
+const SCOPE_REASON = {
+  incomplete_or_conflicting_market: '报价缺腿或冲突',
+  window_started_or_too_close: '窗口已开始或距开始太近，缺起点计数',
+  first_half_phase_uncertain: '上半场阶段未确认',
+  phase_not_authoritative: '等待权威阶段状态',
+  event_already_occurred: '事件已发生',
+  corner_count_missing: '角球计数缺失',
+  corner_model_cap: '角球数超出当前模型范围',
+};
+
+function missingLegs(m){
+  const base = String(m.base || '').replace(/^(1st|2nd) Half - /, '');
+  const expected = {
+    '1x2': ['1', 'X', '2'], 'Double Chance': ['1X', '12', 'X2'],
+    'Both Teams To Score': ['yes', 'no'],
+    'Clean Sheet': ['yes', 'no'], 'Total': ['over', 'under'],
+    'Handicap': ['1', 'X', '2'],
+  }[base];
+  if (!expected) return false;
+  const lines = new Map();
+  for (const s of m.selections || []){
+    const line = s.line || '';
+    if (!lines.has(line)) lines.set(line, new Set());
+    lines.get(line).add(s.label);
+  }
+  return ![...lines.values()].some(labels => expected.every(x => labels.has(x)));
+}
+
+function pendingReason(m){
+  const key = `${m.base || ''}|${m.side || ''}`;
+  if (SCOPE_BLOCKS.has(key)) return SCOPE_BLOCKS.get(key);
+  if (missingLegs(m) || m.solver_reason === 'incomplete') return '报价缺腿或已锁定';
+  if (m.base.startsWith('2nd Half - ') && (DATA.minute == null || DATA.minute < 46))
+    return '下半场尚未开始';
+  if (m.base.startsWith('1st Half - ') && DATA.minute != null && DATA.minute >= 45)
+    return '上半场已结束';
+  return null;
+}
 
 function renderMarkets(markets){
   const count = $('mkCount');
@@ -502,14 +545,15 @@ function renderMarkets(markets){
   const solverMarkets = markets.filter(m => m.in_solver && !hasCombo(m));
   const inShadow = m => SCOPE_KEYS.has(`${m.base || ''}|${m.side || ''}`);
   const shadowMarkets = markets.filter(m => !m.in_solver && inShadow(m));
-  const excludedMarkets = markets.filter(m => !m.in_solver && !inShadow(m));
+  const blockedMarkets = markets.filter(m => !m.in_solver && !inShadow(m) && pendingReason(m));
+  const excludedMarkets = markets.filter(m => !m.in_solver && !inShadow(m) && !pendingReason(m));
   const nSolver = markets.filter(m => m.in_solver).length;
   if (count) {
-    count.textContent = `当前盘口：全场求解 ${nSolver} · 分范围试算 ${shadowMarkets.length} · 未分析 ${excludedMarkets.length}`;
+    count.textContent = `当前盘口：全场求解 ${nSolver} · 分范围试算 ${shadowMarkets.length} · 暂不可验证 ${blockedMarkets.length} · 规则未覆盖 ${excludedMarkets.length}`;
     count.title = '这里是盘口数；上方结果的“候选选项”数是另一个口径';
   }
 
-  const renderMkt = (m, inCombo, excluded, shadow = false) => {
+  const renderMkt = (m, inCombo, excluded, shadow = false, blocked = false) => {
     const isWin = m.base === 'Which Team Wins The Rest Of The Match';
     const n = m.selections.length;
     // 只列了 1 个选项的盘口多半是残缺（平台只挂了一条腿），
@@ -523,9 +567,9 @@ function renderMarkets(markets){
           return wa - wb;
         })
       : m.selections;
-    const reason = excluded
-      ? (SOLVER_REASON[m.solver_reason] || '未参与') : '';
-    return `<div class="mkt${excluded ? ' excluded' : ''}">
+    const reason = blocked ? pendingReason(m)
+      : (excluded ? (SOLVER_REASON[m.solver_reason] || '规则未建模') : '');
+    return `<div class="mkt${excluded || blocked ? ' excluded' : ''}">
       <div class="mkt-head">
         <span class="mkt-name">${esc(m.name)}</span>
         <span class="mkt-sub ${partial ? 'warn' : ''}">${
@@ -533,7 +577,8 @@ function renderMarkets(markets){
         ${isWin ? '<span class="mkt-tag">剩余时间</span>' : ''}
         ${inCombo ? '<span class="mkt-tag arb">参与组合</span>' : ''}
         ${shadow ? '<span class="mkt-tag">分范围试算（未发布）</span>' : ''}
-        ${excluded ? `<span class="mkt-tag mute">未分析：${esc(reason)}</span>` : ''}
+        ${blocked ? `<span class="mkt-tag mute">暂不可验证：${esc(reason)}</span>` : ''}
+        ${excluded ? `<span class="mkt-tag mute">规则未覆盖：${esc(reason)}</span>` : ''}
       </div>
       <div class="sels">${sels.map(s => {
         const picked = PICKED && PICKED.market === m.base
@@ -557,6 +602,7 @@ function renderMarkets(markets){
 
   const showSolver = MK_FILTER === 'all' || MK_FILTER === 'solver';
   const showShadow = MK_FILTER === 'all' || MK_FILTER === 'shadow';
+  const showBlocked = MK_FILTER === 'all' || MK_FILTER === 'blocked';
   const showExcluded = MK_FILTER === 'all' || MK_FILTER === 'excluded';
   const parts = [];
   if (showSolver && showCombo && comboMarkets.length){
@@ -576,13 +622,17 @@ function renderMarkets(markets){
     parts.push(`<div class="mkt-group-label rest">分范围试算（${shadowMarkets.length} 个盘口，未发布）</div>`);
     parts.push(...shadowMarkets.map(m => renderMkt(m, false, false, true)));
   }
+  if (showBlocked && blockedMarkets.length){
+    parts.push(`<div class="mkt-group-label rest">暂不可验证（${blockedMarkets.length} 个盘口）</div>`);
+    parts.push(...blockedMarkets.map(m => renderMkt(m, false, false, false, true)));
+  }
   if (showExcluded && excludedMarkets.length){
-    parts.push(`<div class="mkt-group-label rest">未分析（${excludedMarkets.length} 个盘口）</div>`);
+    parts.push(`<div class="mkt-group-label rest">规则未覆盖（${excludedMarkets.length} 个盘口）</div>`);
     parts.push(...excludedMarkets.map(m => renderMkt(m, false, true)));
   }
   if (!parts.length){
     const msg = MK_FILTER === 'excluded'
-      ? '没有未分析的盘口。' : '这个分组当前没有盘口。';
+      ? '没有规则未覆盖的盘口。' : '这个分组当前没有盘口。';
     $('mkts').innerHTML = `<div class="empty">${msg}</div>`;
     return;
   }
@@ -692,6 +742,7 @@ async function refreshScopeMarkers(snapshotId){
   if (snapshotId !== SCOPE_SNAPSHOT){
     SCOPE_SNAPSHOT = snapshotId || null;
     SCOPE_KEYS = new Set();
+    SCOPE_BLOCKS = new Map();
     SCOPE_REFRESHED_AT = 0;
     if (DATA) renderMarkets(DATA.markets);
   }
@@ -704,17 +755,24 @@ async function refreshScopeMarkers(snapshotId){
     const body = await response.json();
     if (!DATA || DATA.snapshot_id !== snapshotId) return;
     const keys = new Set();
+    const blocks = new Map();
     for (const entry of body.reports || []){
-      if (!['no_candidate', 'shadow_candidate'].includes(entry.status)) continue;
       const report = entry.report || {};
-      const analyzed = report.analyzed_selections || report.source_selections || [];
-      for (const row of analyzed){
+      const rows = ['no_candidate', 'shadow_candidate'].includes(entry.status)
+        ? (report.analyzed_selections || report.source_selections || [])
+        : (entry.status === 'unverifiable' ? report.source_selections || [] : []);
+      for (const row of rows){
         if (Array.isArray(row) && row.length >= 2){
-          keys.add(`${row[0] || ''}|${row[1] || ''}`);
+          const key = `${row[0] || ''}|${row[1] || ''}`;
+          if (entry.status === 'unverifiable'
+              && entry.reason !== 'unsupported_window_rules')
+            blocks.set(key, SCOPE_REASON[entry.reason] || '输入或阶段条件不满足');
+          else keys.add(key);
         }
       }
     }
     SCOPE_KEYS = keys;
+    SCOPE_BLOCKS = blocks;
     renderMarkets(DATA.markets);
   }catch(e){}
 }

@@ -545,7 +545,7 @@ CREATE TABLE IF NOT EXISTS kessbet_odds_live (
 
     match_id      VARCHAR(32)  NOT NULL,
 
-    market        VARCHAR(64)  NOT NULL
+    market        VARCHAR(128) NOT NULL
         COMMENT '归一化盘口名，与 prematch 同口径',
 
     side          CHAR(1)      NOT NULL DEFAULT ''
@@ -554,7 +554,7 @@ CREATE TABLE IF NOT EXISTS kessbet_odds_live (
     line          VARCHAR(16)  NOT NULL DEFAULT ''
         COMMENT '盘线',
 
-    selection     VARCHAR(32)  NOT NULL
+    selection     VARCHAR(64)  NOT NULL
         COMMENT '选项',
 
     odds          DECIMAL(8,3) NOT NULL
@@ -594,10 +594,10 @@ CREATE TABLE IF NOT EXISTS kessbet_odds_live_history (
     platform      VARCHAR(16) NOT NULL DEFAULT 'kessbet',
     match_id      VARCHAR(32) NOT NULL,
 
-    market        VARCHAR(64) NOT NULL,
-    side          CHAR(1)     NOT NULL DEFAULT '',
-    line          VARCHAR(16) NOT NULL DEFAULT '',
-    selection     VARCHAR(32) NOT NULL,
+    market        VARCHAR(128) NOT NULL,
+    side          CHAR(1)      NOT NULL DEFAULT '',
+    line          VARCHAR(16)  NOT NULL DEFAULT '',
+    selection     VARCHAR(64)  NOT NULL,
 
     odds          DECIMAL(8,3) NOT NULL
         COMMENT '变动后的赔率',

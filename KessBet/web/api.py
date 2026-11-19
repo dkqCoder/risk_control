@@ -440,6 +440,25 @@ def _live_result_state(rc: dict, cur_sid) -> tuple[str | None, float | None]:
     return 'waiting', age
 
 
+def _live_invalidation_reason(rc: dict, live: dict, dao) -> str:
+    """Explain only causes supported by the saved result and current state."""
+    if live.get('current_snapshot_id'):
+        return '新赔率快照已收到，但该快照的判定结果尚未写回'
+    if live.get('status') in (100, 120):
+        return '比赛已结束，当前报价快照已撤销'
+    old_score = (rc.get('home_score'), rc.get('away_score'))
+    new_score = (live.get('home_score'), live.get('away_score'))
+    if all(v is not None for v in old_score + new_score) and old_score != new_score:
+        return (f'比分已从 {old_score[0]}:{old_score[1]} '
+                f'变为 {new_score[0]}:{new_score[1]}，旧赔率快照已撤销')
+    old_snapshot = (dao.get_live_snapshot(live['match_id'], rc['snapshot_id'])
+                    if rc.get('snapshot_id') else None)
+    old_status = (old_snapshot or {}).get('state_after') or {}
+    if old_status.get('ms') is not None and old_status['ms'] != live.get('status'):
+        return '比赛阶段或状态已变化，旧赔率快照已撤销'
+    return '当前快照已撤销；历史记录没有保存更具体的撤销原因'
+
+
 def _solver_market_status(m: dict) -> tuple[bool, str]:
     """该盘口是否进入比赛结果求解池，以及未进入的原因。
 
@@ -889,6 +908,9 @@ def live_detail(match_id: str) -> dict:
                     if rc.get('verification_detail') else None),
                 'analysis_status': status,
                 'status_text': _status_text(status),
+                'invalidation_reason': (
+                    _live_invalidation_reason(rc, row, dao)
+                    if status == 'invalidated' else None),
                 'status_reason': rc.get('status_reason'),
                 'is_stale': bool(
                     age is not None and age > config.LIVE_ODDS_MAX_AGE_SEC),

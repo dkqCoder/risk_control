@@ -228,6 +228,27 @@ def test_live_result_state_expires_stale_quote():
     assert _live_result_state(fresh, None)[0] == 'invalidated'
 
 
+def test_invalidation_reason_uses_observed_change_only():
+    from web.api import _live_invalidation_reason
+
+    class SavedSnapshot:
+        def get_live_snapshot(self, *_args):
+            return {'state_after': {'ms': 6}}
+
+    dao = SavedSnapshot()
+    old = {'snapshot_id': 's1', 'home_score': 0, 'away_score': 1}
+    live = {'match_id': MID, 'current_snapshot_id': None,
+            'status': 6, 'home_score': 1, 'away_score': 1}
+    assert '比分已从 0:1 变为 1:1' in _live_invalidation_reason(old, live, dao)
+    live['home_score'] = 0
+    live['status'] = 31
+    assert '阶段或状态已变化' in _live_invalidation_reason(old, live, dao)
+    live['status'] = 6
+    assert '没有保存更具体' in _live_invalidation_reason(old, live, dao)
+    live['current_snapshot_id'] = 's2'
+    assert '新赔率快照已收到' in _live_invalidation_reason(old, live, dao)
+
+
 def _seed_result(d, cost, analysis_status='valid',
                  verification_status=None, age_sec=5, snapshot_id='s1'):
     with d.conn.cursor() as c:
