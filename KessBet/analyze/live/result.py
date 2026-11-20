@@ -418,7 +418,8 @@ def check_match(selections, home: int, away: int,
                 minute: int | None = None,
                 ht_home: int | None = None,
                 ht_away: int | None = None,
-                first_half_live: bool | None = None) -> dict | None:
+                first_half_live: bool | None = None,
+                cost_threshold: float | None = None) -> dict | None:
     """判定一场滚球比赛的「比赛结果」套利。
 
     selections: [(market, side, line, label, odds), ...]
@@ -505,9 +506,16 @@ def check_match(selections, home: int, away: int,
     #
     # 有限模型只负责**找候选**；只有独立验证器在整个无界比分域上找不到
     # 亏损终局，才允许 is_arbitrage=True（进而写正式命中库）。
+    #
+    # 阈值默认 1.0。验证阶段可临时调高到 1.05 让更多机会走完整链路，
+    # 但**不跳过验证**：cost < 1.0 时仍然要求 verify 通过。
+    # 阈值优先用调用方传入的（回放时必须用记录时的值，
+    # 否则改了配置会让历史命中无法复现）。
+    threshold = (cost_threshold if cost_threshold is not None
+                 else getattr(config, 'LIVE_ARB_COST_THRESHOLD', 1.0))
     verification = None
-    is_arb = real_cost < 1.0
-    if is_arb:
+    is_arb = real_cost < threshold
+    if is_arb and real_cost < 1.0:
         from analyze.live import verify
         verification = verify.verify_chosen(
             chosen, home, away, ht_home=ht_home, ht_away=ht_away,

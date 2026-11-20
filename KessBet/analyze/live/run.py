@@ -699,6 +699,9 @@ def _persist_hit(dao, meta: dict, r: dict, now,
         'analyzer_version': LIVE_ANALYZER_VERSION,
         'state_space_version': LIVE_STATE_SPACE_VERSION,
         'candidate_policy_version': LIVE_CANDIDATE_POLICY_VERSION,
+        # 判定时的套利阈值。必须记录 —— 回放要用它还原当时的判定语义，
+        # 否则改了 LIVE_ARB_COST_THRESHOLD 会让历史命中无法复现。
+        'cost_threshold': getattr(config, 'LIVE_ARB_COST_THRESHOLD', 1.0),
         'snapshot_id': meta.get('snapshot_id'),
         'generation': meta.get('generation'),
         'input_fingerprint': fp,
@@ -812,6 +815,9 @@ def replay_live_evidence(replay_context) -> dict:
         ht_home=replay_context.get('ht_home'),
         ht_away=replay_context.get('ht_away'),
         first_half_live=replay_context.get('first_half_live'),
+        # 用记录时的阈值回放，不受当前配置影响。
+        # 旧证据包没有该字段时退回 1.0。
+        cost_threshold=replay_context.get('cost_threshold', 1.0),
     )
     expected = replay_context.get('expected') or {}
     if replayed is None:
