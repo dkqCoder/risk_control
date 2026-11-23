@@ -1025,6 +1025,19 @@ def _arb_row(r: dict) -> dict:
     home, away = r['home_team'], r['away_team']
     cost_f = float(r['cost']) if r.get('cost') is not None else None
 
+    # 滚球命中：命中时刻的比分/比赛时间存在 replay_context 里。
+    # 赛前命中没有这个字段，列表查询也不带 replay_context —— 都返回 None。
+    replay = None
+    if r.get('replay_context'):
+        try:
+            replay = json.loads(r['replay_context'])
+        except (TypeError, ValueError):
+            replay = None
+    home_score = (replay or {}).get('home_score')
+    away_score = (replay or {}).get('away_score')
+    score = (f'{home_score}:{away_score}'
+             if home_score is not None and away_score is not None else None)
+
     # 收益率的来源有两个：
     #   赛前命中 → LP 实测的最差净收益（允许部分下注，比 ILP 隐含值更优）
     #   滚球命中 → 没跑 LP，只能由成本推算 t = 1/cost - 1
@@ -1048,6 +1061,11 @@ def _arb_row(r: dict) -> dict:
         'away_team': away,
         'league': r.get('league') or '',
         'kickoff_time': _iso(r['kickoff_time']),
+        # 命中时刻的比赛状态（只有滚球命中才有）
+        'score': score,
+        'minute': (replay or {}).get('minute'),
+        'match_clock': (replay or {}).get('match_clock'),
+        'phase': (replay or {}).get('phase'),
         'cost': float(r['cost']),
         'cost_scope': r.get('cost_scope'),
         'lp_worst_profit': float(worst) if worst is not None else None,

@@ -101,6 +101,18 @@ td.num{text-align:right; font-family:ui-monospace,Consolas,monospace}
   font-family:ui-monospace,Consolas,monospace}
 .meta-bar b.key{letter-spacing:.02em}
 
+/* 命中时刻的记分牌：比分 + 比赛时间，一眼可见 */
+.scoreboard{background:var(--panel); border:1px solid var(--line);
+  border-radius:8px; padding:14px 18px; margin-bottom:14px}
+.scoreboard .score-line{display:flex; align-items:center; justify-content:center;
+  gap:22px; font-size:17px; font-weight:600}
+.scoreboard .score-line .team{flex:1; text-align:right}
+.scoreboard .score-line .team.away{text-align:left}
+.scoreboard .score-num{font-size:26px; font-weight:700; letter-spacing:.06em;
+  font-variant-numeric:tabular-nums; white-space:nowrap}
+.scoreboard .score-meta{margin-top:6px; text-align:center; font-size:12px;
+  color:var(--muted)}
+
 /* 判定结论：一眼看清是真套利还是只是成本低 */
 .verdict{display:flex; align-items:baseline; gap:22px; flex-wrap:wrap;
   padding:14px 16px; border-radius:8px; margin-bottom:14px;
@@ -324,7 +336,26 @@ async function openDetail(id){
   const isLive = !!h.is_live;
   const isShadow = !!h.is_shadow;
 
+  // 命中时刻的比分和比赛时间（只有滚球命中才有）
+  const phaseText = ({
+    first_half: '上半场', halftime: '中场',
+    second_half: '下半场', finished: '已结束',
+  })[h.phase] || '';
+  const minuteText = h.minute != null ? h.minute + "'" : (h.match_clock || '');
+  const scoreMeta = [minuteText, phaseText,
+    h.alert_time ? '命中于 ' + h.alert_time : ''].filter(Boolean).join(' · ');
+  const scoreboard = (isLive && h.score) ? `
+    <div class="scoreboard">
+      <div class="score-line">
+        <span class="team">${esc(h.home_team)}</span>
+        <span class="score-num">${esc(h.score)}</span>
+        <span class="team away">${esc(h.away_team)}</span>
+      </div>
+      ${scoreMeta ? `<div class="score-meta">${esc(scoreMeta)}</div>` : ''}
+    </div>` : '';
+
   $('dwBody').innerHTML = `
+    ${scoreboard}
     <div class="meta-bar">
       <span>matchId <b>${esc(h.match_id)}</b></span>
       <span>${isLive ? (isShadow ? '滚球 · 试算候选' : '滚球 · 正式候选') : '赛前'}</span>
