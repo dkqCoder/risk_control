@@ -289,6 +289,10 @@ def analyze_live_snapshot(dao, meta: dict, selections: list[tuple], now=None) ->
             if not snap_id:
                 log.warning('影子候选落表失败（证据包不完整或重复）%s',
                             meta['match_id'])
+            else:
+                # 影子命中也要截图：影子模式的作用就是验证完整流程，
+                # 不截图就验证不了截图功能本身。
+                _shoot_async(meta, r, snap_id)
         else:
             snap_id = _persist_hit(dao, meta, r, now)
             if snap_id:
@@ -457,9 +461,9 @@ def analyze_live_once(dao, window_min: int | None = None,
                     snap_id = _persist_hit(dao, evidence_meta, r, now,
                                            shadow=shadow)
                     if snap_id:
-                        # 只有正式命中截图；影子记录用证据页复核。
-                        if not shadow:
-                            _shoot_async(meta, r, snap_id)
+                        # 正式命中与影子命中都要截图 —— 影子模式是验证用，
+                        # 不截图就无法验证截图链路本身。
+                        _shoot_async(meta, r, snap_id)
                     else:
                         if shadow:
                             log.warning('影子候选落表失败（证据包不完整或重复）'

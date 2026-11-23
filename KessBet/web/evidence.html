@@ -227,7 +227,46 @@ async function load(){
         有、这里没有的选项，就是被平台锁定/过滤掉的。
       </p>
     </div>
+
+    <div class="card" id="shotCard" style="display:none">
+      <h2>截图留证</h2>
+      <p class="note" style="margin:0 0 10px">
+        本地证据页截图是命中瞬间的冻结视图；平台官网截图为辅助证据，
+        拍摄时间晚于命中（页面赔率会继续变动）。
+      </p>
+      <div id="shotList"></div>
+    </div>
   `;
+
+  loadScreenshots();
+}
+
+// 截图列表：本地证据页 + 平台官网
+async function loadScreenshots(){
+  try{
+    const r = await fetch(`/api/snapshots/${encodeURIComponent(SNAP)}/screenshots`);
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!d.files || !d.files.length) return;
+
+    const card = $('shotCard');
+    const list = $('shotList');
+    if (!card || !list) return;
+
+    list.innerHTML = d.files.map(f => `
+      <div style="margin-bottom:16px">
+        <div class="note" style="margin-bottom:6px">
+          ${f.kind === 'official' ? '平台官网（辅助证据，晚于命中）'
+                                  : '本地证据页（命中瞬间）'}
+          · <a href="${esc(f.url)}" target="_blank">${esc(f.name)}</a>
+        </div>
+        <a href="${esc(f.url)}" target="_blank">
+          <img src="${esc(f.url)}" alt="${esc(f.name)}"
+               style="max-width:100%;border:1px solid var(--line);border-radius:6px">
+        </a>
+      </div>`).join('');
+    card.style.display = '';
+  }catch(e){ /* 截图加载失败不影响证据页主体 */ }
 }
 
 load();

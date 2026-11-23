@@ -72,7 +72,10 @@ def test_shadow_persists_shadow_hit(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0].get('shadow') is True
-    assert shots == [], '影子记录不截正式命中图'
+    # 2026-11-21 起影子命中也截图：影子模式的作用就是验证完整流程，
+    # 不截图就验证不了截图功能本身（当时正是因为这条断言，截图链路
+    # 在 Linux 部署后一直没被验证过）。
+    assert shots == [1], '影子命中应当触发截图'
     assert d.cost_kw['analysis_status'] == 'shadow_candidate'
 
 

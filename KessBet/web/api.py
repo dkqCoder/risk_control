@@ -1347,3 +1347,65 @@ def evidence_page(snap_id: int):
     if os.path.isfile(p):
         return _page(p)
     raise HTTPException(404, 'web/evidence.html not found')
+
+
+# ---------------------------------------------------------------- 截图
+
+SHOT_DIR = os.path.join(BASE, 'data', 'screenshots')
+
+
+def _shot_names_for(snap_id: int) -> list[str]:
+    """列出某次命中关联的截图文件名。
+
+    文件名格式 {时间戳}_{match_id}_{snapshot_id}_{local|kessbet}.png，
+    按「_{snapshot_id}_」后缀精确匹配 —— 不能只用 endswith(snap_id)，
+    否则 snap_id=1 会误匹配到 11、21、31…
+    """
+    if not os.path.isdir(SHOT_DIR):
+        return []
+    needle = f'_{int(snap_id)}_'
+    out = []
+    for name in sorted(os.listdir(SHOT_DIR)):
+        if not name.endswith('.png'):
+            continue
+        if needle not in name:
+            continue
+        out.append(name)
+    return out
+
+
+@app.get('/api/snapshots/{snap_id}/screenshots')
+def list_screenshots(snap_id: int) -> dict:
+    """列出该命中关联的截图（本地证据页 + 平台官网各一张）。"""
+    names = _shot_names_for(snap_id)
+    return {
+        'snapshot_id': snap_id,
+        'files': [
+            {
+                'name': n,
+                'url': f'/screenshots/{n}',
+                'kind': 'official' if n.endswith('_kessbet.png') else 'local',
+            }
+            for n in names
+        ],
+        'count': len(names),
+    }
+
+
+@app.get('/screenshots/{filename}')
+def serve_screenshot(filename: str):
+    """取一张截图。只允许 data/screenshots 下的文件名，防路径穿越。"""
+    # 只接受纯文件名：不能含路径分隔符、不能是 .. 之类
+    if (not filename or filename.startswith('.')
+            or '/' in filename or '\\' in filename
+            or os.path.basename(filename) != filename):
+        raise HTTPException(400, 'invalid filename')
+    path = os.path.join(SHOT_DIR, filename)
+    # 再确认解析后的真实路径仍在截图目录内（防符号链接逃逸）
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.realpath(SHOT_DIR) + os.sep):
+        raise HTTPException(403, 'forbidden')
+    if not os.path.isfile(path):
+        raise HTTPException(404, 'screenshot not found')
+    return FileResponse(path, media_type='image/png',
+                        headers={'Cache-Control': 'no-store'})

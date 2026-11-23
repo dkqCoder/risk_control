@@ -210,7 +210,9 @@ LIVE_ROW_MAX_LAG_SEC = 120
 # 截图内容是本地详情页 /live/<match_id>，包含计分板、判定结果、
 # 下注组合和当时的全部盘口。
 LIVE_SHOT_ENABLED = True
-LIVE_SHOT_BASE_URL = 'http://127.0.0.1:8080'
+# 本地证据页地址。端口必须与 deploy/.env 里的 API_PORT 一致（当前 9001）。
+# 截图 worker 用无头浏览器打开这个地址拍图，端口写错会截到「连接失败」。
+LIVE_SHOT_BASE_URL = 'http://127.0.0.1:9001'
 # 存在工作区的 data/screenshots/ 下（data/ 已在 .gitignore 里，
 # 截图是二进制证据，不该进版本库）
 LIVE_SHOT_DIR = os.path.join(

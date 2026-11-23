@@ -27,6 +27,13 @@ log = logging.getLogger(__name__)
 
 # 常见的 Chrome/Edge 安装位置。用第一个存在的。
 _CANDIDATES = [
+    # Linux（生产服务器）
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/opt/google/chrome/chrome',
+    # Windows（开发机）
     r'C:\Program Files\Google\Chrome\Application\chrome.exe',
     r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
     r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
@@ -44,6 +51,14 @@ def find_browser() -> str | None:
         if os.path.isfile(p):
             found = p
             break
+    if not found:
+        # 退回 Playwright 下载的 Chromium（Ubuntu 24.04 的
+        # chromium-browser 只是 snap 包装，服务器上 snapd 常不运行）
+        try:
+            from common.platform_shot import _playwright_chromium
+            found = _playwright_chromium()
+        except Exception:
+            found = None
     _browser_cache['path'] = found
     if not found:
         log.warning('未找到 Chrome/Edge，网页截图功能不可用')

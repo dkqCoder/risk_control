@@ -35,10 +35,48 @@ import time
 log = logging.getLogger(__name__)
 
 BROWSERS = [
+    # Linux（生产服务器）。Playwright 下载的 Chromium 也在这个列表里，
+    # 因为 Ubuntu 24.04 的 chromium-browser 只是 snap 包装，服务器上
+    # snapd 通常不运行，装不上。
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/opt/google/chrome/chrome',
+    # Windows（开发机）
     r'C:\Program Files\Google\Chrome\Application\chrome.exe',
     r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
     r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
 ]
+
+
+def _playwright_chromium() -> str | None:
+    """找 Playwright 下载的 Chromium。
+
+    目录名带版本号（chromium-1255），所以不能写死路径。
+    优先用 PLAYWRIGHT_BROWSERS_PATH 显式配置的根目录。
+    """
+    roots = [
+        os.environ.get('PLAYWRIGHT_BROWSERS_PATH'),
+        # 生产部署位置：/root/.cache 对 kessbet 用户不可读，
+        # 安装时把 chromium 复制到这里并 chmod 755。
+        '/opt/ms-playwright',
+        os.path.expanduser('~/.cache/ms-playwright'),
+        '/root/.cache/ms-playwright',
+        '/ms-playwright',
+    ]
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root), reverse=True):
+            if not name.startswith('chromium-'):
+                continue
+            for sub in ('chrome-linux64/chrome', 'chrome-linux/chrome'):
+                p = os.path.join(root, name, sub)
+                if os.path.isfile(p) and os.access(p, os.X_OK):
+                    return p
+    return None
+
 
 MATCH_URL = 'https://www.kessbet.com/match/%s'
 
@@ -51,7 +89,7 @@ def find_browser() -> str | None:
     for p in BROWSERS:
         if os.path.isfile(p):
             return p
-    return None
+    return _playwright_chromium()
 
 
 class _Cdp:
@@ -217,6 +255,40 @@ def capture_match_meta(match_id: str, out_path: str,
         log.info('平台截图 tab=%s coverage=%s %s',
                  tab, result['coverage'], match_id)
         time.sleep(_AFTER_CLICK_SEC)
+
+        # 点开 All 后页面会变得很高，视口截图只能拍到顶部一段。
+        # 先量实际内容高度，再按这个高度设视口重截一次。
+        #
+        # 不用 captureBeyondViewport —— 实测那样截出来中间一大片空白：
+        # 内容在 DOM 里、innerText 也能读到，但合成层没被展开。
+        # 必须真的把视口撑到那么高。
+        page_h = 0
+        try:
+            page_h = int(cdp.eval(
+                'Math.max(document.body.scrollHeight,'
+                ' document.documentElement.scrollHeight,'
+                ' document.body.offsetHeight,'
+                ' document.documentElement.offsetHeight)') or 0)
+        except Exception:
+            page_h = 0
+        result['page_height'] = page_h
+
+        if page_h > height:
+            try:
+                # 视口上限压到 12000，避免异常页面（无限滚动）把内存打爆
+                target = min(page_h + 200, 12000)
+                cdp.call('Emulation.setDeviceMetricsOverride',
+                         width=width, height=target,
+                         deviceScaleFactor=1, mobile=False)
+                time.sleep(1.5)
+                result['capture_height'] = target
+                log.info('平台截图按页面高度调整为 %dpx（原 %dpx）',
+                         target, height)
+            except Exception as e:
+                log.warning('调整截图视口失败 %s: %s', match_id, e)
+                result['capture_height'] = height
+        else:
+            result['capture_height'] = height
 
         cdp.shot(out_path)
         if os.path.isfile(out_path) and os.path.getsize(out_path) > 1024:
