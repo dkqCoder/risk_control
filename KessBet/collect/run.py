@@ -381,7 +381,10 @@ class Collector:
                         # 滚球数据保留期更短（3 天），一并清
                         if getattr(self, 'live', None):
                             live_r = self.dao.cleanup_live(
-                                days=config.LIVE_RETAIN_DAYS)
+                                days=config.LIVE_RETAIN_DAYS,
+                                snapshot_days=config.LIVE_SNAPSHOT_RETAIN_DAYS,
+                                scope_days=config.LIVE_SCOPE_RETAIN_DAYS,
+                                removed_days=config.MARKET_REMOVED_RETAIN_DAYS)
                             log.info('cleanup_live: %s', live_r)
                         self._last_cleanup = time.monotonic()
                         self.stats['cleanup'] += 1

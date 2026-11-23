@@ -1190,10 +1190,11 @@ class Dao:
                         (platform, match_id))
         self.conn.commit()
 
-    def cleanup_live(self, days: int = 3) -> dict:
+    def cleanup_live(self, days: int = 3, snapshot_days: int = 7,
+                     scope_days: int = 2, removed_days: int = 7) -> dict:
         """滚球数据保留期比赛前短 —— 比赛结束后就没有分析价值了。
 
-        四张表都按自己的 kickoff_time 清理，互相独立。
+        各表按自己的时间字段清理，互相独立。
         不要用「子查询 kessbet_match」的方式关联 —— 那张表先被清掉的话，
         子查询查不到任何行，本表的数据就永远留着成孤儿。
         """
@@ -1230,7 +1231,7 @@ class Dao:
             while True:
                 cur.execute("""
                     DELETE FROM kessbet_live_snapshot
-                    WHERE response_received_at < NOW() - INTERVAL 7 DAY
+                    WHERE response_received_at < NOW() - INTERVAL %s DAY
                       AND snapshot_id NOT IN (
                           SELECT evidence_id FROM (
                               SELECT evidence_id FROM kessbet_arbitrage_snapshot
@@ -1239,13 +1240,23 @@ class Dao:
                           ) AS keep
                       )
                     LIMIT 5000
-                """)
+                """, (snapshot_days,))
                 n = cur.rowcount
                 snap_deleted += n
                 self.conn.commit()
                 if n < 5000:
                     break
             result['live_snapshot'] = snap_deleted
+            # 分范围影子分析：按创建时间清理。
+            cur.execute("DELETE FROM kessbet_live_scope_analysis "
+                        "WHERE created_time < NOW() - INTERVAL %s DAY",
+                        (scope_days,))
+            result['live_scope'] = cur.rowcount
+            # 撤盘日志：观察用，按撤盘时间清理。
+            cur.execute("DELETE FROM kessbet_market_removed "
+                        "WHERE removed_time < NOW() - INTERVAL %s DAY",
+                        (removed_days,))
+            result['market_removed'] = cur.rowcount
         self.conn.commit()
         return result
 
@@ -1557,6 +1568,14 @@ class Dao:
                 "WHERE changed_time < NOW() - INTERVAL %s DAY",
                 (history_days,))
             result['cost_history'] = cur.rowcount
+
+            # 当前成本快照：cleanup_cost() 存在但没有任何调用点，
+            # 不在这里清就会只增不减。
+            cur.execute(
+                "DELETE FROM kessbet_match_cost "
+                "WHERE kickoff_time < NOW() - INTERVAL %s DAY",
+                (match_days,))
+            result['cost'] = cur.rowcount
 
             cur.execute(
                 "DELETE FROM kessbet_collect_log "

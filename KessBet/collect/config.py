@@ -142,6 +142,13 @@ LIVE_POLL_ODDS_SEC = 30
 
 # 滚球数据保留天数。比赛结束后基本没有分析价值，比赛前（7 天）短。
 LIVE_RETAIN_DAYS = 3
+# 不可变滚球输入快照：命中证据已另存 evidence，这里只留排查用的中间产物。
+# 2026-11-23 磁盘写满事故后从 30 天降到 7 天，见 cleanup_live()。
+LIVE_SNAPSHOT_RETAIN_DAYS = 7
+# 分范围影子分析结果。
+LIVE_SCOPE_RETAIN_DAYS = 2
+# 撤盘日志：观察用。
+MARKET_REMOVED_RETAIN_DAYS = 7
 
 # 滚球采集并发数。滚球比赛同时进行的场次有限，不需要像赛前那么大。
 LIVE_CONCURRENCY = 8
