@@ -133,6 +133,14 @@ async function load(){
       <b>仅内部记录</b>，不能证明平台当时返回了什么。</div>`;
   }else{
     const markets = raw.markets || [];
+    // raw 是 {request_started_at, response_received_at, state_before,
+    // state_after, markets}；比分/时钟在 replayContext 顶层，兼容旧的
+    // raw.fetched_time / raw.state 结构。
+    const rawState = raw.state_after || raw.state_before || raw.state || {};
+    const rawTime = rc.raw_fetched_time || raw.response_received_at
+                 || raw.fetched_time || '—';
+    const rawStatus = rc.match_status ?? rawState.ms ?? '—';
+    const rawClock = rc.match_clock ?? rawState.mt ?? '—';
     const marketRows = markets.map((mk, i) => {
       const mari = mk.mari || '';
       const name = mari.includes('|') ? mari.split('|').pop() : '';
@@ -144,10 +152,10 @@ async function load(){
     }).join('');
     rawBlock = `
       <div class="kv">
-        <div>原始响应时间 <b>${esc(raw.fetched_time || '—')}</b></div>
+        <div>原始响应时间 <b>${esc(rawTime)}</b></div>
         <div>盘口数 <b>${markets.length}</b></div>
-        <div>平台比赛状态 <b>${esc((raw.state || {}).ms ?? '—')}</b></div>
-        <div>平台时钟 <b>${esc((raw.state || {}).mt ?? '—')}</b></div>
+        <div>平台比赛状态 <b>${esc(rawStatus)}</b></div>
+        <div>平台时钟 <b>${esc(rawClock)}</b></div>
       </div>
       <table style="margin-top:10px">
         <thead><tr><th>#</th><th>盘口</th><th>原始 mari 串</th></tr></thead>
