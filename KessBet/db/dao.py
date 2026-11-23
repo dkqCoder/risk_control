@@ -1212,13 +1212,40 @@ class Dao:
                         "WHERE fetched_time < NOW() - INTERVAL %s DAY",
                         (days,))
             result['live_raw'] = cur.rowcount
-            # 不可变输入快照：保留期比当前赔率长得多（30 天）。
-            # 判定暂停期间快照可能尚未被分析；不能用 3 天的缓存保留期
-            # 把未分析的输入删掉（D01 要求）。命中证据已另存 snapshot。
-            cur.execute("DELETE FROM kessbet_live_snapshot "
-                        "WHERE response_received_at "
-                        "      < NOW() - INTERVAL 30 DAY")
-            result['live_snapshot'] = cur.rowcount
+            # 不可变输入快照。
+            #
+            # 2026-11-23：原来是 30 天，两天就涨到 14.7G 把磁盘写满，
+            # MySQL 无法建临时表、服务停摆。滚球每 30 秒采一次、20 场并发，
+            # 每次存整份原始响应（几十 KB），30 天对这张表太长了。
+            #
+            # 改成 7 天：判定是秒级的，7 天足够覆盖任何延迟场景。
+            # 命中证据已另存 data/evidence/ 和 kessbet_arbitrage_snapshot，
+            # 原始输入快照只是排查用的中间产物。
+            #
+            # ⚠️ 必须排除被 arbitrage_snapshot 引用的快照 —— 它们是命中
+            # 证据链的一环，删了回放和证据页都会失效。
+            #
+            # 分批删（LIMIT）避免一次锁太多行、也让 binlog/undo 可控。
+            snap_deleted = 0
+            while True:
+                cur.execute("""
+                    DELETE FROM kessbet_live_snapshot
+                    WHERE response_received_at < NOW() - INTERVAL 7 DAY
+                      AND snapshot_id NOT IN (
+                          SELECT evidence_id FROM (
+                              SELECT evidence_id FROM kessbet_arbitrage_snapshot
+                              WHERE evidence_id IS NOT NULL
+                                AND evidence_id <> ''
+                          ) AS keep
+                      )
+                    LIMIT 5000
+                """)
+                n = cur.rowcount
+                snap_deleted += n
+                self.conn.commit()
+                if n < 5000:
+                    break
+            result['live_snapshot'] = snap_deleted
         self.conn.commit()
         return result
 
